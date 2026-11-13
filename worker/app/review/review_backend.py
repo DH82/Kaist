@@ -57,6 +57,38 @@ def inspect(review, project, ep):
                 'approval': review.approval_summary(project, ep)}
 
 
+def missing_masks(review, project, ep):
+    d = review.root(project, ep)
+    draft = d/'review/draft'
+    meta = json.loads((review.source(d)/'metadata.json').read_text())
+    return [(c, o, f) for c in range(4) for o in range(2) for f in range(meta['frame_num'])
+            if not (draft/f'mask/{c}/{o}/{f}.png').exists()]
+
+
+def fill_missing_masks(review, project, ep):
+    """손에 완전히 가려지는 등 SAM3가 대상을 찾지 못한 프레임은 마스크 파일이 아예 없습니다.
+    추적·QC·복원은 모든 프레임에 마스크 파일이 있다고 보므로, 승인 직전에 초안의 빈 자리를 빈 마스크(전부 0)로 채웁니다.
+    파이프라인 코드(00_scripts)는 실행마다 해시로 고정되므로 바꾸지 않고, 검수 서버에서 데이터만 채웁니다.
+    채운 프레임은 승인 기록의 exceptions에 'empty'로 남습니다(승인 사유 필요)."""
+    d = review.root(project, ep)
+    draft = d/'review/draft'
+    width, height = json.loads((review.source(d)/'metadata.json').read_text())['WH']
+    filled = []
+    for cam, obj, frame in missing_masks(review, project, ep):
+        path = draft/f'mask/{cam}/{obj}/{frame}.png'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp = path.with_suffix('.tmp')
+        Image.new('L', (width, height), 0).save(temp, format='PNG')
+        temp.replace(path)
+        filled.append([cam, obj, frame])
+    if filled:
+        edits = json.loads((draft/'edits.json').read_text())
+        edits['events'].append({'filled_empty_masks': filled, 'reason': 'SAM3 미검출 프레임을 승인 전 빈 마스크로 채움',
+                                'time': time.strftime('%Y-%m-%dT%H:%M:%S%z')})
+        review.save(draft/'edits.json', edits)
+    return filled
+
+
 def decide(review, project, ep, data):
     with episode_lock(project, ep):
         draft = review.prepare_draft(project, ep)
@@ -72,9 +104,14 @@ def decide(review, project, ep, data):
             checked = data.get('checked')
             if not isinstance(checked, list) or len(checked) != 4 or any(v is not True for v in checked):
                 raise ValueError('4개 카메라 검수 완료를 모두 확인하세요.')
+            # 채운 뒤 승인이 사유 없음으로 실패하면 초안만 바뀌어 다음 승인 시 기준값이 어긋나므로, 채우기 전에 먼저 확인합니다.
+            if not note.strip() and missing_masks(review, project, ep):
+                raise ValueError('마스크가 없는 프레임(SAM3 미검출)이 있습니다. 승인 사유를 검수 의견에 기록하세요. 예: 손에 가려 물체가 보이지 않음')
+            filled = fill_missing_masks(review, project, ep)
             dest = review.approve(project, ep, name, checked, note)
+            extra = f' 마스크가 없던 {len(filled)}개 프레임은 빈 마스크로 채웠습니다.' if filled else ''
             return {'status': 'approved', 'version': dest.name,
-                    'message': '승인본을 저장했습니다. Airflow가 약 60초 안에 다음 단계로 진행합니다.'}
+                    'message': '승인본을 저장했습니다.'+extra+' Airflow가 바로(몇 초 안에) 다음 단계로 진행합니다.'}
         if data['decision'] == 'hold':
             if not note.strip():
                 raise ValueError('보류 사유를 입력하세요.')
@@ -161,7 +198,7 @@ def tracking_decide(review, project, ep, data):
                                  str(data.get('operator', '')), checked, str(data.get('note', '')),
                                  data['basis'], mode='human')
         return {'status': result['status'], 'decision_id': result['id'],
-                'message': '추적 승인 완료. Airflow가 약 60초 안에 복원 단계로 진행합니다.'
+                'message': '추적 승인 완료. Airflow가 바로(몇 초 안에) 복원 단계로 진행합니다.'
                            if result['status']=='approved' else '추적 결과를 보류했습니다. 후속 단계는 진행하지 않습니다.'}
 
 

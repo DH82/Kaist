@@ -27,15 +27,17 @@ mkdir -p "$PROJECT_DIR" "$NAS_MOUNT/$RESULTS_SUBDIR"
 # 3) Worker 설정 생성. 파일 이름(gpu_4090_a.json)은 Worker 코드 호환용이며 모든 PC 동일합니다.
 GPU_UUID=${GPU_UUID:-$(nvidia-smi --query-gpu=uuid --format=csv,noheader | head -1)}
 [[ "$GPU_UUID" == GPU-* ]] || { echo "GPU를 찾지 못했습니다 (nvidia-container-toolkit 확인)" >&2; exit 1; }
-python3 - "$W/config/gpu_4090_a.json" <<PY
-import json,sys
-cfg={"scripts_dir":"$SCRIPTS","pipeline_root":"$KAIST_REV_ROOT/workspace","project_dir":"$PROJECT_DIR",
- "control_python":"/usr/bin/python3","gpu_uuid":"$GPU_UUID","nas_mount":"$NAS_MOUNT",
- "nas_results_subdir":"$RESULTS_SUBDIR",
+export GPU_UUID SCRIPTS PC_ID NAS_MOUNT RAW_ROOT RESULTS_SUBDIR PROJECT_DIR WORKER_PORT
+python3 - "$W/config/gpu_4090_a.json" <<'PY'
+import json,sys,os
+e=os.environ
+cfg={"scripts_dir":e["SCRIPTS"],"pipeline_root":e["KAIST_REV_ROOT"]+"/workspace","project_dir":e["PROJECT_DIR"],
+ "control_python":"/usr/bin/python3","gpu_uuid":e["GPU_UUID"],"nas_mount":e["NAS_MOUNT"],
+ "nas_results_subdir":e["RESULTS_SUBDIR"],
  "artifacts":["final_data.pkl","shape/matching/final_mesh.glb","hands/hand_v1/hand_reg.pkl",
   "hands/hand_v1/hand_reg_params.pkl","hands/hand_v1/hand_reg_cidx.pkl","hands/hand_v1/integrity.json",
   "hands/hand_v1/shared_shape.pkl","hands/settings.json","hands/review/mano_review.mp4","hands/review/validation.json"],
- "raw_root":"$RAW_ROOT"}
+ "raw_root":e["RAW_ROOT"]}
 open(sys.argv[1],"w").write(json.dumps(cfg,indent=2)+"\n")
 PY
 

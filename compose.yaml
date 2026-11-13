@@ -1,6 +1,6 @@
 # KAIST 단일 PC 스택: UI + Airflow + PostgreSQL을 GPU PC 안에서 실행합니다.
 # NAS는 NFS 마운트로 RAW를 읽고 결과를 쓰는 저장소로만 사용합니다.
-# GPU Worker(포트 8090)는 gpu 프로필의 컨테이너로 실행됩니다.
+# GPU Worker도 기본 서비스로 함께 시작됩니다.
 #
 # 모든 서비스는 host 네트워크를 사용합니다.
 #  - Worker가 127.0.0.1:8090에만 열려 있어 SSH 터널 없이 바로 연결할 수 있습니다.
@@ -8,12 +8,14 @@
 name: kaist-pc
 
 x-airflow-base: &airflow-base
-  build: .
+  build:
+    context: .
+    target: airflow
   image: kaist-airflow:3.3.2
   restart: unless-stopped
   network_mode: host
   # 호스트 계정 UID로 실행해 state/·intake_state/와 Worker secret 파일을 sudo 없이 읽고 씁니다.
-  user: "${HOST_UID:?run setup.sh first}:0"
+  user: "${HOST_UID:?run ./start.sh first}:0"
 
 services:
   postgres:
@@ -23,7 +25,7 @@ services:
     command: ["postgres", "-c", "port=${POSTGRES_PORT:-15432}", "-c", "listen_addresses=127.0.0.1"]
     environment:
       POSTGRES_USER: airflow
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?run setup.sh first}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?run ./start.sh first}
       POSTGRES_DB: airflow
     volumes:
       - pgdata:/var/lib/postgresql/data
@@ -35,11 +37,20 @@ services:
   airflow:
     <<: *airflow-base
     command: standalone
+    healthcheck:
+      test: ["CMD", "python", "/opt/kaist-healthcheck.py", "airflow"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 60s
     depends_on:
       postgres:
         condition: service_healthy
+      gpu-worker:
+        condition: service_healthy
     environment:
       AIRFLOW_HOME: /opt/airflow
+      AIRFLOW_PORT: ${AIRFLOW_PORT:-18082}
       AIRFLOW__CORE__DAGS_FOLDER: /opt/kaist/dags
       AIRFLOW__CORE__LOAD_EXAMPLES: "false"
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
@@ -47,35 +58,42 @@ services:
       AIRFLOW__CORE__DEFAULT_TIMEZONE: Asia/Seoul
       AIRFLOW__API__HOST: ${AIRFLOW_BIND:-0.0.0.0}
       AIRFLOW__API__PORT: ${AIRFLOW_PORT:-18082}
-      AIRFLOW__API__BASE_URL: ${KAIST_AIRFLOW_PUBLIC_URL:?run setup.sh first}
+      AIRFLOW__API__BASE_URL: ${KAIST_AIRFLOW_PUBLIC_URL:?run ./start.sh first}
       AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://127.0.0.1:${AIRFLOW_PORT:-18082}/execution/
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:${POSTGRES_PASSWORD}@127.0.0.1:${POSTGRES_PORT:-15432}/airflow
       # host 네트워크에서 기본 로그 포트(8793/8794) 충돌을 피합니다.
-      AIRFLOW__LOGGING__WORKER_LOG_SERVER_PORT: "18793"
-      AIRFLOW__LOGGING__TRIGGER_LOG_SERVER_PORT: "18794"
+      AIRFLOW__LOGGING__WORKER_LOG_SERVER_PORT: "${AIRFLOW_LOG_PORT:-18793}"
+      AIRFLOW__LOGGING__TRIGGER_LOG_SERVER_PORT: "${AIRFLOW_TRIGGER_LOG_PORT:-18794}"
       AIRFLOW__CORE__AUTH_MANAGER: airflow.api_fastapi.auth.managers.simple.simple_auth_manager.SimpleAuthManager
       AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS: admin:admin
-      AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET:?run setup.sh first}
+      AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET:?run ./start.sh first}
       KAIST_WORKERS_FILE: /opt/kaist-config/workers.json
       KAIST_WORKER_URL: ${WORKER_URL:-http://127.0.0.1:8090}
       KAIST_WORKER_TOKEN_FILE: /run/secrets/worker_token
     volumes:
-      - ./state:/opt/airflow
-      - ./code:/opt/kaist:ro
-      - ./config:/opt/kaist-config:ro
-      - ${WORKER_SECRET_FILE:?run setup.sh first}:/run/secrets/worker_token:ro
+      - ${STACK_STATE_DIR:-.}/state:/opt/airflow
+      - ${STACK_STATE_DIR:-.}/config:/opt/kaist-config:ro
+      - ${WORKER_SECRET_FILE:?run ./start.sh first}:/run/secrets/worker_token:ro
 
   ui:
     <<: *airflow-base
+    healthcheck:
+      test: ["CMD", "python", "/opt/kaist-healthcheck.py", "ui"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
     entrypoint: /bin/bash
     command: ["-c", "exec python -m uvicorn platform_app:app --app-dir /opt/kaist/platform --host \"$$UI_BIND\" --port \"$$UI_PORT\""]
     depends_on:
-      - airflow
+      airflow:
+        condition: service_healthy
+      gpu-worker:
+        condition: service_healthy
     environment:
       HOME: /tmp
       UI_BIND: ${UI_BIND:-0.0.0.0}
       UI_PORT: ${UI_PORT:-18083}
-      KAIST_UI_ALLOWED_HOSTS: ${KAIST_UI_ALLOWED_HOSTS:?run setup.sh first}
+      KAIST_UI_ALLOWED_HOSTS: ${KAIST_UI_ALLOWED_HOSTS:?run ./start.sh first}
       KAIST_UI_USER: operator
       KAIST_UI_PASSWORD_FILE: /run/secrets/ui_password
       KAIST_AIRFLOW_API_URL: http://127.0.0.1:${AIRFLOW_PORT:-18082}
@@ -88,29 +106,24 @@ services:
       KAIST_NAS_RAW_ROOT: /data/raw
       KAIST_INTAKE_DB: /var/lib/kaist/catalog.sqlite
     volumes:
-      - ./code:/opt/kaist:ro
-      - ./config:/opt/kaist-config:ro
-      - ./state:/opt/airflow:ro
-      - ./intake_state:/var/lib/kaist
-      - ./secrets/ui_password:/run/secrets/ui_password:ro
+      - ${STACK_STATE_DIR:-.}/config:/opt/kaist-config:ro
+      - ${STACK_STATE_DIR:-.}/state:/opt/airflow:ro
+      - ${STACK_STATE_DIR:-.}/intake_state:/var/lib/kaist
+      - ${STACK_STATE_DIR:-.}/secrets/ui_password:/run/secrets/ui_password:ro
       - ${WORKER_SECRET_FILE}:/run/secrets/worker_token:ro
-      - ${NAS_RAW_HOST_PATH:?run setup.sh first}:/data/raw:ro
+      - ${NAS_RAW_HOST_PATH:?run ./start.sh first}:/data/raw:ro
 
 
   # ---- GPU 파이프라인 컨테이너 (SAM3 → 추적 → 3D 복원 → HaMBA·MANO → NAS 저장) ----
-  # repro/install.sh가 빌드·실행합니다. 프로필 gpu로만 켜집니다: docker compose --profile gpu up -d gpu-worker
+  # ./start.sh가 설정·빌드·점검 후 모든 서비스를 시작합니다.
   # 이미지 안 경로(/home/cw-wfm/...)는 검증된 환경의 절대경로를 그대로 쓴 것으로, PC 사용자 이름과 무관합니다.
   # Python 환경은 빌드 때 인터넷에서 받아 만들고, 모델 weight는 호스트 KAIST_WEIGHTS_ROOT에서 읽기 전용으로 마운트합니다.
   gpu-worker:
-    profiles: [gpu]
     build:
-      context: ./gpu
-      additional_contexts:
-        dependency-source: ./pipeline/dependency-source
-        rev: ${KAIST_REV_ROOT:-./pipeline/current}
-        worker: ./worker/app
+      context: .
+      target: gpu
       args:
-        HOST_UID: ${HOST_UID:?run setup.sh first}
+        HOST_UID: ${HOST_UID:?run ./start.sh first}
         # GPU 세대(compute capability). prepare_pc.py가 nvidia-smi로 채웁니다. 예: 4090=8.9
         TORCH_CUDA_ARCH_LIST: ${TORCH_CUDA_ARCH_LIST:-8.9}
     image: kaist-gpu:latest
@@ -139,16 +152,16 @@ services:
       - gpu-cache:/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace/runtime-cache
       # ---- 모델 weight (gpu/env/weights.txt와 같은 목록). 호스트 폴더가 없으면 시작하지 않습니다.
       # KAIST_WEIGHTS_ROOT 기본값은 원래 PC의 weight 위치(WFM_KAIST/workspace)입니다. ----
-      - {type: bind, read_only: true, bind: {create_host_path: false}, source: "${KAIST_WEIGHTS_ROOT:-/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace}/hf-cache/hub", target: "/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace/hf-cache/hub"}
-      - {type: bind, read_only: true, bind: {create_host_path: false}, source: "${KAIST_WEIGHTS_ROOT:-/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace}/runtime-cache/torch/hub", target: "/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace/runtime-cache/torch/hub"}
-      - {type: bind, read_only: true, bind: {create_host_path: false}, source: "${KAIST_WEIGHTS_ROOT:-/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace}/runtime-cache/iopath", target: "/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace/runtime-cache/iopath"}
-      - {type: bind, read_only: true, bind: {create_host_path: false}, source: "${KAIST_WEIGHTS_ROOT:-/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace}/kaist-full/PhysTwin/Mono/data_process/Hamba/_DATA/data/mano", target: "/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace/kaist-full/PhysTwin/Mono/data_process/Hamba/_DATA/data/mano"}
-      - {type: bind, read_only: true, bind: {create_host_path: false}, source: "${KAIST_WEIGHTS_ROOT:-/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace}/kaist-full/PhysTwin/Mono/data_process/Hamba/_DATA/data/mano_mean_params.npz", target: "/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace/kaist-full/PhysTwin/Mono/data_process/Hamba/_DATA/data/mano_mean_params.npz"}
-      - {type: bind, read_only: true, bind: {create_host_path: false}, source: "${KAIST_WEIGHTS_ROOT:-/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace}/kaist-full/PhysTwin/Mono/data_process/Hamba/_DATA/vitpose_ckpts", target: "/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace/kaist-full/PhysTwin/Mono/data_process/Hamba/_DATA/vitpose_ckpts"}
-      - {type: bind, read_only: true, bind: {create_host_path: false}, source: "${KAIST_WEIGHTS_ROOT:-/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace}/kaist-full/PhysTwin/Mono/data_process/Hamba/ckpts/hamba/checkpoints", target: "/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace/kaist-full/PhysTwin/Mono/data_process/Hamba/ckpts/hamba/checkpoints"}
-      - {type: bind, read_only: true, bind: {create_host_path: false}, source: "${KAIST_WEIGHTS_ROOT:-/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace}/kaist-full/PhysTwin/data_process/models/weights", target: "/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace/kaist-full/PhysTwin/data_process/models/weights"}
-      - {type: bind, read_only: true, bind: {create_host_path: false}, source: "${KAIST_WEIGHTS_ROOT:-/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace}/kaist-full/PhysTwin/data/mano_faces.pkl", target: "/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace/kaist-full/PhysTwin/data/mano_faces.pkl"}
-      - {type: bind, read_only: true, bind: {create_host_path: false}, source: "${KAIST_WEIGHTS_ROOT:-/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace}/kaist-full/PhysTwin/Mono/data/mano_faces.pkl", target: "/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace/kaist-full/PhysTwin/Mono/data/mano_faces.pkl"}
+      - {type: bind, read_only: true, bind: {create_host_path: false}, source: "${WEIGHT_HF_HUB:-${KAIST_WEIGHTS_ROOT:-/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace}/hf-cache/hub}", target: "/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace/hf-cache/hub"}
+      - {type: bind, read_only: true, bind: {create_host_path: false}, source: "${WEIGHT_TORCH_HUB:-${KAIST_WEIGHTS_ROOT:-/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace}/runtime-cache/torch/hub}", target: "/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace/runtime-cache/torch/hub"}
+      - {type: bind, read_only: true, bind: {create_host_path: false}, source: "${WEIGHT_VITDET:-${KAIST_WEIGHTS_ROOT:-/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace}/runtime-cache/iopath}", target: "/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace/runtime-cache/iopath"}
+      - {type: bind, read_only: true, bind: {create_host_path: false}, source: "${WEIGHT_MANO:-${KAIST_WEIGHTS_ROOT:-/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace}/kaist-full/PhysTwin/Mono/data_process/Hamba/_DATA/data/mano}", target: "/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace/kaist-full/PhysTwin/Mono/data_process/Hamba/_DATA/data/mano"}
+      - {type: bind, read_only: true, bind: {create_host_path: false}, source: "${WEIGHT_MANO_MEAN:-${KAIST_WEIGHTS_ROOT:-/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace}/kaist-full/PhysTwin/Mono/data_process/Hamba/_DATA/data/mano_mean_params.npz}", target: "/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace/kaist-full/PhysTwin/Mono/data_process/Hamba/_DATA/data/mano_mean_params.npz"}
+      - {type: bind, read_only: true, bind: {create_host_path: false}, source: "${WEIGHT_VITPOSE:-${KAIST_WEIGHTS_ROOT:-/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace}/kaist-full/PhysTwin/Mono/data_process/Hamba/_DATA/vitpose_ckpts}", target: "/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace/kaist-full/PhysTwin/Mono/data_process/Hamba/_DATA/vitpose_ckpts"}
+      - {type: bind, read_only: true, bind: {create_host_path: false}, source: "${WEIGHT_HAMBA:-${KAIST_WEIGHTS_ROOT:-/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace}/kaist-full/PhysTwin/Mono/data_process/Hamba/ckpts/hamba/checkpoints}", target: "/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace/kaist-full/PhysTwin/Mono/data_process/Hamba/ckpts/hamba/checkpoints"}
+      - {type: bind, read_only: true, bind: {create_host_path: false}, source: "${WEIGHT_SUPERGLUE:-${KAIST_WEIGHTS_ROOT:-/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace}/kaist-full/PhysTwin/data_process/models/weights}", target: "/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace/kaist-full/PhysTwin/data_process/models/weights"}
+      - {type: bind, read_only: true, bind: {create_host_path: false}, source: "${WEIGHT_MANO_FACES:-${KAIST_WEIGHTS_ROOT:-/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace}/kaist-full/PhysTwin/data/mano_faces.pkl}", target: "/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace/kaist-full/PhysTwin/data/mano_faces.pkl"}
+      - {type: bind, read_only: true, bind: {create_host_path: false}, source: "${WEIGHT_MANO_FACES_MONO:-${KAIST_WEIGHTS_ROOT:-/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace}/kaist-full/PhysTwin/Mono/data/mano_faces.pkl}", target: "/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace/kaist-full/PhysTwin/Mono/data/mano_faces.pkl"}
     deploy:
       resources:
         reservations:

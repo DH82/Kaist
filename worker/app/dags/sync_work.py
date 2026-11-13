@@ -57,13 +57,27 @@ def size(path):
     return sum(f.stat().st_size for f in path.rglob('*') if f.is_file() and not f.is_symlink()) if path.is_dir() else path.stat().st_size
 
 
+def history_dirs(project):
+    """99_history/<단계>/<ep> 보관본 폴더들. 원본 스크립트가 단계 이름 그대로(05_tracking, 06_reconstruction,
+    hands, approved …) 이전 시도를 옮겨 두므로, 이름을 고정하지 않고 찾아서 함께 올립니다."""
+    base = project / '99_history'
+    if not base.is_dir():
+        return []
+    return ['99_history/' + d.name for d in sorted(base.iterdir())
+            if d.is_dir() and not d.is_symlink() and d.name not in HISTORY_SKIP]
+
+
+# 에피소드별 보관본이 아닌 99_history 하위 폴더(잠금·임시 작업·매니페스트·업로드 기록)
+HISTORY_SKIP = {'locks', 'staging', 'manifests', 'nas_sync'}
+
+
 def sync_episode(cfg, ep, log=print):
     project = Path(cfg['project_dir'])
     nas = work_root(cfg)
     if not Path(cfg['nas_mount']).is_mount():
         raise RuntimeError('NAS가 마운트되어 있지 않습니다: ' + cfg['nas_mount'])
     copied, removed, total = [], [], 0
-    for d in STAGE_DIRS:
+    for d in list(dict.fromkeys(STAGE_DIRS + history_dirs(project))):
         src, dst = project / d / ep, nas / d / ep
         if src.is_dir() and not src.is_symlink():
             rsync(src, dst)
@@ -92,6 +106,60 @@ def sync_episode(cfg, ep, log=print):
     out.write_text(json.dumps(record, ensure_ascii=False, indent=2))
     log(f'NAS 작업 폴더 업로드 완료: {ep} → {nas} ({len(copied)}개 경로, {total/1e9:.2f} GB, 검증 통과)')
     return record
+
+
+def published_to_nas(project, ep):
+    """최종 저장(publish)이 NAS results에 끝났는지. NAS가 없어 로컬(07_deliverables/local_results)에
+    저장된 경우는 False — 그때는 로컬이 유일한 사본이므로 지우면 안 됩니다."""
+    for f in sorted((Path(project) / '_airflow' / ep).glob('*/published.json')):
+        try:
+            rec = json.loads(f.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if rec.get('storage') == 'nas' and Path(rec.get('destination') or '/nonexistent').is_dir():
+            return True
+    return False
+
+
+def purge_local(cfg, ep, record, log=print):
+    """최종 결과가 NAS results에 저장되고 작업 폴더도 NAS에 검증 업로드된 에피소드의 로컬 사본을 지웁니다.
+
+    - 최종 저장이 NAS에 된 경우에만 (published_to_nas)
+    - 지우기 직전에 rsync로 다시 비교해 NAS 사본과 차이가 0건일 때만
+    - 이번 업로드에서 검증한 경로(record['paths'])만 지웁니다. 심볼릭 링크는 따라가지 않습니다.
+    - NAS 99_history/nas_sync/<ep>.json에 삭제 기록을 남깁니다(복원은 NAS work/<pc>에서 같은 경로로 복사).
+    """
+    project = Path(cfg['project_dir']).resolve()
+    if not published_to_nas(project, ep):
+        log(f'로컬 작업 파일 유지: {ep} — 최종 결과가 NAS results에 저장되지 않았습니다.')
+        return []
+    nas = work_root(cfg)
+    diff = []
+    for rel in record['paths']:
+        diff += rsync(project / rel, nas / rel, dry=True)
+    if diff:
+        raise RuntimeError(f'로컬 삭제 중단 — NAS 사본과 다릅니다 ({len(diff)}건): ' + '; '.join(diff[:5]))
+    deleted, freed = [], 0
+    for rel in record['paths']:
+        p = project / rel
+        # 이 에피소드 이름의 폴더/파일이고 작업 폴더 안에 있을 때만 지웁니다.
+        if p.name not in (ep, ep + '.json') or not p.parent.resolve().is_relative_to(project):
+            raise RuntimeError('로컬 삭제 대상이 에피소드 경로가 아닙니다: ' + str(p))
+        if p.is_symlink():
+            p.unlink()
+        elif p.is_dir():
+            freed += size(p); shutil.rmtree(p)
+        elif p.is_file():
+            freed += size(p); p.unlink()
+        else:
+            continue
+        deleted.append(rel)
+    out = nas / '99_history/nas_sync' / f'{ep}.json'
+    rec = json.loads(out.read_text()) if out.is_file() else dict(record)
+    rec.update(local_deleted=deleted, local_deleted_at=datetime.datetime.now().astimezone().isoformat(), local_freed_bytes=freed)
+    out.write_text(json.dumps(rec, ensure_ascii=False, indent=2))
+    log(f'로컬 작업 파일 삭제 완료: {ep} ({len(deleted)}개 경로, {freed/1e9:.2f} GB 확보) — NAS 사본: {nas}')
+    return deleted
 
 
 if __name__ == '__main__':

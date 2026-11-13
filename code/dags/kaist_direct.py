@@ -22,8 +22,10 @@ for worker_id,mode,dag_id in dag_entries():
         params.update(sam_prompt=Param(type='string',minLength=1,maxLength=200),
                       sam_scene=Param('2d',enum=['2d']),sam_settings_confirmed=Param(False,type='boolean'),
                       # text: 기존 텍스트 분할 / bbox_track: 첫 프레임 bbox+텍스트 단일 물체 추적(테스트 옵션)
-                      sam_object_mode=Param('text',enum=['text','bbox_track']),
-                      sam_object_bboxes=Param(None,type=['null','object']))
+                      # point_track: 첫 프레임 포인트(포함/제외)+텍스트 단일 물체 추적(테스트 옵션)
+                      sam_object_mode=Param('text',enum=['text','bbox_track','point_track']),
+                      sam_object_bboxes=Param(None,type=['null','object']),
+                      sam_object_points=Param(None,type=['null','object']))
     with DAG(dag_id,schedule=None,catchup=False,start_date=datetime(2026,1,1,tzinfo=timezone.utc),
              max_active_runs=MAX_PARALLEL_RUNS,max_active_tasks=MAX_PARALLEL_RUNS,is_paused_upon_creation=True,
              params=params,tags=['kaist',worker_id,'연결됨' if pc['enabled'] else '미연결'],
@@ -34,7 +36,7 @@ for worker_id,mode,dag_id in dag_entries():
             # worker_id는 DAG에 고정합니다. 실행 파라미터를 바꿔 다른 PC로 우회하지 않습니다.
             task=PythonSensor(task_id=stage,python_callable=poll,
                               op_kwargs={'stage':stage,'worker_id':worker_id},mode='reschedule',
-                              poke_interval=15,timeout=7*24*3600)
+                              poke_interval=15,timeout=7*24*3600)  # 15초 간격 확인. 5초로 줄이면 이전 확인의 종료 보고보다 다음 확인이 먼저 예약돼 Airflow가 "state mismatch"로 실패 처리합니다(2026-11-13). 승인 직후는 UI가 바로 깨웁니다(nudge).
             if previous:previous >> task
             previous=task
     globals()[dag_id]=dag

@@ -306,9 +306,30 @@ def worker_info():
             'gpu':gpu,'server':cfg.get('server_label',__import__('socket').gethostname()),'raw_root':cfg['raw_root'],'project_dir':cfg['project_dir'],
             'nas_ready':Path(cfg['nas_mount']).is_mount(),'worker_kind':'ssh','server_airflow_required':False}
 
+def gpu_status():
+    """UI 사이드바의 GPU 메모리 표시용: GPU별 사용/전체 메모리(MiB)와 사용률, GPU 메모리를 쓰는 프로세스."""
+    q=lambda args:[[v.strip() for v in line.split(',')] for line in subprocess.check_output(
+        ['nvidia-smi',*args,'--format=csv,noheader,nounits'],text=True,timeout=10).strip().splitlines() if ',' in line]
+    num=lambda v:int(float(v)) if v.replace('.','',1).isdigit() else None
+    gpus=[{'index':num(i),'name':n,'uuid':u,'used_mb':num(used),'total_mb':num(total),'util':num(util)}
+          for i,n,u,used,total,util in q(['--query-gpu=index,name,uuid,memory.used,memory.total,utilization.gpu'])]
+    try:apps=q(['--query-compute-apps=gpu_uuid,pid,process_name,used_memory'])
+    except (OSError,subprocess.SubprocessError,ValueError):apps=[]
+    for g in gpus:
+        g['processes']=[{'pid':num(pid),'name':Path(name.split(' --')[0]).name[:60],'used_mb':num(mem)} for u,pid,name,mem in apps if u==g['uuid']]
+    return gpus
+
+@app.get('/worker/gpu')
+def worker_gpu():
+    cfg=json.loads((ROOT/'config/gpu_4090_a.json').read_text())
+    try:gpus=gpu_status()
+    except (OSError,subprocess.SubprocessError,ValueError) as error:raise HTTPException(503,f'nvidia-smi 조회 실패: {error}') from error
+    return {'gpus':gpus,'worker_gpu_uuid':cfg.get('gpu_uuid')}
+
 @app.post('/worker/jobs/{action}')
 async def jobs(action:str,request:Request):
-    if action not in ('start','status','retry'):raise HTTPException(404)
+    # stop: 실행 강제 종료 · skip: 시작 전 단계 건너뜀 · sync/sync-status: 에피소드 작업 폴더를 NAS에 올리기 (모두 runner.py가 새 프로세스로 처리)
+    if action not in ('start','status','retry','stop','skip','sync','sync-status'):raise HTTPException(404)
     raw=await request.body()
     if len(raw)>8192:raise HTTPException(413)
     r=subprocess.run(['/usr/bin/python3',str(WORKER_ROOT/'runner.py'),action],input=raw,capture_output=True,timeout=20)

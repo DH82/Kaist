@@ -2,12 +2,24 @@ let outputRoot='project',outputPath='',outputListing=null,outputSeq=0,outputRoot
 function outputUrl(action,values={}){return '/api/outputs/'+action+'?'+new URLSearchParams({worker_id:action.startsWith('preview')?selectedWorker():($('outputWorker').value||selectedWorker()),...values})}
 const fileSize=n=>n==null?'—':n<1024?n+' B':n<1048576?(n/1024).toFixed(1)+' KB':n<1073741824?(n/1048576).toFixed(1)+' MB':(n/1073741824).toFixed(2)+' GB';
 const fileDate=t=>new Date(t*1000).toLocaleString('ko-KR',{timeZone:'Asia/Seoul'});
+let outputCatalog=null;
 async function loadOutputCatalog(){
- const wid=$('outputWorker').value;const tree=$('outputTree');tree.textContent='서버 결과 폴더를 읽는 중…';
- try{const data=await api(outputUrl('catalog',{root:outputRoot}));if(wid!==$('outputWorker').value)return;$('dateBasis').textContent=data.date_basis+' 기준 · 생성된 결과만 표시';
- tree.innerHTML=data.groups.map((group,i)=>'<details '+(i===0?'open':'')+'><summary>📁 '+escape(group.date)+'</summary>'+group.episodes.map(ep=>'<details class="episodeFolder"><summary>📁 '+escape(ep.episode)+'</summary>'+ep.folders.map(f=>'<button class="folderLink" data-root="'+escape(f.root)+'" data-path="'+escape(f.path)+'">📁 '+escape(f.label)+'</button>').join('')+'</details>').join('')+'</details>').join('')||'<p class="help">아직 생성된 결과가 없습니다.</p>';
- tree.querySelectorAll('[data-path]').forEach(button=>button.onclick=()=>browseOutputs(button.dataset.path,button.dataset.root));
+ const wid=$('outputWorker').value;const tree=$('outputTree');tree.textContent='서버 결과 폴더를 읽는 중…';outputCatalog=null;
+ try{const [data]=await Promise.all([api(outputUrl('catalog',{root:outputRoot})),loadHidden('outputs')]);if(wid!==$('outputWorker').value)return;$('dateBasis').textContent=data.date_basis+' 기준 · 생성된 결과만 표시';
+ outputCatalog=data;renderOutputTree();
  }catch(e){tree.textContent=e.message}
+}
+// 에피소드 폴더마다 NAS에 올리기 · 강제 종료 · 목록에서 삭제(숨김) 버튼 (파이프라인 결과에서만)
+function renderOutputTree(){
+ const data=outputCatalog,tree=$('outputTree');if(!data)return;
+ const manage=outputRoot==='project',first=!tree.querySelector('details');
+ const open=new Set([...tree.querySelectorAll('details[open]')].map(d=>d.dataset.k));
+ let hiddenCount=0;
+ const groups=data.groups.map(g=>({...g,episodes:g.episodes.filter(ep=>{const h=manage&&isHidden('outputs',ep.episode);if(h)hiddenCount++;return !h||showHidden.outputs})})).filter(g=>g.episodes.length);
+ tree.innerHTML=(manage&&(hiddenCount||showHidden.outputs)?'<p>'+hiddenToggleHtml('outputs',hiddenCount)+'</p>':'')+(groups.map((group,i)=>'<details data-k="'+escape('d:'+group.date)+'" '+((first?i===0:open.has('d:'+group.date))?'open':'')+'><summary>📁 '+escape(group.date)+'</summary>'+group.episodes.map(ep=>{const hidden=manage&&isHidden('outputs',ep.episode);
+  return '<details class="episodeFolder'+(hidden?' hiddenRow':'')+'" data-k="'+escape('e:'+ep.episode)+'" '+(open.has('e:'+ep.episode)?'open':'')+'><summary>📁 '+escape(ep.episode)+'</summary>'+(manage?'<div class="outputEpActions">'+episodeActionsHtml({episode:ep.episode,scope:'outputs',key:ep.episode,active:null,hidden})+'</div>':'')+ep.folders.map(f=>'<button class="folderLink" data-root="'+escape(f.root)+'" data-path="'+escape(f.path)+'">📁 '+escape(f.label)+'</button>').join('')+'</details>'}).join('')+'</details>').join('')||'<p class="help">'+(hiddenCount?'모든 결과를 목록에서 숨겼습니다.':'아직 생성된 결과가 없습니다.')+'</p>');
+ tree.querySelectorAll('[data-path]').forEach(button=>button.onclick=()=>browseOutputs(button.dataset.path,button.dataset.root));
+ if(manage)bindEpisodeActions(tree,renderOutputTree);
 }
 async function browseOutputs(path='',root=outputRoot){
  const seq=++outputSeq;$('outputRows').innerHTML='<tr><td colspan="4">파일 목록을 불러오는 중…</td></tr>';$('outputPreview').innerHTML='<p class="help">파일을 클릭하면 여기에서 확인할 수 있습니다.</p>';
@@ -48,7 +60,7 @@ function updateLaunch(){
  // 버튼이 왜 눌리지 않는지, 마지막 실행 요청이 왜 거절됐는지 버튼 바로 아래에 보여 줍니다.
  const ep=$('episode').value;if(launchErrorFor!==ep){launchError='';launchErrorFor=ep}
  const reason=busy?'실행 요청 중…':!connected?'서버 연결을 확인하는 중입니다. 잠시 후 다시 시도하세요.':!ep?'RAW 표에서 에피소드를 선택하세요.':selected?.can_run===false?'다른 작업자가 선택한 데이터라 실행할 수 없습니다.'
-  :previewEpisode!==ep||previewLoaded.size!==2?'사진 2장을 불러온 뒤 실행할 수 있습니다.':!$('prompt').value.trim()?'SAM3 분할 대상을 입력하세요.':!objectModeReady()?'카메라 4개 모두 첫 프레임에 bbox를 그리세요.':!$('confirmed').checked?'"사진과 분할 대상을 확인했습니다"를 체크하세요.':'';
+  :previewEpisode!==ep||previewLoaded.size!==2?'사진 2장을 불러온 뒤 실행할 수 있습니다.':!$('prompt').value.trim()?'SAM3 분할 대상을 입력하세요.':!objectModeReady()?objectModeHint():!$('confirmed').checked?'"사진과 분할 대상을 확인했습니다"를 체크하세요.':'';
  const hint=$('launchHint');hint.textContent=launchError?'실행 거절: '+launchError:reason;hint.classList.toggle('error',!!launchError);
 }
 async function loadEpisodePreview(){
@@ -73,49 +85,85 @@ $('episode').onchange=()=>{$('prompt').value='';loadEpisodePreview()};
 $('refreshPreview').onclick=loadEpisodePreview;
 $('confirmed').onchange=updateLaunch;$('prompt').oninput=updateLaunch;
 
-// 선택 옵션: 첫 프레임 bbox + 텍스트 → 단일 물체 추적. RAW cam_1~4 첫 프레임에 그린 bbox를 정규화(x,y,w,h)해 보냅니다.
-let objectBoxes={},bboxLoaded=new Set(),bboxEpisode='',bboxGeneration=0;
-function objectModeReady(){return $('objectMode').value!=='bbox_track'||(bboxEpisode===$('episode').value&&[1,2,3,4].every(c=>objectBoxes[c]))}
+// 선택 옵션: 첫 프레임 bbox 또는 포인트 + 텍스트 → 단일 물체 추적. RAW cam_1~4 첫 프레임에 그린 bbox(x,y,w,h)나
+// 클릭한 포인트([x,y,label], label 1=포함 0=제외)를 0~1로 정규화해 보냅니다.
+let objectBoxes={},objectPoints={},bboxLoaded=new Set(),bboxEpisode='',bboxGeneration=0;
+function objectMode(){return $('objectMode').value}
+function camPointsReady(c){return (objectPoints[c]||[]).some(p=>p[2]===1)}
+function objectModeReady(){
+ const m=objectMode();if(m==='text')return true;if(bboxEpisode!==$('episode').value)return false;
+ return [1,2,3,4].every(c=>m==='bbox_track'?objectBoxes[c]:camPointsReady(c));
+}
+function objectModeHint(){return objectMode()==='point_track'?'카메라 4개 모두 첫 프레임에서 물체를 클릭하세요(포함 포인트 1개 이상).':'카메라 4개 모두 첫 프레임에 bbox를 그리세요.'}
 function objectBboxPayload(){
- if($('objectMode').value!=='bbox_track')return null;
+ if(objectMode()!=='bbox_track')return null;
  const result={};for(const c of [1,2,3,4])result[String(c-1)]=objectBoxes[c].map(v=>Math.round(v*10000)/10000);return result;
 }
-function paintBox(canvas,box){
- const r=canvas.getBoundingClientRect(),dpr=window.devicePixelRatio||1;canvas.width=Math.round(r.width*dpr);canvas.height=Math.round(r.height*dpr);
- const ctx=canvas.getContext('2d');ctx.clearRect(0,0,canvas.width,canvas.height);if(!box)return;
- const [x,y,w,h]=box;ctx.fillStyle='rgba(255,210,0,.15)';ctx.strokeStyle='#ffd200';ctx.lineWidth=2*dpr;
- ctx.fillRect(x*canvas.width,y*canvas.height,w*canvas.width,h*canvas.height);ctx.strokeRect(x*canvas.width,y*canvas.height,w*canvas.width,h*canvas.height);
+function objectPointPayload(){
+ if(objectMode()!=='point_track')return null;
+ const result={};for(const c of [1,2,3,4])result[String(c-1)]=objectPoints[c].map(([x,y,l])=>[Math.round(x*10000)/10000,Math.round(y*10000)/10000,l]);return result;
 }
+function paintBox(canvas,box,points){
+ const r=canvas.getBoundingClientRect(),dpr=window.devicePixelRatio||1;canvas.width=Math.round(r.width*dpr);canvas.height=Math.round(r.height*dpr);
+ const ctx=canvas.getContext('2d');ctx.clearRect(0,0,canvas.width,canvas.height);
+ if(box){
+  const [x,y,w,h]=box;ctx.fillStyle='rgba(255,210,0,.15)';ctx.strokeStyle='#ffd200';ctx.lineWidth=2*dpr;
+  ctx.fillRect(x*canvas.width,y*canvas.height,w*canvas.width,h*canvas.height);ctx.strokeRect(x*canvas.width,y*canvas.height,w*canvas.width,h*canvas.height);
+ }
+ const rad=6*dpr;
+ for(const [x,y,l] of points||[]){
+  const cx=x*canvas.width,cy=y*canvas.height;
+  ctx.beginPath();ctx.arc(cx,cy,rad,0,Math.PI*2);ctx.fillStyle=l?'#22c55e':'#ef4444';ctx.fill();ctx.lineWidth=2*dpr;ctx.strokeStyle='white';ctx.stroke();
+  ctx.beginPath();ctx.moveTo(cx-rad*.55,cy);ctx.lineTo(cx+rad*.55,cy);if(l){ctx.moveTo(cx,cy-rad*.55);ctx.lineTo(cx,cy+rad*.55)}ctx.stroke();
+ }
+}
+function paintCam(canvas){const c=+canvas.dataset.cam;paintBox(canvas,objectMode()==='bbox_track'?objectBoxes[c]:null,objectMode()==='point_track'?objectPoints[c]:null)}
 function bboxStatus(){
- const done=[1,2,3,4].filter(c=>objectBoxes[c]).length;
- $('bboxStatus').textContent=bboxLoaded.size<4?'첫 프레임 사진을 불러오는 중…':done<4?'bbox '+done+'/4 · 남은 카메라에도 그려야 실행할 수 있습니다.':'bbox 4/4 완료. SAM3에서 카메라별 초기 마스크를 고른 뒤 그 물체만 추적합니다. 결과는 마스크 검수에서 확인합니다.';
+ const point=objectMode()==='point_track',done=[1,2,3,4].filter(c=>point?camPointsReady(c):objectBoxes[c]).length,word=point?'포인트':'bbox';
+ $('bboxStatus').textContent=bboxLoaded.size<4?'첫 프레임 사진을 불러오는 중…':done<4?word+' '+done+'/4 · 남은 카메라에도 '+(point?'물체를 클릭해야':'그려야')+' 실행할 수 있습니다.':word+' 4/4 완료. SAM3에서 카메라별 초기 마스크를 고른 뒤 그 물체만 추적합니다. 결과는 마스크 검수에서 확인합니다.';
  updateLaunch();
 }
+function pointLabel(c){const pts=objectPoints[c]||[],pos=pts.filter(p=>p[2]===1).length;return pts.length?'<b>포함 '+pos+' · 제외 '+(pts.length-pos)+'</b> <button type="button" class="linkbtn" data-clear="'+c+'">지우기</button>':'포인트 없음'}
 function loadBboxPicker(){
- const episode=$('episode').value,on=$('objectMode').value==='bbox_track',generation=++bboxGeneration;
- objectBoxes={};bboxLoaded=new Set();bboxEpisode='';$('bboxPicker').classList.toggle('hidden',!on);
+ const episode=$('episode').value,mode=objectMode(),on=mode!=='text',point=mode==='point_track',generation=++bboxGeneration;
+ objectBoxes={};objectPoints={};bboxLoaded=new Set();bboxEpisode='';$('bboxPicker').classList.toggle('hidden',!on);
+ $('bboxHelpBox').hidden=point;$('bboxHelpPoint').hidden=!point;
  if(!on){updateLaunch();return}
  if(!episode){$('bboxImages').textContent='에피소드를 선택하세요.';$('bboxStatus').textContent='';updateLaunch();return}
- $('bboxImages').innerHTML=[1,2,3,4].map(c=>'<figure><div class="bboxStage"><img alt="카메라 '+c+' 첫 프레임" data-cam="'+c+'"><canvas data-cam="'+c+'" role="img" aria-label="카메라 '+c+' 물체 bbox 그리기"></canvas></div><figcaption>카메라 '+c+' · 첫 프레임 · <span data-box="'+c+'">bbox 없음</span></figcaption></figure>').join('');
+ $('bboxImages').innerHTML=[1,2,3,4].map(c=>'<figure><div class="bboxStage"><img alt="카메라 '+c+' 첫 프레임" data-cam="'+c+'"><canvas data-cam="'+c+'" role="img" aria-label="카메라 '+c+' 물체 '+(point?'포인트 찍기':'bbox 그리기')+'"></canvas></div><figcaption>카메라 '+c+' · 첫 프레임 · <span data-box="'+c+'">'+(point?'포인트 없음':'bbox 없음')+'</span></figcaption></figure>').join('');
  for(const img of $('bboxImages').querySelectorAll('img')){
   const cam=+img.dataset.cam,canvas=img.nextElementSibling,label=$('bboxImages').querySelector('[data-box="'+cam+'"]');
-  img.onload=()=>{if(generation!==bboxGeneration)return;bboxLoaded.add(cam);if(bboxLoaded.size===4)bboxEpisode=episode;paintBox(canvas,objectBoxes[cam]);bboxStatus()};
+  img.onload=()=>{if(generation!==bboxGeneration)return;bboxLoaded.add(cam);if(bboxLoaded.size===4)bboxEpisode=episode;paintCam(canvas);bboxStatus()};
   img.onerror=()=>{if(generation!==bboxGeneration)return;$('bboxStatus').textContent='첫 프레임 사진을 불러오지 못했습니다. 다시 불러오기를 눌러주세요.';updateLaunch()};
-  let start=null;
-  const point=e=>{const r=canvas.getBoundingClientRect();return [Math.min(1,Math.max(0,(e.clientX-r.left)/r.width)),Math.min(1,Math.max(0,(e.clientY-r.top)/r.height))]};
-  const boxOf=(a,b)=>[Math.min(a[0],b[0]),Math.min(a[1],b[1]),Math.abs(a[0]-b[0]),Math.abs(a[1]-b[1])];
-  canvas.onpointerdown=e=>{if(!bboxLoaded.has(cam))return;start=point(e);canvas.setPointerCapture(e.pointerId);e.preventDefault()};
-  canvas.onpointermove=e=>{if(start)paintBox(canvas,boxOf(start,point(e)))};
-  canvas.onpointerup=e=>{if(!start)return;const box=boxOf(start,point(e));start=null;
-   if(box[2]>=0.01&&box[3]>=0.01){objectBoxes[cam]=box;label.innerHTML='<b>bbox 지정됨</b>'}
-   paintBox(canvas,objectBoxes[cam]);bboxStatus()};
-  canvas.onpointercancel=()=>{start=null;paintBox(canvas,objectBoxes[cam])};
+  const at=e=>{const r=canvas.getBoundingClientRect();return [Math.min(1,Math.max(0,(e.clientX-r.left)/r.width)),Math.min(1,Math.max(0,(e.clientY-r.top)/r.height))]};
+  if(point){
+   // 왼쪽 클릭 = 포함(초록), Shift+클릭 또는 오른쪽 클릭 = 제외(빨강). 카메라당 최대 20개.
+   const refresh=()=>{label.innerHTML=pointLabel(cam);const b=label.querySelector('[data-clear]');if(b)b.onclick=()=>{objectPoints[cam]=[];refresh()};paintCam(canvas);bboxStatus()};
+   canvas.oncontextmenu=e=>e.preventDefault();
+   canvas.onpointerdown=e=>{
+    if(!bboxLoaded.has(cam)||(e.button!==0&&e.button!==2))return;e.preventDefault();
+    const pts=objectPoints[cam]||(objectPoints[cam]=[]),neg=e.button===2||e.shiftKey;
+    if(neg&&!pts.some(p=>p[2]===1)){$('bboxStatus').textContent='카메라 '+cam+': 먼저 물체 위를 왼쪽 클릭해 포함 포인트를 찍으세요.';return}
+    if(pts.length>=20){$('bboxStatus').textContent='카메라 '+cam+': 포인트는 20개까지입니다. 지우기 후 다시 찍으세요.';return}
+    const [x,y]=at(e);pts.push([x,y,neg?0:1]);refresh();
+   };
+   canvas.style.cursor='copy';
+  }else{
+   let start=null;
+   const boxOf=(a,b)=>[Math.min(a[0],b[0]),Math.min(a[1],b[1]),Math.abs(a[0]-b[0]),Math.abs(a[1]-b[1])];
+   canvas.onpointerdown=e=>{if(!bboxLoaded.has(cam))return;start=at(e);canvas.setPointerCapture(e.pointerId);e.preventDefault()};
+   canvas.onpointermove=e=>{if(start)paintBox(canvas,boxOf(start,at(e)))};
+   canvas.onpointerup=e=>{if(!start)return;const box=boxOf(start,at(e));start=null;
+    if(box[2]>=0.01&&box[3]>=0.01){objectBoxes[cam]=box;label.innerHTML='<b>bbox 지정됨</b>'}
+    paintCam(canvas);bboxStatus()};
+   canvas.onpointercancel=()=>{start=null;paintCam(canvas)};
+  }
   img.src=outputUrl('preview',{episode,cam,position:0});
  }
  bboxStatus();
 }
 $('objectMode').onchange=loadBboxPicker;
-window.addEventListener('resize',()=>{for(const canvas of $('bboxImages').querySelectorAll('canvas'))paintBox(canvas,objectBoxes[+canvas.dataset.cam])});
+window.addEventListener('resize',()=>{for(const canvas of $('bboxImages').querySelectorAll('canvas'))paintCam(canvas)});
 
 function revealSamPreview(){ $('samPreview').classList.remove('hidden');$('prompt').setAttribute('aria-expanded','true') }
 $('prompt').onfocus=revealSamPreview;$('prompt').onclick=revealSamPreview;

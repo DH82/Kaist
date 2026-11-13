@@ -39,6 +39,8 @@ check('GPU (nvidia-smi)', ['nvidia-smi', '-i', cfg['gpu_uuid'], '--query-gpu=nam
 check('ffmpeg', ['bash', '-c', 'ffmpeg -version | head -1'])
 check('xvfb-run', ['xvfb-run', '-a', 'true'])
 check('SAM3 환경 (sam-env)', code('sam', "import torch,sam3;x=torch.ones(1024,1024,device='cuda');print('torch',torch.__version__,torch.cuda.get_device_name(0),float((x@x).sum()))"))
+check('3D CUDA 확장', code('phystwin', "import torch;from pytorch3d import _C;import diffoctreerast._C,diff_gaussian_rasterization._C;import nvdiffrast.torch as dr;c=dr.RasterizeCudaContext();p=torch.tensor([[[-0.5,-0.5,0,1],[0.5,-0.5,0,1],[0,0.5,0,1]]],dtype=torch.float32,device='cuda');t=torch.tensor([[0,1,2]],dtype=torch.int32,device='cuda');r,_=dr.rasterize(c,p,t,(16,16));assert (r[...,3]>0).any();print('CUDA rasterization OK')"))
+check('HaMBA CUDA 확장', code('hamba', "import torch;from pytorch3d import _C;import selective_scan_cuda_oflex;print('PyTorch3D / selective_scan imports OK')"))
 if not RUNTIME_ONLY:
     check('SAM3.1 모델 캐시', code('sam', "from huggingface_hub import snapshot_download as s;print(s('facebook/sam3.1',local_files_only=True))"))
     check('추적 (tracking_worker check)', [py['phystwin'], str(scripts / 'tracking_worker.py'), 'check', '--repo', env.get('KP_COTRACKER_REPO', '')], cwd=phystwin)

@@ -15,9 +15,14 @@ export TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST:-8.9} MAX_JOBS=${MAX_JOBS:-4}
 TORCH_INDEX=https://download.pytorch.org/whl/cu128
 KAOLIN_LINKS=https://nvidia-kaolin.s3.us-east-2.amazonaws.com/torch-2.7.0_cu128.html
 
-pinned() {  # 고정 버전 목록을 의존성 해석 없이 그대로 설치
-  uv pip install --python "$1" --no-deps \
-    --extra-index-url "$TORCH_INDEX" --find-links "$KAOLIN_LINKS" -r "$2"
+pinned() {  # PyTorch wheels use their own index; other pinned packages use PyPI.
+  local torch_lock rest_lock
+  torch_lock=$(mktemp); rest_lock=$(mktemp)
+  grep -E '^(torch|torchvision)==' "$2" > "$torch_lock"
+  grep -vE '^(torch|torchvision)==' "$2" > "$rest_lock"
+  uv pip install --python "$1" --no-deps --index-url "$TORCH_INDEX" -r "$torch_lock"
+  uv pip install --python "$1" --no-deps --find-links "$KAOLIN_LINKS" -r "$rest_lock"
+  rm -f "$torch_lock" "$rest_lock"
 }
 source_build() {  # 이미 설치된 torch로 CUDA 확장 빌드
   uv pip install --python "$1" --no-deps --no-build-isolation "${@:2}"
@@ -54,6 +59,7 @@ case "${1:?python|sam|phystwin|hamba}" in
     HAMBA="$DEP/kaist-full/PhysTwin/Mono/data_process/Hamba"
     uv venv --python 3.10.22 "$DEP/hamba-env"
     pinned "$PY" "$LOCK/hamba.lock"
+    "$PY" "$LOCK/patch_selective_scan.py" "$HAMBA/VMamba/kernels/selective_scan/setup.py"
     source_build "$PY" mmcv==1.3.9 \
       'chumpy @ git+https://github.com/mattloper/chumpy@580566eafc9ac68b2614b64d6f7aaa84eebb70da'
     source_build "$PY" \

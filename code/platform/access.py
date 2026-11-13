@@ -10,6 +10,8 @@ def db():
  c.execute('CREATE TABLE IF NOT EXISTS execution_versions (run_id TEXT PRIMARY KEY, raw_episode TEXT NOT NULL, episode TEXT UNIQUE NOT NULL, number INTEGER NOT NULL, operator TEXT NOT NULL, UNIQUE(raw_episode,number))')
  c.execute('CREATE TABLE IF NOT EXISTS execution_workers (run_id TEXT PRIMARY KEY, episode TEXT UNIQUE NOT NULL, worker_id TEXT NOT NULL)')
  c.execute('CREATE TABLE IF NOT EXISTS ui_audit (at REAL,name TEXT,action TEXT)')
+ # 목록에서 삭제(숨김): 실제 데이터·실행 기록은 지우지 않습니다. scope=jobs|outputs|review
+ c.execute('CREATE TABLE IF NOT EXISTS ui_hidden (scope TEXT NOT NULL,key TEXT NOT NULL,episode TEXT,name TEXT,at REAL,PRIMARY KEY(scope,key))')
  return c
 
 def login(name,role):
