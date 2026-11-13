@@ -38,14 +38,21 @@ $('refreshOutputs').onclick=()=>openOutputExplorer();
 
 // Episode selection must remain visible while checking the SAM3 target.
 let previewEpisode='',previewLoaded=new Set(),previewGeneration=0;
+let launchError='',launchErrorFor='';
 function updateLaunch(){
  const mode='pipeline';
  const selected=rawEpisodes.find(e=>e.episode===$('episode').value);
  $('episodeOwner').textContent=!selected?'RAW 표에서 에피소드를 선택하세요.':selected?.operator?(selected.can_run?'내가 선택한 데이터입니다.':selected.operator+' 작업자가 선택한 데이터입니다. 이미지 확인만 가능하며 중복 실행할 수 없습니다.'):'아직 다른 작업자가 선택하지 않은 데이터입니다.';
- const ready=mode!=='pipeline'||(previewEpisode===$('episode').value&&previewLoaded.size===2&&$('confirmed').checked&&$('prompt').value.trim());
+ const ready=mode!=='pipeline'||(previewEpisode===$('episode').value&&previewLoaded.size===2&&$('confirmed').checked&&$('prompt').value.trim()&&objectModeReady());
  $('launch').disabled=busy||!connected||!ready||(mode!=='test'&&(!$('episode').value||selected?.can_run===false));
+ // 버튼이 왜 눌리지 않는지, 마지막 실행 요청이 왜 거절됐는지 버튼 바로 아래에 보여 줍니다.
+ const ep=$('episode').value;if(launchErrorFor!==ep){launchError='';launchErrorFor=ep}
+ const reason=busy?'실행 요청 중…':!connected?'서버 연결을 확인하는 중입니다. 잠시 후 다시 시도하세요.':!ep?'RAW 표에서 에피소드를 선택하세요.':selected?.can_run===false?'다른 작업자가 선택한 데이터라 실행할 수 없습니다.'
+  :previewEpisode!==ep||previewLoaded.size!==2?'사진 2장을 불러온 뒤 실행할 수 있습니다.':!$('prompt').value.trim()?'SAM3 분할 대상을 입력하세요.':!objectModeReady()?'카메라 4개 모두 첫 프레임에 bbox를 그리세요.':!$('confirmed').checked?'"사진과 분할 대상을 확인했습니다"를 체크하세요.':'';
+ const hint=$('launchHint');hint.textContent=launchError?'실행 거절: '+launchError:reason;hint.classList.toggle('error',!!launchError);
 }
 async function loadEpisodePreview(){
+ loadBboxPicker();
  const episode=$('episode').value;const generation=++previewGeneration;previewEpisode='';previewLoaded=new Set();$('confirmed').checked=false;$('confirmed').disabled=true;updateLaunch();
  if(!episode){$('episodeImages').textContent='에피소드를 선택하세요.';return}
  $('episodeImages').textContent='이미지를 불러오는 중…';
@@ -65,6 +72,50 @@ async function loadEpisodePreview(){
 $('episode').onchange=()=>{$('prompt').value='';loadEpisodePreview()};
 $('refreshPreview').onclick=loadEpisodePreview;
 $('confirmed').onchange=updateLaunch;$('prompt').oninput=updateLaunch;
+
+// 선택 옵션: 첫 프레임 bbox + 텍스트 → 단일 물체 추적. RAW cam_1~4 첫 프레임에 그린 bbox를 정규화(x,y,w,h)해 보냅니다.
+let objectBoxes={},bboxLoaded=new Set(),bboxEpisode='',bboxGeneration=0;
+function objectModeReady(){return $('objectMode').value!=='bbox_track'||(bboxEpisode===$('episode').value&&[1,2,3,4].every(c=>objectBoxes[c]))}
+function objectBboxPayload(){
+ if($('objectMode').value!=='bbox_track')return null;
+ const result={};for(const c of [1,2,3,4])result[String(c-1)]=objectBoxes[c].map(v=>Math.round(v*10000)/10000);return result;
+}
+function paintBox(canvas,box){
+ const r=canvas.getBoundingClientRect(),dpr=window.devicePixelRatio||1;canvas.width=Math.round(r.width*dpr);canvas.height=Math.round(r.height*dpr);
+ const ctx=canvas.getContext('2d');ctx.clearRect(0,0,canvas.width,canvas.height);if(!box)return;
+ const [x,y,w,h]=box;ctx.fillStyle='rgba(255,210,0,.15)';ctx.strokeStyle='#ffd200';ctx.lineWidth=2*dpr;
+ ctx.fillRect(x*canvas.width,y*canvas.height,w*canvas.width,h*canvas.height);ctx.strokeRect(x*canvas.width,y*canvas.height,w*canvas.width,h*canvas.height);
+}
+function bboxStatus(){
+ const done=[1,2,3,4].filter(c=>objectBoxes[c]).length;
+ $('bboxStatus').textContent=bboxLoaded.size<4?'첫 프레임 사진을 불러오는 중…':done<4?'bbox '+done+'/4 · 남은 카메라에도 그려야 실행할 수 있습니다.':'bbox 4/4 완료. SAM3에서 카메라별 초기 마스크를 고른 뒤 그 물체만 추적합니다. 결과는 마스크 검수에서 확인합니다.';
+ updateLaunch();
+}
+function loadBboxPicker(){
+ const episode=$('episode').value,on=$('objectMode').value==='bbox_track',generation=++bboxGeneration;
+ objectBoxes={};bboxLoaded=new Set();bboxEpisode='';$('bboxPicker').classList.toggle('hidden',!on);
+ if(!on){updateLaunch();return}
+ if(!episode){$('bboxImages').textContent='에피소드를 선택하세요.';$('bboxStatus').textContent='';updateLaunch();return}
+ $('bboxImages').innerHTML=[1,2,3,4].map(c=>'<figure><div class="bboxStage"><img alt="카메라 '+c+' 첫 프레임" data-cam="'+c+'"><canvas data-cam="'+c+'" role="img" aria-label="카메라 '+c+' 물체 bbox 그리기"></canvas></div><figcaption>카메라 '+c+' · 첫 프레임 · <span data-box="'+c+'">bbox 없음</span></figcaption></figure>').join('');
+ for(const img of $('bboxImages').querySelectorAll('img')){
+  const cam=+img.dataset.cam,canvas=img.nextElementSibling,label=$('bboxImages').querySelector('[data-box="'+cam+'"]');
+  img.onload=()=>{if(generation!==bboxGeneration)return;bboxLoaded.add(cam);if(bboxLoaded.size===4)bboxEpisode=episode;paintBox(canvas,objectBoxes[cam]);bboxStatus()};
+  img.onerror=()=>{if(generation!==bboxGeneration)return;$('bboxStatus').textContent='첫 프레임 사진을 불러오지 못했습니다. 다시 불러오기를 눌러주세요.';updateLaunch()};
+  let start=null;
+  const point=e=>{const r=canvas.getBoundingClientRect();return [Math.min(1,Math.max(0,(e.clientX-r.left)/r.width)),Math.min(1,Math.max(0,(e.clientY-r.top)/r.height))]};
+  const boxOf=(a,b)=>[Math.min(a[0],b[0]),Math.min(a[1],b[1]),Math.abs(a[0]-b[0]),Math.abs(a[1]-b[1])];
+  canvas.onpointerdown=e=>{if(!bboxLoaded.has(cam))return;start=point(e);canvas.setPointerCapture(e.pointerId);e.preventDefault()};
+  canvas.onpointermove=e=>{if(start)paintBox(canvas,boxOf(start,point(e)))};
+  canvas.onpointerup=e=>{if(!start)return;const box=boxOf(start,point(e));start=null;
+   if(box[2]>=0.01&&box[3]>=0.01){objectBoxes[cam]=box;label.innerHTML='<b>bbox 지정됨</b>'}
+   paintBox(canvas,objectBoxes[cam]);bboxStatus()};
+  canvas.onpointercancel=()=>{start=null;paintBox(canvas,objectBoxes[cam])};
+  img.src=outputUrl('preview',{episode,cam,position:0});
+ }
+ bboxStatus();
+}
+$('objectMode').onchange=loadBboxPicker;
+window.addEventListener('resize',()=>{for(const canvas of $('bboxImages').querySelectorAll('canvas'))paintBox(canvas,objectBoxes[+canvas.dataset.cam])});
 
 function revealSamPreview(){ $('samPreview').classList.remove('hidden');$('prompt').setAttribute('aria-expanded','true') }
 $('prompt').onfocus=revealSamPreview;$('prompt').onclick=revealSamPreview;
@@ -104,8 +155,17 @@ $('folderRegister').onclick=async()=>{
 
 let rawBoardBusy=false;
 function rawCaptureDate(ep){const m=ep.match(/^ep_(\d{4})(\d{2})(\d{2})_/);return m?m[1]+'-'+m[2]+'-'+m[3]:'—'}
+let rawDateFilter='';
+const rawDateCal=createDateCalendar({toggle:$('rawDateToggle'),panel:$('rawCalendar'),
+ counts:()=>{const c={};rawEpisodes.forEach(e=>{const d=rawCaptureDate(e.episode);c[d]=(c[d]||0)+1});return c},
+ get:()=>rawDateFilter,set:v=>{if(v!==rawDateFilter){rawDateFilter=v;renderRawTable()}}});
 function renderRawTable(){
- $('rawRows').innerHTML=rawEpisodes.map((e,i)=>'<tr data-raw-index="'+i+'" class="'+($('episode').value===e.episode?'rawSelected':'')+'"><td>'+(e.can_run?'<input type="radio" name="rawSelection" aria-label="'+escape(e.episode)+' 선택" '+($('episode').value===e.episode?'checked':'')+'>':'<span class="help">조회만</span>')+'</td><td>'+rawCaptureDate(e.episode)+'</td><td>'+escape(e.episode)+'</td><td>'+escape(e.operator||'—')+'</td><td>'+stageLabel(e.progress|| '단계 확인 중')+'</td><td><button class="smallbtn" data-raw-preview="'+i+'">미리보기</button></td></tr>').join('')||'<tr><td colspan="6">RAW 에피소드가 없습니다.</td></tr>';
+ rawDateCal.refresh();
+ const filter=rawDateFilter,groups={};
+ rawEpisodes.forEach((e,i)=>{const d=rawCaptureDate(e.episode);if(!filter||filter===d)(groups[d]=groups[d]||[]).push(i)});
+ const dates=Object.keys(groups).sort((a,b)=>a==='—'?1:b==='—'?-1:b.localeCompare(a));
+ const row=i=>{const e=rawEpisodes[i];return '<tr data-raw-index="'+i+'" class="'+($('episode').value===e.episode?'rawSelected':'')+'"><td>'+(e.can_run?'<input type="radio" name="rawSelection" aria-label="'+escape(e.episode)+' 선택" '+($('episode').value===e.episode?'checked':'')+'>':'<span class="help">조회만</span>')+'</td><td>'+rawCaptureDate(e.episode)+'</td><td>'+escape(e.episode)+'</td><td>'+escape(e.operator||'—')+'</td><td>'+stageLabel(e.progress|| '단계 확인 중')+'</td><td><button class="smallbtn" data-raw-preview="'+i+'">미리보기</button></td></tr>'};
+ $('rawRows').innerHTML=dates.map(d=>'<tr class="rawDateGroup"><td colspan="6">📅 '+(d==='—'?'날짜 미상':escape(d))+' · '+groups[d].length+'개</td></tr>'+groups[d].map(row).join('')).join('')||'<tr><td colspan="6">RAW 에피소드가 없습니다.</td></tr>';
  $('rawRows').querySelectorAll('[data-raw-index]').forEach(row=>row.onclick=event=>{const e=rawEpisodes[+row.dataset.rawIndex];$('episode').value=e.episode;$('episode').dispatchEvent(new Event('change'));renderRawTable();if(event.target.closest('[data-raw-preview]'))revealSamPreview()});
 }
 async function refreshRawBoard(){

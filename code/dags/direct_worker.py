@@ -30,6 +30,9 @@ def request_for(stage,run_id,params):
  req={'stage':stage,'episode':params['episode_id'],'run_id':run_id,'sam_prompt':params.get('sam_prompt',''),
          'sam_scene':params.get('sam_scene','2d'),'sam_confirmed':params.get('sam_settings_confirmed',False)}
  if params.get('raw_episode_id') and params['raw_episode_id']!=params['episode_id']:req['raw_episode']=params['raw_episode_id']
+ # Optional SAM3 object mode. Default text mode adds no keys, so existing job requests are unchanged.
+ if params.get('sam_object_mode','text')!='text':
+  req.update(sam_object_mode=params['sam_object_mode'],sam_object_bboxes=params.get('sam_object_bboxes'))
  return req
 
 def poll(stage,worker_id=DEFAULT_WORKER,**ctx):
@@ -40,7 +43,7 @@ def poll(stage,worker_id=DEFAULT_WORKER,**ctx):
  if result['state'] in ('failed','interrupted'):
   log=call('POST','/worker/log',json=req,worker_id=worker_id)['log'];print(log)
   raise RuntimeError('GPU worker failed at '+stage+'; see worker log above')
- print(json.dumps({'stage':stage,'state':result['state'],'remote_log':result.get('log')}))
+ print(json.dumps({'stage':stage,'state':result['state'],'remote_log':result.get('log'),'progress':result.get('progress')}))
  return result['state']=='success'
 
 

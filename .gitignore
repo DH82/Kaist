@@ -22,3 +22,34 @@ __pycache__/
 
 # Local distribution archives
 kaist-pc-stack-*.tar.gz
+
+# Local snapshots, runtime archives, model assets and generated contexts
+backups/
+.runtime/
+*.tar.zst
+*.tar.zst.partial
+pipeline/current/workspace/*-env
+pipeline/current/workspace/hf-cache/
+pipeline/current/workspace/runtime-cache/
+pipeline/current/workspace/logs/
+pipeline/current/workspace/data/
+
+# Local-only tools and historical/native deployment files (not Docker distribution)
+/MIGRATION_KO.md
+/README_KO.md
+/native/
+/intake/
+/pack.sh
+/worker/install_worker.sh
+/gpu/setup_gpu.sh
+/tests/
+/repro/capture_source.py
+/repro/locks/
+/pipeline/**/*.pt
+/pipeline/**/*.pth
+/pipeline/**/*.ckpt
+/pipeline/**/*.safetensors
+/pipeline/**/*.onnx
+/pipeline/**/*.pkl
+/pipeline/**/*.npz
+/pipeline/**/*.npy

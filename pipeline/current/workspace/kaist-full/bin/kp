@@ -1,0 +1,227 @@
+#!/usr/bin/env bash
+# kaist_pipeline runner: RGB-D capture -> PhysTwin processing -> KAIST delivery zip.
+#
+#   bin/kp check                    환경/가중치/에피소드 JSON 점검
+#   bin/kp setup-mano               MANO_*.pkl 에서 mano_faces.pkl 생성 (MANO 파일을 넣은 뒤 1회)
+#   bin/kp ingest <raw_dir>...      수집 원본 에피소드 폴더를 $KP_DATA_BASE 로 복사
+#   bin/kp qc <ep|dir> [--scene 1D|2D|3D]   수집 품질 검사 (원본 cam_* 파일 필요)
+#   bin/kp phase1                   전처리 -> 노출 trim -> SAM 3.1 (episodes.json 전체, 검수 지점에서 멈춤)
+#   bin/kp review <ep> [cam]        마스크 검수 편집기 실행 안내/실행 (GUI 필요)
+#   bin/kp phase2 <ep>... | --all [--keep]   CoTracker -> 3D recon -> MANO -> 납품 zip
+#   bin/kp status                   에피소드별 진행 상태
+set -uo pipefail
+
+KP_ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+KP_CONFIG="${KP_CONFIG:-$KP_ROOT/config.env}"
+if [ ! -f "$KP_CONFIG" ]; then
+  echo "config not found: $KP_CONFIG  (cp $KP_ROOT/config.env.example $KP_ROOT/config.env 후 경로 입력)" >&2
+  exit 2
+fi
+set -a; . "$KP_CONFIG"; set +a
+for v in KP_PY_PHYSTWIN KP_PY_SAM3 KP_PY_HAMBA KP_DATA_BASE KP_COTRACKER_REPO KP_LOG_DIR; do
+  [ -n "${!v:-}" ] || { echo "config: $v is empty ($KP_CONFIG)" >&2; exit 2; }
+done
+export KP_ROOT
+KP_DATA_BASE="$(readlink -f "$KP_DATA_BASE")"; export KP_DATA_BASE
+mkdir -p "$KP_LOG_DIR"
+PT_ROOT="$KP_ROOT/PhysTwin"
+HAMBA_DIR="$PT_ROOT/Mono/data_process/Hamba"
+cd "$PT_ROOT"
+
+# open3d offscreen rendering aborts (core dump) without an X display -> use a virtual one
+headless() {
+  if [ -z "${DISPLAY:-}" ]; then
+    command -v xvfb-run >/dev/null || { echo "no DISPLAY and xvfb-run missing (apt install xvfb)" >&2; return 2; }
+    xvfb-run -a -s "-screen 0 1920x1080x24" "$@"
+  else
+    "$@"
+  fi
+}
+
+ep_names() {  # episode names from the JSON (validates the file on the way)
+  "$KP_PY_PHYSTWIN" -c "from data_process.episodes import EPISODES; print('\n'.join(e['ep'] for e in EPISODES))"
+}
+
+RAW_REQUIRED='cam_*.mp4 cam_*_intrinsics.json cam_*_timestamps.csv extrinsics.json'
+raw_ok() {  # $1 = dir; prints what is missing, returns 1 if anything is
+  local d="$1" miss=()
+  for pat in $RAW_REQUIRED; do compgen -G "$d/$pat" >/dev/null || miss+=("$pat"); done
+  compgen -G "$d/cam_*_depth" >/dev/null || miss+=("cam_*_depth/")
+  [ ${#miss[@]} -eq 0 ] || { echo "missing: ${miss[*]}"; return 1; }
+}
+
+cmd_check() {
+  local fail=0
+  ok()   { echo "  [OK]   $*"; }
+  bad()  { echo "  [FAIL] $*"; fail=$((fail+1)); }
+  warn() { echo "  [WARN] $*"; }
+
+  echo "== config: $KP_CONFIG"
+  for v in KP_PY_PHYSTWIN KP_PY_SAM3 KP_PY_HAMBA; do
+    [ -x "${!v}" ] && ok "$v=${!v}" || bad "$v not executable: ${!v}"
+  done
+  [ -d "$KP_DATA_BASE" ] && ok "KP_DATA_BASE=$KP_DATA_BASE" || bad "KP_DATA_BASE missing: $KP_DATA_BASE"
+  [ -f "$KP_COTRACKER_REPO/hubconf.py" ] && ok "KP_COTRACKER_REPO=$KP_COTRACKER_REPO" || bad "co-tracker repo not found: $KP_COTRACKER_REPO"
+  [ -n "${HF_HOME:-}" ] && ok "HF_HOME=$HF_HOME" || warn "HF_HOME not set (default ~/.cache/huggingface)"
+
+  echo "== tools"
+  for t in ffmpeg ffprobe zip script; do command -v $t >/dev/null && ok "$t" || bad "$t not found"; done
+  if [ -z "${DISPLAY:-}" ]; then
+    command -v xvfb-run >/dev/null && ok "xvfb-run (no DISPLAY -> phase2 runs under Xvfb)" || bad "no DISPLAY and xvfb-run missing (apt install xvfb)"
+  else ok "DISPLAY=$DISPLAY"; fi
+
+  echo "== python envs"
+  "$KP_PY_PHYSTWIN" - <<'PY' && ok "phystwin imports + CUDA" || bad "phystwin env"
+import torch, open3d, trimesh, cv2, imageio, sys
+assert torch.cuda.is_available(), "CUDA not available"
+cap = torch.cuda.get_device_capability()
+print(f"         torch {torch.__version__}  GPU {torch.cuda.get_device_name()}  sm_{cap[0]}{cap[1]}")
+sys.path.insert(0, "data_process")
+from TRELLIS.trellis.pipelines import TrellisImageTo3DPipeline  # noqa
+PY
+  "${KP_PY_XLSX:-$KP_PY_PHYSTWIN}" -c "import openpyxl" 2>/dev/null \
+    && ok "openpyxl (${KP_PY_XLSX:-KP_PY_PHYSTWIN})" || bad "openpyxl missing in ${KP_PY_XLSX:-KP_PY_PHYSTWIN} (dataset xlsx step)"
+  "$KP_PY_SAM3" - <<'PY' && ok "sam3 imports + CUDA" || bad "sam3 env"
+import torch
+assert torch.cuda.is_available(), "CUDA not available"
+from sam3.model_builder import build_sam3_predictor  # noqa
+print(f"         torch {torch.__version__}")
+PY
+  (cd "$HAMBA_DIR" && "$KP_PY_HAMBA" - <<'PY') && ok "hamba imports + pytorch3d CUDA kernel" || bad "hamba env (a 'no kernel image' error = extensions built for another GPU arch)"
+import torch, detectron2, smplx, mediapipe, hamba  # noqa
+from pytorch3d.ops import knn_points
+x = torch.rand(1, 64, 3, device="cuda")
+knn_points(x, x, K=1)      # runs a compiled CUDA kernel: fails if built for another GPU arch
+print(f"         torch {torch.__version__}")
+PY
+
+  echo "== weights / assets"
+  local w
+  for w in "ckpts/hamba/checkpoints/hamba.ckpt" "ckpts/hamba/model_config.yaml" \
+           "_DATA/vitpose_ckpts/vitpose+_huge/wholebody.pth" "_DATA/data/mano_mean_params.npz"; do
+    [ -f "$HAMBA_DIR/$w" ] && ok "Hamba/$w" || bad "Hamba/$w missing"
+  done
+  for w in MANO_LEFT.pkl MANO_RIGHT.pkl; do
+    [ -f "$HAMBA_DIR/_DATA/data/mano/$w" ] && ok "MANO $w" || bad "MANO $w missing (mano.is.tue.mpg.de 에서 직접 받아야 함)"
+  done
+  for w in data/mano_faces.pkl Mono/data/mano_faces.pkl; do
+    [ -f "$PT_ROOT/$w" ] && ok "$w" || bad "$w missing (bin/kp setup-mano)"
+  done
+  [ -f data_process/models/weights/superglue_indoor.pth ] && ok "SuperGlue weights" || bad "SuperGlue weights missing"
+  "$KP_PY_SAM3" -c "from huggingface_hub import whoami; print('         HF user:', whoami()['name'])" 2>/dev/null \
+    && ok "Hugging Face login" || warn "Hugging Face not logged in (SAM 3.1 is gated: huggingface-cli login)"
+
+  echo "== episodes"
+  local names
+  if names=$(ep_names 2>&1); then
+    ok "episodes.json: $(echo "$names" | grep -c .) episodes (${EPISODES_JSON:-$KP_DATA_BASE/episodes.json})"
+    local e d
+    while read -r e; do
+      [ -n "$e" ] || continue
+      d="$KP_DATA_BASE/$e"
+      if [ ! -d "$d" ]; then warn "$e: no case dir (bin/kp ingest <raw_dir>)"
+      elif [ -f "$d/metadata.json" ]; then ok "$e: preprocessed"
+      elif m=$(raw_ok "$d"); then ok "$e: raw capture present"
+      else bad "$e: $m"; fi
+    done <<< "$names"
+  else
+    bad "episodes.json: $names"
+  fi
+
+  echo; [ $fail -eq 0 ] && echo "check: all OK" || echo "check: $fail problem(s)"
+  return $fail
+}
+
+cmd_setup_mano() {
+  "$KP_PY_HAMBA" data_process/export_mano_faces.py
+}
+
+cmd_ingest() {
+  [ $# -ge 1 ] || { echo "usage: kp ingest <raw_episode_dir>..." >&2; return 2; }
+  local names; names=$(ep_names) || return 2
+  local src name dst m rc=0
+  for src in "$@"; do
+    src="$(readlink -f "$src")"; name="$(basename "$src")"; dst="$KP_DATA_BASE/$name"
+    if ! m=$(raw_ok "$src"); then echo "[skip] $name: $m"; rc=1; continue; fi
+    if [ -e "$dst" ]; then echo "[skip] $name: $dst already exists"; continue; fi
+    cp -r "$src" "$dst" && echo "[ok]   $name -> $dst"
+    grep -qx "$name" <<< "$names" || echo "       WARNING: $name is not in episodes.json yet (add prompt/label/scene/name/interaction)"
+  done
+  return $rc
+}
+
+cmd_qc() {
+  [ $# -ge 1 ] || { echo "usage: kp qc <ep|raw_dir> [--scene 1D|2D|3D] [--json out.json]" >&2; return 2; }
+  local d="$1"; shift
+  if [ ! -d "$d" ]; then
+    for c in "$KP_DATA_BASE/$d" "$KP_DATA_BASE/raw_archive/$d"; do
+      compgen -G "$c/cam_*.mp4" >/dev/null && { d="$c"; break; }
+    done
+  fi
+  "$KP_PY_PHYSTWIN" "$KP_ROOT/capture/run_capture_qc.py" "$d" "$@"
+}
+
+cmd_phase1() {
+  "$KP_PY_PHYSTWIN" -u run_sam_all.py
+}
+
+cmd_review() {
+  [ $# -ge 1 ] || { echo "usage: kp review <ep> [cam|all]" >&2; return 2; }
+  [ -n "${DISPLAY:-}" ] || { echo "마스크 검수 편집기는 GUI 가 필요합니다 (DISPLAY 없음). 디스플레이가 있는 PC 에서 실행하세요." >&2; return 2; }
+  [ -n "${KP_SAM3_CKPT:-}" ] || { echo "config: KP_SAM3_CKPT (facebook/sam3 checkpoint) 를 지정하세요" >&2; return 2; }
+  "$KP_PY_SAM3" data_process/sam_mask_refine.py --case "$KP_DATA_BASE/$1" --cam "${2:-all}"
+}
+
+cmd_phase2() {
+  local keep="" eps=() e
+  for a in "$@"; do
+    case "$a" in
+      --keep) keep="--keep" ;;
+      --all)  while read -r e; do [ -n "$e" ] && eps+=("$e"); done < <(ep_names) ;;
+      *)      eps+=("$a") ;;
+    esac
+  done
+  [ ${#eps[@]} -ge 1 ] || { echo "usage: kp phase2 <ep>... | --all [--keep]" >&2; return 2; }
+  local d rc=0 miss
+  for e in "${eps[@]}"; do
+    d="$KP_DATA_BASE/$e"
+    if ! compgen -G "$d/mask/*/0" >/dev/null; then echo "[skip] $e: no SAM masks (bin/kp phase1 first)"; rc=1; continue; fi
+    echo "======== phase2 $e ========"
+    headless bash run_delivery.sh "$e" $keep 2>&1 | tee "$KP_LOG_DIR/phase2_$e.log"
+    # run_delivery.sh keeps going after a failed step, so judge the run by its products
+    miss=()
+    for f in final_data.pkl final_data_hand.pkl shape/hand/hand_mano_trajectory.pkl metadata.json; do
+      [ -f "$d/$f" ] || miss+=("$f")
+    done
+    [ -f "$KP_DATA_BASE/$e.zip" ] || miss+=("$e.zip")
+    [ -f "$d/ALIGN_FAILED.txt" ] && miss+=("ALIGN_FAILED.txt present")
+    if [ ${#miss[@]} -eq 0 ]; then echo "[phase2 OK]   $e -> $KP_DATA_BASE/$e.zip"
+    else echo "[phase2 FAIL] $e: ${miss[*]}  (log: $KP_LOG_DIR/phase2_$e.log)"; rc=1; fi
+  done
+  return $rc
+}
+
+cmd_status() {
+  local e d
+  printf "%-22s %-5s %-5s %-4s %-5s %-4s %-4s\n" episode prep sam cot final mano zip
+  while read -r e; do
+    [ -n "$e" ] || continue; d="$KP_DATA_BASE/$e"
+    f() { [ -e "$1" ] && echo o || echo -; }
+    printf "%-22s %-5s %-5s %-4s %-5s %-4s %-4s\n" "$e" "$(f "$d/metadata.json")" \
+      "$(compgen -G "$d/mask/*/0" >/dev/null && echo o || echo -)" "$(f "$d/cotracker")" \
+      "$(f "$d/final_data.pkl")" "$(f "$d/shape/hand/hand_mano_trajectory.pkl")" "$(f "$KP_DATA_BASE/$e.zip")"
+  done < <(ep_names)
+}
+
+sub="${1:-}"; shift || true
+case "$sub" in
+  check)      cmd_check "$@" ;;
+  setup-mano) cmd_setup_mano "$@" ;;
+  ingest)     cmd_ingest "$@" ;;
+  qc)         cmd_qc "$@" ;;
+  phase1)     cmd_phase1 "$@" ;;
+  review)     cmd_review "$@" ;;
+  phase2)     cmd_phase2 "$@" ;;
+  status)     cmd_status "$@" ;;
+  *) sed -n '2,11p' "$0"; exit 2 ;;
+esac

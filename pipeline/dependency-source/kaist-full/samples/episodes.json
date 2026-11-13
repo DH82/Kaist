@@ -1,0 +1,23 @@
+{
+  "ep_20260826_083803": {
+    "prompt": "blue cloth",
+    "label": "cloth",
+    "scene": "2d",
+    "name": "blue cloth",
+    "interaction": "fold, roll and unfold a blue cloth on a table by hand"
+  },
+  "ep_20260826_084721": {
+    "prompt": "yellow sponge",
+    "label": "sponge",
+    "scene": "2d",
+    "name": "yellow sponge",
+    "interaction": "press, fold and release a sponge on a table by hand"
+  },
+  "ep_20260826_085016": {
+    "prompt": "mouse pad",
+    "label": "pad",
+    "scene": "2d",
+    "name": "mouse pad",
+    "interaction": "flatten, roll and unroll a mouse pad on a table by hand"
+  }
+}

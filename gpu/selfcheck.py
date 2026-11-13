@@ -7,6 +7,7 @@
 import json, os, subprocess, sys, tempfile, time
 from pathlib import Path
 
+RUNTIME_ONLY = '--runtime-only' in sys.argv
 W = Path(os.environ['KAIST_WORKER_ROOT'])
 cfg = json.loads((W / 'config/gpu_4090_a.json').read_text())
 scripts = Path(cfg['scripts_dir'])
@@ -38,12 +39,17 @@ check('GPU (nvidia-smi)', ['nvidia-smi', '-i', cfg['gpu_uuid'], '--query-gpu=nam
 check('ffmpeg', ['bash', '-c', 'ffmpeg -version | head -1'])
 check('xvfb-run', ['xvfb-run', '-a', 'true'])
 check('SAM3 환경 (sam-env)', code('sam', "import torch,sam3;x=torch.ones(1024,1024,device='cuda');print('torch',torch.__version__,torch.cuda.get_device_name(0),float((x@x).sum()))"))
-check('SAM3.1 모델 캐시', code('sam', "from huggingface_hub import snapshot_download as s;print(s('facebook/sam3.1',local_files_only=True))"))
-check('추적 (tracking_worker check)', [py['phystwin'], str(scripts / 'tracking_worker.py'), 'check', '--repo', env.get('KP_COTRACKER_REPO', '')], cwd=phystwin)
-check('3D 복원 (reconstruction_worker check)', [py['phystwin'], str(scripts / 'reconstruction_worker.py'), 'check'], cwd=phystwin)
-mono = phystwin / 'Mono'
-hamba_env = {'PYTHONPATH': f"{mono/'data_process'}:{mono/'data_process/Hamba'}:{env.get('PYTHONPATH','')}"}
-check('HaMBA·MANO (hand_stage_worker check)', [py['hamba'], str(scripts / 'hand_stage_worker.py'), 'check', '--mono', str(mono)], cwd=mono, extra_env=hamba_env)
+if not RUNTIME_ONLY:
+    check('SAM3.1 모델 캐시', code('sam', "from huggingface_hub import snapshot_download as s;print(s('facebook/sam3.1',local_files_only=True))"))
+    check('추적 (tracking_worker check)', [py['phystwin'], str(scripts / 'tracking_worker.py'), 'check', '--repo', env.get('KP_COTRACKER_REPO', '')], cwd=phystwin)
+    check('3D 복원 (reconstruction_worker check)', [py['phystwin'], str(scripts / 'reconstruction_worker.py'), 'check'], cwd=phystwin)
+    mono = phystwin / 'Mono'
+    hamba_env = {'PYTHONPATH': f"{mono/'data_process'}:{mono/'data_process/Hamba'}:{env.get('PYTHONPATH','')}"}
+    check('HaMBA·MANO (hand_stage_worker check)', [py['hamba'], str(scripts / 'hand_stage_worker.py'), 'check', '--mono', str(mono)], cwd=mono, extra_env=hamba_env)
+else:
+    for name in ('phystwin', 'hamba'):
+        check(name+' Python·CUDA', code(name, "import torch;print(torch.__version__,torch.ones(1,device='cuda').item())"))
+    print('모델 검사 생략 (--runtime-only): 추론 가능한 상태라는 의미는 아닙니다.')
 check('EGL 오프스크린 렌더 (pyrender)', code('hamba', "import pyrender,numpy as n;r=pyrender.OffscreenRenderer(64,64);s=pyrender.Scene();s.add(pyrender.PerspectiveCamera(yfov=1.0));c,d=r.render(s);print('EGL ok',c.shape)"))
 try:
     nas = Path(cfg['nas_mount']) / cfg['nas_results_subdir']

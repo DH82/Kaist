@@ -1,0 +1,13 @@
+# 모델 weight 위치 (weight 폴더 = 원본 PC의 WFM_KAIST/workspace 기준 상대경로).
+# compose.yaml의 gpu-worker 마운트, repro/prepare_pc.py 검사, gpu/env/link_workspace.sh가 이 목록을 따릅니다.
+# 형식: <상대경로> <workspace 링크 여부(link|-)>
+hf-cache/hub                                                          -
+runtime-cache/torch/hub                                               -
+runtime-cache/iopath                                                  -
+kaist-full/PhysTwin/Mono/data_process/Hamba/_DATA/data/mano            link
+kaist-full/PhysTwin/Mono/data_process/Hamba/_DATA/data/mano_mean_params.npz link
+kaist-full/PhysTwin/Mono/data_process/Hamba/_DATA/vitpose_ckpts        link
+kaist-full/PhysTwin/Mono/data_process/Hamba/ckpts/hamba/checkpoints    link
+kaist-full/PhysTwin/data_process/models/weights                       link
+kaist-full/PhysTwin/data/mano_faces.pkl                               link
+kaist-full/PhysTwin/Mono/data/mano_faces.pkl                          link

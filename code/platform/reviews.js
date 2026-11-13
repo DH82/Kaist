@@ -1,5 +1,5 @@
 const HC_BASE='/kaist-review/dags/kaist_revising_gpu_4090_a';
-let hcFrameLoading=false,hcMeta=null,hcPath='',hcStage='mask',hcEpoch=0,hcFrame=0,hcVisited=[],hcBusy=false,hcTimer=null,hcToken='',activeDetailRun=null,hcLoadGeneration=0;
+let hcShownMode='overlay',hcFrameLoading=false,hcMeta=null,hcPath='',hcStage='mask',hcEpoch=0,hcFrame=0,hcVisited=[],hcBusy=false,hcTimer=null,hcToken='',activeDetailRun=null,hcLoadGeneration=0;
 const hcVideos=()=>[$('hcObject'),$('hcHand')];
 async function hcRequest(url,options={}){
  const response=await fetch(url,{credentials:'same-origin',cache:'no-store',...options});
@@ -72,9 +72,11 @@ async function openReview(episode,stage='mask'){
   $('hcTips').textContent=stage==='mask'?'카메라별 모든 프레임을 확인하면 검수 완료를 체크할 수 있습니다.':'천·손의 추적점이 배경으로 벗어나거나 미끄러지는지 확인하세요. 표시된 이상 후보 구간도 함께 검수하세요.';
   if(stage==='mask'){
    hcVisited=[new Set(),new Set(),new Set(),new Set()];$('hcMaskMode').value='overlay';$('hcSlider').max=hcMeta.frames-1;
-   $('hcImages').innerHTML=[0,1,2,3].map(cam=>'<figure><figcaption><strong>카메라 '+(cam+1)+'</strong><button class="smallbtn" data-edit-cam="'+cam+'">수정</button></figcaption><img id="hcImage'+cam+'" alt="카메라 '+(cam+1)+' 마스크"></figure>').join('');
+   $('hcImages').classList.remove('hcSolo');hcEdit.solo=null;
+   $('hcImages').innerHTML=[0,1,2,3].map(cam=>'<figure data-cam="'+cam+'"><figcaption><strong>카메라 '+(cam+1)+'</strong><span class="hcCamEdit" id="hcCamEdit'+cam+'" hidden></span><span class="hcSoloHint">더블클릭: 크게 보기 / 2×2로 돌아가기</span></figcaption><div class="hcStage"><img id="hcImage'+cam+'" alt="카메라 '+(cam+1)+' 마스크"><canvas class="hcEditCanvas" id="hcEdit'+cam+'" aria-label="카메라 '+(cam+1)+' 마스크 수정"></canvas><div class="hcBrushRing" id="hcRing'+cam+'" hidden></div></div></figure>').join('');
+   [0,1,2,3].forEach(hcEditBind);hcEditReset();
    $('hcChecks').innerHTML=[0,1,2,3].map(cam=>'<label><input id="hcCam'+cam+'" type="checkbox" disabled>카메라 '+(cam+1)+' 검수 완료</label>').join('');
-   $('hcChecks').onchange=hcEnable;$('hcImages').querySelectorAll('[data-edit-cam]').forEach(b=>b.onclick=()=>openMaskEditor(Number(b.dataset.editCam)));hcEnable();await hcShowFrame(0);
+   $('hcChecks').onchange=hcEnable;hcEnable();await hcShowFrame(0);
   }else{
    $('hcMissing').hidden=true;
    $('hcViewChecks').innerHTML='<label><input id="hcTrackingReviewed" type="checkbox" '+(hcApproved()?'disabled':'')+'>추적 영상 확인 완료</label>';
@@ -87,12 +89,14 @@ async function openReview(episode,stage='mask'){
   hcStatus('');hcEnable();
  }catch(e){if(generation!==hcLoadGeneration)return;hcMeta=null;hcStatus(e.message,true);$('hcDecision').classList.add('hidden')}
 }
-async function hcShowFrame(value){
- if(!hcMeta||hcFrameLoading)return;hcFrameLoading=true;hcFrame=Math.max(0,Math.min(hcMeta.frames-1,Number(value)));$('hcSlider').value=hcFrame;$('hcFrameLabel').textContent=(hcFrame+1)+' / '+hcMeta.frames+'프레임';['hcPrevFrame','hcNextFrame','hcFirst','hcMiddle','hcLast','hcSlider','hcMaskMode'].forEach(id=>$(id).disabled=true);
+async function hcShowFrame(value,skipEditCheck=false){
+ if(!hcMeta||hcFrameLoading)return;
+ if(!skipEditCheck&&hcEditDirty()){hcStop();if(!await hcEditResolve()){$('hcSlider').value=hcFrame;$('hcMaskMode').value=hcShownMode;return}if(!hcMeta||hcFrameLoading)return}
+ hcEditReset();hcShownMode=$('hcMaskMode').value;hcFrameLoading=true;hcFrame=Math.max(0,Math.min(hcMeta.frames-1,Number(value)));$('hcSlider').value=hcFrame;$('hcFrameLabel').textContent=(hcFrame+1)+' / '+hcMeta.frames+'프레임';['hcPrevFrame','hcNextFrame','hcFirst','hcMiddle','hcLast','hcSlider','hcMaskMode'].forEach(id=>$(id).disabled=true);
  const epoch=++hcEpoch,frame=hcFrame,mode=$('hcMaskMode').value;
  await Promise.all([0,1,2,3].map(cam=>new Promise(resolve=>{
   const img=$('hcImage'+cam),url=hcPath+'/image?'+new URLSearchParams({cam,frame,mode});
-  img.onload=()=>{if(epoch===hcEpoch&&mode==='overlay'){hcVisited[cam].add(frame);hcEnable()}resolve()};
+  img.onload=()=>{if(img.naturalWidth)img.parentElement.style.aspectRatio=img.naturalWidth+'/'+img.naturalHeight;if(epoch===hcEpoch&&mode==='overlay'){hcVisited[cam].add(frame);hcEnable()}resolve()};
   img.onerror=()=>{if(epoch!==hcEpoch){resolve();return}hcStatus('카메라 '+(cam+1)+' 이미지를 불러오지 못했습니다. 새로 불러오기를 눌러주세요.',true);hcStop();resolve()};
   img.src=url;img.onclick=()=>window.open(url,'_blank','noopener');
  })));
@@ -133,14 +137,14 @@ async function hcDecide(decision){
  finally{hcBusy=false;hcEnable()}
 }
 function returnToReviewQueue(){hcLoadGeneration++;hcEpoch++;hcStop();hcMeta=null;$('hcWorkspace').classList.add('hidden');$('hcQueuePanel').classList.remove('hidden');show('review')}
-$('hcBack').onclick=()=>{if(hcReturnPage==='review'){returnToReviewQueue();return}hcLoadGeneration++;hcEpoch++;hcStop();show(hcReturnPage)};
-$('hcList').onclick=returnToReviewQueue;
-$('hcReload').onclick=()=>{if($('hcEpisode').textContent)openReview($('hcEpisode').textContent,hcStage)};
+$('hcBack').onclick=()=>{if(!hcEditLeaveOk())return;hcEditReset();if(hcReturnPage==='review'){returnToReviewQueue();return}hcLoadGeneration++;hcEpoch++;hcStop();show(hcReturnPage)};
+$('hcList').onclick=()=>{if(!hcEditLeaveOk())return;hcEditReset();returnToReviewQueue()};
+$('hcReload').onclick=()=>{if(!hcEditLeaveOk())return;hcEditReset();if($('hcEpisode').textContent)openReview($('hcEpisode').textContent,hcStage)};
 $('hcRefreshQueue').onclick=loadHcQueue;document.querySelectorAll('[data-review-filter]').forEach(b=>b.onclick=()=>selectHcQueue(b.dataset.reviewFilter));
 $('hcApprove').onclick=()=>hcDecide('approve');$('hcHold').onclick=()=>hcDecide('hold');$('hcNote').oninput=hcEnable;
 $('hcFirst').onclick=()=>{hcStop();hcShowFrame(0)};$('hcMiddle').onclick=()=>{hcStop();hcShowFrame(Math.floor(hcMeta.frames/2))};$('hcLast').onclick=()=>{hcStop();hcShowFrame(hcMeta.frames-1)};
 $('hcSlider').oninput=e=>{hcStop();hcShowFrame(e.target.value)};$('hcMaskMode').onchange=()=>hcShowFrame(hcFrame);
-$('hcPlay').onclick=()=>{if(!hcMeta)return;if(hcTimer){hcStop();return}let loading=false;$('hcPlay').textContent='❚❚ 일시정지';hcTimer=setInterval(async()=>{if(loading)return;if(hcFrame>=hcMeta.frames-1){hcStop();return}loading=true;await hcShowFrame(hcFrame+1);loading=false},350)};
+$('hcPlay').onclick=async()=>{if(!hcMeta)return;if(hcTimer){hcStop();return}if(!await hcEditResolve('재생'))return;let loading=false;$('hcPlay').textContent='❚❚ 일시정지';hcTimer=setInterval(async()=>{if(loading)return;if(hcFrame>=hcMeta.frames-1){hcStop();return}loading=true;await hcShowFrame(hcFrame+1);loading=false},350)};
 $('hcTrackPlay').onclick=()=>Promise.allSettled(hcVideos().map(v=>v.play()));$('hcTrackPause').onclick=hcStop;
 $('hcTrackFirst').onclick=()=>hcSeek(0);$('hcTrackMiddle').onclick=()=>hcSeek(Math.floor(hcMeta.frames/2));$('hcTrackLast').onclick=()=>hcSeek(hcMeta.frames-1);
 hcVideos().forEach((v,i)=>{v.ontimeupdate=()=>{if(!hcMeta||hcStage!=='tracking')return;$('hcTrackFrame').textContent=Math.min(hcMeta.frames,Math.floor(v.currentTime*hcMeta.fps)+1)+' / '+hcMeta.frames+'프레임';const other=hcVideos()[1-i];if(other.readyState>=1&&Math.abs(v.currentTime-other.currentTime)>.2)other.currentTime=v.currentTime};v.onplay=()=>{const other=hcVideos()[1-i];if(other.paused)other.play().catch(()=>{})};v.onpause=()=>{const other=hcVideos()[1-i];if(!other.paused)other.pause()}});

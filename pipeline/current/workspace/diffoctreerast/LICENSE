@@ -1,0 +1,73 @@
+License  
+
+This *Software* is a derivative work of the *Original Software*
+
+Copyright for *Original Software* is held by the *Original Licensor*:
+    Copyright (c) **Inria** and **the Max Planck Institut for Informatik (MPII)**
+
+Copyright for *Software* is held by the *Licensor*:
+    Copyright (c) Jianfeng XIANG
+
+## 1.  Definitions  
+
+*Original Licensor* means the owners of the *Original Software*, ie. Inria and MPII
+
+*Licensor* means the owners of the *Software*, ie. Jianfeng XIANG.
+
+*Original Software* means the work *Software* is derived from, ie. **gaussian-splatting**
+
+*Software* means the derivative work of authorship made available under this  
+License, ie. **diffoctreerast**
+
+*Work* means the *Software* and any additions to or derivative works of the  
+*Software* that are made available under this License.  
+
+## 2.  Rights granted  
+
+Licensors grant non-exclusive rights to use the *Software* for research purposes  
+to research users (both academic and industrial), free of charge, without right  
+to sublicense.. The *Software* may be used "non-commercially", i.e., for research  
+and/or evaluation purposes only.  
+
+Subject to the terms and conditions of this License, you are granted a  
+non-exclusive, royalty-free, license to reproduce, prepare derivative works of,  
+publicly display, publicly perform and distribute its *Work* and any resulting  
+derivative works in any form.  
+
+## 3.  Limitations  
+
+**3.1 Redistribution.** You may reproduce or distribute the *Work* only if (a) you do  
+so under this License, (b) you include a complete copy of this License with  
+your distribution, and (c) you retain without modification any copyright,  
+patent, trademark, or attribution notices that are present in the *Work*.  
+
+**3.2 Derivative Works.** You may specify that additional or different terms apply  
+to the use, reproduction, and distribution of your derivative works of the *Work*  
+("Your Terms") only if (a) Your Terms provide that the use limitation in  
+Section 2 applies to your derivative works, and (b) you identify the specific  
+derivative works that are subject to Your Terms. Notwithstanding Your Terms,  
+this License (including the redistribution requirements in Section 3.1) will  
+continue to apply to the *Work* itself.  
+
+**3.3** Any other use without of prior consent of Licensors is prohibited. Research  
+users explicitly acknowledge having received from Licensors all information  
+allowing to appreciate the adequacy between of the *Software* and their needs and  
+to undertake all necessary precautions for its execution and use.  
+
+**3.4** The *Software* is provided both as a compiled library file and as source  
+code. In case of using the *Software* for a publication or other results obtained  
+through the use of the *Software*, users are strongly encouraged to cite the  
+corresponding publications as explained in the documentation of the *Software*.  
+
+## 4.  Disclaimer  
+
+THE USER CANNOT USE, EXPLOIT OR DISTRIBUTE THE *SOFTWARE* FOR COMMERCIAL PURPOSES  
+WITHOUT PRIOR AND EXPLICIT CONSENT OF LICENSORS. ANY SUCH ACTION WILL  
+CONSTITUTE A FORGERY. THIS *SOFTWARE* IS PROVIDED "AS IS" WITHOUT ANY WARRANTIES  
+OF ANY NATURE AND ANY EXPRESS OR IMPLIED WARRANTIES, WITH REGARDS TO COMMERCIAL  
+USE, PROFESSIONNAL USE, LEGAL OR NOT, OR OTHER, OR COMMERCIALISATION OR  
+ADAPTATION. UNLESS EXPLICITLY PROVIDED BY LAW,  IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE *SOFTWARE* OR THE USE OR OTHER DEALINGS IN THE
+*SOFTWARE*

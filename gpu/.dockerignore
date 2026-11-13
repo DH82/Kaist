@@ -3,3 +3,5 @@
 !entrypoint.sh
 !kaist_run.py
 !selfcheck.py
+!requirements-worker.txt
+!env/

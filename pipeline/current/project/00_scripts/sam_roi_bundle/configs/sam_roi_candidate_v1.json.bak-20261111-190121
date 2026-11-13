@@ -1,0 +1,12 @@
+{
+  "profile_id": "full_frame_plus_static_hand_roi_pilot_v1",
+  "status": "candidate_new_runner_not_gpu_validated",
+  "model_version": "sam3.1",
+  "hand_prompts": ["hand"],
+  "subtract_prompts": ["human forearm"],
+  "threshold": 0.5,
+  "scale": 4,
+  "padding_fraction": 0.5,
+  "max_frames": 300,
+  "notes": "Historical ROI evidence used SAM3; this SAME-sam3.1 paired experiment is a new candidate, not an exact historical reproduction. No morphology or area spike deletion in the ROI branch; compare separately before adoption. Enlargement does not create new image detail."
+}

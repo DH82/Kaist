@@ -4,7 +4,7 @@ from pathlib import Path
 from datetime import datetime,timezone
 sys.path.insert(0,str(Path(__file__).parent))
 from direct_worker import poll, poll_mano_batch
-from workers import dag_entries,worker,DEFAULT_WORKER,BATCH_DAG
+from workers import dag_entries,worker,DEFAULT_WORKER,BATCH_DAG,MAX_PARALLEL_RUNS
 from airflow.sdk import DAG,Param
 from airflow.providers.standard.sensors.python import PythonSensor
 
@@ -20,9 +20,12 @@ for worker_id,mode,dag_id in dag_entries():
     params={'episode_id':Param(type='string',pattern='^ep_[A-Za-z0-9_]+$')}
     if not raw:
         params.update(sam_prompt=Param(type='string',minLength=1,maxLength=200),
-                      sam_scene=Param('2d',enum=['2d']),sam_settings_confirmed=Param(False,type='boolean'))
+                      sam_scene=Param('2d',enum=['2d']),sam_settings_confirmed=Param(False,type='boolean'),
+                      # text: 기존 텍스트 분할 / bbox_track: 첫 프레임 bbox+텍스트 단일 물체 추적(테스트 옵션)
+                      sam_object_mode=Param('text',enum=['text','bbox_track']),
+                      sam_object_bboxes=Param(None,type=['null','object']))
     with DAG(dag_id,schedule=None,catchup=False,start_date=datetime(2026,1,1,tzinfo=timezone.utc),
-             max_active_runs=1,max_active_tasks=1,is_paused_upon_creation=True,
+             max_active_runs=MAX_PARALLEL_RUNS,max_active_tasks=MAX_PARALLEL_RUNS,is_paused_upon_creation=True,
              params=params,tags=['kaist',worker_id,'연결됨' if pc['enabled'] else '미연결'],
              default_args={'pool':pc['pool'],'retries':0}) as dag:
         previous=None
@@ -35,8 +38,8 @@ for worker_id,mode,dag_id in dag_entries():
             if previous:previous >> task
             previous=task
     globals()[dag_id]=dag
-# 검수 대기 중에는 해당 PC의 다음 에피소드는 대기하지만 다른 PC의 DAG는 진행합니다.
-# Sensor는 원격 GPU를 직접 점유하지 않으므로 실제 동시 연산 방지는 각 PC의 Worker lock이 담당합니다.
+# PC마다 에피소드 최대 MAX_PARALLEL_RUNS(2)개가 동시에 진행되고, 그 이상은 대기합니다.
+# Sensor는 원격 GPU를 직접 점유하지 않으므로 실제 GPU 동시 연산 수 제한은 각 PC Worker의 GPU 슬롯(gpu_slots.py)이 담당합니다.
 
 # 낮에 완료한 원본 실행을 선택한 순서로 이어갑니다.
 with DAG(BATCH_DAG, schedule=None, catchup=False, max_active_runs=1,

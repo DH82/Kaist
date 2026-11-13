@@ -2,6 +2,8 @@
 # Ubuntu에 Docker·Compose v2·NVIDIA Container Toolkit을 설치하고 현재 계정에 docker 권한을 줍니다.
 # (sudo 필요, 한 번만. 여러 번 실행해도 안전합니다.)
 set -euo pipefail
+sudo apt-get update
+sudo apt-get install -y python3 zstd curl openssl iproute2 nfs-common ca-certificates gnupg git gh
 if command -v docker >/dev/null && docker compose version >/dev/null 2>&1; then
   echo "Docker가 이미 설치되어 있습니다: $(docker --version)"
 else

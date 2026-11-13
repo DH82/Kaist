@@ -1,91 +1,319 @@
-let me=null,meGeneration=0,meBusy=false,meDrawing=false,meLast=null,meRaf=0;
-const meMask=document.createElement('canvas'),meOverlay=document.createElement('canvas');
-function meMessage(text,error=false){$('meStatus').textContent=text;$('meStatus').classList.toggle('error',error)}
-function meControls(){const ready=!!me&&!meBusy;$('meSave').disabled=!ready||!me.dirty;$('meUndo').disabled=!ready||meDrawing||!me.history.length;$('meRedo').disabled=!ready||meDrawing||!me.future.length;$('meReset').disabled=!ready||!me.dirty;['meCam','meObj','meFrame','mePrev','meNext','meBrushMode','meBrush','meEraser','meRadius','meZoom'].forEach(id=>$(id).disabled=meBusy);$('meDirty').textContent=me?.dirty?'저장하지 않은 수정 있음':'서버 마스크와 동일';}
-function meFit(){if(!me)return;const fit=Math.max(100,Math.min(me.width,$('meViewport').clientWidth-4));$('meCanvas').style.width=(fit*Number($('meZoom').value))+'px';$('meZoomLabel').textContent=Math.round(Number($('meZoom').value)*100)+'%';}
-// Zoom the view only: mask pixels and brush coordinates remain in source resolution.
-function meZoomAt(value,clientX,clientY){
- if(!me||meBusy||meDrawing)return;
- const viewport=$('meViewport'),canvas=$('meCanvas'),before=canvas.getBoundingClientRect(),view=viewport.getBoundingClientRect();
- const x=clientX??view.left+viewport.clientWidth/2,y=clientY??view.top+viewport.clientHeight/2;
- const u=(x-before.left)/before.width,v=(y-before.top)/before.height;
- $('meZoom').value=String(Math.max(1,Math.min(8,value)));meFit();
- const after=canvas.getBoundingClientRect();
- viewport.scrollLeft+=after.left+u*after.width-x;
- viewport.scrollTop+=after.top+v*after.height-y;
+// HC 마스크 검수 화면의 카메라 1~4 타일에서 바로 마스크를 수정합니다.
+// - 원본 + 마스크 표시에서 타일 위를 드래그(또는 클릭)하면 선택한 대상(손/물체)의 마스크를 칠하거나 지웁니다.
+// - 마법봉: 클릭한 곳을 SAM3.1로 분할합니다. 물체 이름을 함께 주면 같은 종류의 물체를 먼저 찾고 클릭한 것을 고릅니다.
+//   왼쪽 클릭 = 포함할 곳, Shift+클릭 또는 오른쪽 클릭 = 제외할 곳, Enter = 적용, Esc = 점 지우기
+// - 타일을 더블클릭하면 그 카메라만 크게 보고, 다시 더블클릭(또는 Esc)하면 2×2로 돌아갑니다.
+// - 마스크 좌표와 브러시 반경은 원본 해상도 기준이며, 원본 RGB는 바꾸지 않습니다.
+const hcEdit={cams:[null,null,null,null],history:[],future:[],stroke:null,tap:null,saving:false,solo:null,
+ names:{0:null,1:'hand'},wandCam:null,wandLoaded:false};
+const HC_TAP_DELAY=260;
+
+function hcTool(){return $('hcBrushMode').value}
+function hcEditKey(){return $('hcEditObj').value+':'+hcFrame}
+function hcEditDirtyCams(){return [0,1,2,3].filter(cam=>hcEdit.cams[cam]?.ready&&hcEdit.cams[cam].dirty)}
+function hcEditDirty(){return hcEditDirtyCams().length>0}
+function hcEditMessage(text,error=false){$('hcEditState').textContent=text;$('hcEditState').classList.toggle('error',error)}
+function hcWandMessage(text,error=false){$('hcWandState').textContent=text;$('hcWandState').classList.toggle('error',error)}
+function hcEditBlocked(){
+ if(!hcMeta||hcStage!=='mask')return '검수 화면을 불러온 뒤 수정할 수 있습니다.';
+ if(hcEdit.saving)return '저장하는 중입니다.';
+ if(hcBusy)return '검수 결정을 기록하는 중입니다.';
+ if(hcFrameLoading)return '프레임을 불러오는 중입니다.';
+ if($('hcMaskMode').value!=='overlay')return '표시를 "원본 + 마스크"로 바꾸면 화면에서 바로 수정할 수 있습니다.';
+ return '';
 }
-$('meViewport').addEventListener('wheel',e=>{
- if(!me)return;
- e.preventDefault();
- if(meBusy||meDrawing)return;
- const unit=e.deltaMode===1?16:e.deltaMode===2?$('meViewport').clientHeight:1;
- const delta=Math.max(-240,Math.min(240,e.deltaY*unit));
- meZoomAt(Number($('meZoom').value)*Math.exp(-delta*.002),e.clientX,e.clientY);
-},{passive:false});
-function meRender(){if(!me)return;const canvas=$('meCanvas'),ctx=canvas.getContext('2d'),overlay=meOverlay.getContext('2d');ctx.clearRect(0,0,canvas.width,canvas.height);ctx.drawImage(me.rgb,0,0);overlay.clearRect(0,0,canvas.width,canvas.height);overlay.globalCompositeOperation='source-over';overlay.fillStyle=me.obj===0?'rgb(40,230,90)':'rgb(245,70,205)';overlay.fillRect(0,0,canvas.width,canvas.height);overlay.globalCompositeOperation='destination-in';overlay.drawImage(meMask,0,0);ctx.globalAlpha=.48;ctx.drawImage(meOverlay,0,0);ctx.globalAlpha=1;}
-function meSchedule(){if(!meRaf)meRaf=requestAnimationFrame(()=>{meRaf=0;meRender()})}
-function meImage(src){return new Promise((resolve,reject)=>{const im=new Image();im.onload=()=>resolve(im);im.onerror=()=>reject(Error('이미지를 불러오지 못했습니다. 다시 불러오세요.'));im.src=src})}
-function meRestoreSelectors(){if(!me)return;$('meCam').value=me.cam;$('meObj').value=me.obj;$('meFrame').value=me.frame+1;}
-async function meLoad(cam,obj,frame,force=false){
- if(meBusy)return;
- if(!force&&me?.dirty&&!confirm('저장하지 않은 수정을 버리고 다른 마스크를 열까요?')){meRestoreSelectors();return}
- const generation=++meGeneration;meBusy=true;meControls();meMessage('RGB와 편집용 마스크를 불러오는 중…');
+function hcWandEntry(){const cam=hcEdit.wandCam;const e=cam===null?null:hcEdit.cams[cam];return e?.ready&&e.wand?e:null}
+function hcEditControls(){
+ const dirty=hcEditDirtyCams(),busy=hcEdit.saving||hcBusy,we=hcWandEntry();
+ $('hcSaveEdits').disabled=busy||!dirty.length;$('hcDiscardEdits').disabled=busy||!dirty.length;
+ $('hcEditUndo').disabled=busy||!hcEdit.history.length;$('hcEditRedo').disabled=busy||!hcEdit.future.length;
+ $('hcSaveEdits').textContent=dirty.length?'수정 저장 ('+dirty.map(c=>'카메라 '+(c+1)).join(', ')+')':'수정 저장';
+ $('hcWandApply').disabled=busy||!we?.wand.mask||we.wand.busy;$('hcWandClear').disabled=busy||!we?.wand.points.length;
+ for(let cam=0;cam<4;cam++){const tag=$('hcCamEdit'+cam);if(tag){const e=hcEdit.cams[cam],d=e?.ready&&e.dirty,none=e?.ready&&e.data.missing&&!d;
+  // SAM3가 이 프레임에서 대상을 찾지 못해 마스크 파일이 없는 경우: 빈 마스크에서 새로 칠할 수 있습니다.
+  tag.textContent=d?'수정됨 · 저장 전':none?(e.obj===0?'물체':'손')+' 마스크 없음 · 칠하면 새로 만듦':'';tag.hidden=!(d||none)}}
+ if(!busy&&!$('hcEditState').classList.contains('error'))hcEditMessage(dirty.length?'저장하지 않은 수정이 있습니다. 다른 프레임으로 이동하기 전에 저장하세요.':'');
+}
+
+// ---- 타일 렌더링 ----
+function hcEditRender(cam){
+ const e=hcEdit.cams[cam],canvas=$('hcEdit'+cam);if(!canvas)return;
+ const ctx=canvas.getContext('2d'),wand=e?.ready&&e.wand&&(e.wand.mask||e.wand.points.length);
+ if(!e?.ready||(!e.dirty&&!wand)){ctx.clearRect(0,0,canvas.width,canvas.height);return}
+ if(canvas.width!==e.width||canvas.height!==e.height){canvas.width=e.width;canvas.height=e.height}
+ ctx.globalCompositeOperation='source-over';ctx.globalAlpha=1;ctx.clearRect(0,0,e.width,e.height);
+ const tint=e.tint.getContext('2d');
+ if(e.dirty){
+  // 수정 전·후 마스크가 닿는 영역만 다시 그립니다. 그 밖은 서버 오버레이 이미지가 그대로 보입니다.
+  const region=e.scratch.getContext('2d');region.globalCompositeOperation='source-over';region.clearRect(0,0,e.width,e.height);
+  region.putImageData(e.original,0,0);region.drawImage(e.mask,0,0);
+  ctx.drawImage(e.rgb,0,0);ctx.globalCompositeOperation='destination-in';ctx.drawImage(e.scratch,0,0);ctx.globalCompositeOperation='source-over';
+  tint.globalCompositeOperation='source-over';tint.clearRect(0,0,e.width,e.height);
+  tint.fillStyle=e.obj===0?'rgb(40,230,90)':'rgb(245,70,205)';tint.fillRect(0,0,e.width,e.height);
+  tint.globalCompositeOperation='destination-in';tint.drawImage(e.mask,0,0);
+  ctx.globalAlpha=.48;ctx.drawImage(e.tint,0,0);ctx.globalAlpha=1;
+ }
+ if(e.wand?.mask){
+  // 마법봉 결과(적용 전)는 노란색으로 겹쳐 보여 줍니다.
+  tint.globalCompositeOperation='source-over';tint.clearRect(0,0,e.width,e.height);
+  tint.fillStyle='rgb(255,210,0)';tint.fillRect(0,0,e.width,e.height);
+  tint.globalCompositeOperation='destination-in';tint.drawImage(e.wand.mask,0,0);
+  ctx.globalAlpha=e.wand.busy?.3:.55;ctx.drawImage(e.tint,0,0);ctx.globalAlpha=1;
+ }
+ if(e.wand){
+  const r=Math.max(3,e.width/110);
+  for(const [x,y,label] of e.wand.points){
+   ctx.beginPath();ctx.arc(x*e.width,y*e.height,r,0,Math.PI*2);ctx.fillStyle=label?'#22c55e':'#ef4444';ctx.fill();
+   ctx.lineWidth=Math.max(1,r/3);ctx.strokeStyle='white';ctx.stroke();
+   ctx.beginPath();ctx.moveTo(x*e.width-r*.55,y*e.height);ctx.lineTo(x*e.width+r*.55,y*e.height);
+   if(label){ctx.moveTo(x*e.width,y*e.height-r*.55);ctx.lineTo(x*e.width,y*e.height+r*.55)}ctx.stroke();
+  }
+ }
+}
+function hcEditSchedule(cam){const e=hcEdit.cams[cam];if(e&&!e.raf)e.raf=requestAnimationFrame(()=>{e.raf=0;hcEditRender(cam)})}
+
+// ---- 편집용 마스크 불러오기 (타일에 마우스를 올리면 미리 불러옵니다) ----
+function hcEditImage(src){return new Promise((resolve,reject)=>{const im=new Image();im.onload=()=>resolve(im);im.onerror=()=>reject(Error('원본 이미지를 불러오지 못했습니다.'));im.src=src})}
+function hcEditLoad(cam){
+ const key=hcEditKey(),cur=hcEdit.cams[cam];
+ if(cur&&cur.key===key&&!cur.failed)return cur.promise;
+ const obj=Number($('hcEditObj').value),frame=hcFrame,path=hcPath;
+ const entry={key,cam,obj,frame,ready:false,dirty:false,failed:false,raf:0,wand:null};
+ entry.promise=(async()=>{
+  const data=await hcRequest(path+'/edit?'+new URLSearchParams({cam,obj,frame}));
+  const [rgb,maskImage]=await Promise.all([hcEditImage(path+'/image?'+new URLSearchParams({cam,frame,mode:'rgb'})),hcEditImage('data:image/png;base64,'+data.mask_png)]);
+  if(hcEdit.cams[cam]!==entry)return null;
+  const make=()=>{const c=document.createElement('canvas');c.width=data.width;c.height=data.height;return c};
+  Object.assign(entry,{data,rgb,width:data.width,height:data.height,mask:make(),scratch:make(),tint:make()});
+  const ctx=entry.mask.getContext('2d',{willReadFrequently:true});ctx.drawImage(maskImage,0,0);
+  const px=ctx.getImageData(0,0,data.width,data.height);
+  for(let i=0;i<px.data.length;i+=4){const inside=px.data[i]>0;px.data[i]=px.data[i+1]=px.data[i+2]=255;px.data[i+3]=inside?255:0}
+  ctx.putImageData(px,0,0);entry.original=ctx.getImageData(0,0,data.width,data.height);entry.ready=true;
+  // 물체 이름 기본값: 이 에피소드 SAM3 실행에 쓴 프롬프트
+  if(hcEdit.names[0]===null&&data.sam_prompt){hcEdit.names[0]=data.sam_prompt;hcWandSyncName()}
+  hcEditControls();
+  return entry;
+ })().catch(err=>{if(hcEdit.cams[cam]===entry){entry.failed=true;hcEditMessage('카메라 '+(cam+1)+': '+err.message,true)}return null});
+ hcEdit.cams[cam]=entry;return entry.promise;
+}
+function hcEditReset(){
+ clearTimeout(hcEdit.tap?.timer);hcEdit.tap=null;hcEdit.stroke=null;hcEdit.wandCam=null;
+ hcEdit.cams.forEach(e=>{if(e?.raf)cancelAnimationFrame(e.raf)});
+ hcEdit.cams=[null,null,null,null];hcEdit.history=[];hcEdit.future=[];
+ for(let cam=0;cam<4;cam++)hcEditRender(cam);
+ $('hcEditState').classList.remove('error');hcWandMessage('');hcEditControls();
+}
+function hcEditPushHistory(cam,e){
+ hcEdit.history.push({cam,entry:e,pixels:e.mask.getContext('2d').getImageData(0,0,e.width,e.height),dirty:e.dirty});
+ if(hcEdit.history.length>30)hcEdit.history.shift();hcEdit.future=[];
+}
+
+// ---- 브러시 ----
+function hcEditPoint(cam,ev){const r=$('hcEdit'+cam).getBoundingClientRect(),e=hcEdit.cams[cam],w=e?.width||$('hcImage'+cam).naturalWidth||r.width,h=e?.height||$('hcImage'+cam).naturalHeight||r.height;return {x:Math.max(0,Math.min(w-1,(ev.clientX-r.left)*w/r.width)),y:Math.max(0,Math.min(h-1,(ev.clientY-r.top)*h/r.height))}}
+function hcEditDraw(e,from,to){
+ const ctx=e.mask.getContext('2d'),radius=Number($('hcRadius').value);
+ ctx.globalCompositeOperation=hcTool()==='add'?'source-over':'destination-out';ctx.fillStyle=ctx.strokeStyle='white';
+ if(from){ctx.lineWidth=2*radius;ctx.lineCap='round';ctx.lineJoin='round';ctx.beginPath();ctx.moveTo(from.x,from.y);ctx.lineTo(to.x,to.y);ctx.stroke()}
+ else{ctx.beginPath();ctx.arc(to.x,to.y,radius,0,Math.PI*2);ctx.fill()}
+ ctx.globalCompositeOperation='source-over';
+}
+async function hcEditFlush(stroke){
+ const e=await hcEditLoad(stroke.cam);
+ if(!e||stroke.cancelled||hcEdit.cams[stroke.cam]!==e)return;
+ if(!stroke.started){stroke.started=true;hcEditPushHistory(stroke.cam,e)}
+ while(stroke.drawn<stroke.pts.length){hcEditDraw(e,stroke.drawn?stroke.pts[stroke.drawn-1]:null,stroke.pts[stroke.drawn]);stroke.drawn++}
+ e.dirty=true;hcEditSchedule(stroke.cam);hcEditControls();
+}
+function hcEditRing(cam,ev){
+ const ring=$('hcRing'+cam),canvas=$('hcEdit'+cam);if(!ring||!canvas)return;
+ if(!ev||hcTool()==='wand'||hcEditBlocked()){ring.hidden=true;return}
+ const r=canvas.getBoundingClientRect(),w=hcEdit.cams[cam]?.width||$('hcImage'+cam).naturalWidth||r.width;
+ const size=2*Number($('hcRadius').value)*r.width/w;
+ Object.assign(ring.style,{width:size+'px',height:size+'px',left:(ev.clientX-r.left)+'px',top:(ev.clientY-r.top)+'px'});
+ ring.classList.toggle('erase',hcTool()==='erase');ring.hidden=false;
+}
+function hcCancelTap(){if(hcEdit.tap){clearTimeout(hcEdit.tap.timer);hcEdit.tap.stroke.cancelled=true;hcEdit.tap=null}}
+function hcEditBind(cam){
+ const canvas=$('hcEdit'+cam);
+ canvas.onpointerenter=ev=>{if(!hcEditBlocked())hcEditLoad(cam);hcEditRing(cam,ev)};
+ canvas.onpointerleave=()=>hcEditRing(cam,null);
+ canvas.oncontextmenu=ev=>{if(hcTool()==='wand')ev.preventDefault()};
+ canvas.onpointerdown=ev=>{
+  const wand=hcTool()==='wand';
+  if(ev.button!==0&&!(wand&&ev.button===2))return;
+  const blocked=hcEditBlocked();if(blocked){hcEditMessage(blocked,true);return}
+  ev.preventDefault();hcStop();$('hcEditState').classList.remove('error');
+  const p=hcEditPoint(cam,ev);
+  // 마법봉 오른쪽 클릭은 더블클릭과 겹치지 않으므로 바로 '제외' 점으로 씁니다.
+  if(wand&&ev.button===2){hcWandClick(cam,p,0);return}
+  // 같은 자리를 빠르게 두 번 누르면 더블클릭(크게 보기)으로 보고 점을 찍지 않습니다.
+  if(hcEdit.tap&&hcEdit.tap.cam===cam&&Math.hypot(hcEdit.tap.client.x-ev.clientX,hcEdit.tap.client.y-ev.clientY)<12)hcCancelTap();
+  hcEdit.stroke={cam,pts:[p],drawn:0,started:false,moved:false,cancelled:false,pointer:ev.pointerId,client:{x:ev.clientX,y:ev.clientY},
+   wand,label:ev.shiftKey||ev.altKey?0:1};
+  canvas.setPointerCapture(ev.pointerId);hcEditLoad(cam);
+ };
+ canvas.onpointermove=ev=>{
+  hcEditRing(cam,ev);const s=hcEdit.stroke;
+  if(!s||s.cam!==cam||s.pointer!==ev.pointerId||s.wand)return;
+  ev.preventDefault();s.pts.push(hcEditPoint(cam,ev));
+  if(!s.moved&&Math.hypot(ev.clientX-s.client.x,ev.clientY-s.client.y)>4)s.moved=true;
+  if(s.moved)hcEditFlush(s);
+ };
+ canvas.onpointerup=ev=>{
+  const s=hcEdit.stroke;if(!s||s.cam!==cam||s.pointer!==ev.pointerId)return;hcEdit.stroke=null;
+  if(s.moved){hcEditFlush(s);return}
+  s.pts=[s.pts[0]];
+  const run=s.wand?()=>{if(!s.cancelled)hcWandClick(cam,s.pts[0],s.label)}:()=>hcEditFlush(s);
+  hcEdit.tap={cam,stroke:s,client:s.client,timer:setTimeout(()=>{if(hcEdit.tap?.stroke===s)hcEdit.tap=null;run()},HC_TAP_DELAY)};
+ };
+ canvas.onpointercancel=()=>{if(hcEdit.stroke?.cam===cam){hcEdit.stroke.cancelled=!hcEdit.stroke.started;hcEdit.stroke=null}};
+ canvas.ondblclick=ev=>{ev.preventDefault();hcCancelTap();hcToggleSolo(cam)};
+}
+
+// ---- 마법봉 (SAM3.1) ----
+function hcWandSyncName(){const v=hcEdit.names[Number($('hcEditObj').value)];$('hcWandText').value=v||''}
+function hcWandRequestBody(e){
+ const useName=$('hcWandPrompt').value==='name';
+ return {cam:e.cam,frame:e.frame,points:e.wand.points,text:useName?$('hcWandText').value.trim():'',threshold:Number($('hcWandThr').value)};
+}
+async function hcWandClick(cam,p,label){
+ const blocked=hcEditBlocked();if(blocked){hcEditMessage(blocked,true);return}
+ const e=await hcEditLoad(cam);if(!e||hcEdit.cams[cam]!==e)return;
+ // 다른 카메라에서 진행 중이던 마법봉 점은 정리합니다(한 번에 한 카메라).
+ if(hcEdit.wandCam!==null&&hcEdit.wandCam!==cam){const old=hcEdit.cams[hcEdit.wandCam];if(old){old.wand=null;hcEditRender(hcEdit.wandCam)}}
+ hcEdit.wandCam=cam;
+ if(!e.wand)e.wand={points:[],mask:null,seq:0,busy:false};
+ if(label===0&&!e.wand.points.some(x=>x[2]===1)){hcWandMessage('먼저 포함할 곳을 왼쪽 클릭하세요. 제외는 Shift+클릭 또는 오른쪽 클릭입니다.',true);return}
+ if(e.wand.points.length>=20){hcWandMessage('점은 20개까지 찍을 수 있습니다. 점 지우기 후 다시 시작하세요.',true);return}
+ e.wand.points.push([p.x/e.width,p.y/e.height,label]);hcEditRender(cam);hcWandRun(cam);
+}
+async function hcWandRun(cam){
+ const e=hcEdit.cams[cam];if(!e?.wand?.points.length)return;
+ const w=e.wand,seq=++w.seq;w.busy=true;hcEditRender(cam);hcEditControls();
+ hcWandMessage(hcEdit.wandLoaded?'SAM3로 분할하는 중…':'SAM3 모델을 GPU에 불러오는 중… 처음 한 번은 10~20초 걸립니다.');
  try{
-  const base=HC_BASE+'/episodes/'+encodeURIComponent($('meEpisode').textContent);const data=await hcRequest(base+'/edit?'+new URLSearchParams({cam,obj,frame}));
-  const [rgb,mask]=await Promise.all([meImage(base+'/image?'+new URLSearchParams({cam,frame,mode:'rgb'})),meImage('data:image/png;base64,'+data.mask_png)]);
-  if(generation!==meGeneration)return;
-  me={...data,base,rgb,dirty:false,history:[],future:[]};
-  for(const canvas of [meMask,meOverlay,$('meCanvas')]){canvas.width=data.width;canvas.height=data.height}
-  const ctx=meMask.getContext('2d',{willReadFrequently:true});ctx.drawImage(mask,0,0);const pixels=ctx.getImageData(0,0,data.width,data.height);
-  for(let i=0;i<pixels.data.length;i+=4){const inside=pixels.data[i]>0;pixels.data[i]=pixels.data[i+1]=pixels.data[i+2]=255;pixels.data[i+3]=inside?255:0}
-  ctx.putImageData(pixels,0,0);me.original=ctx.getImageData(0,0,data.width,data.height);meRestoreSelectors();$('meZoom').value='1';meFit();$('meViewport').scrollLeft=0;$('meViewport').scrollTop=0;meRender();
-  $('meDimensions').textContent=data.width+' × '+data.height+'px · 프레임 '+(frame+1);$('meFrame').max=hcMeta.frames;
-  meMessage(data.approval.status==='approved'?'승인된 마스크입니다. 초안을 저장하면 기존 승인이 해제되고 재검수가 필요합니다.':'브러시로 수정한 뒤 초안 저장을 누르세요.');
- }catch(e){meRestoreSelectors();meMessage(e.message,true)}
- finally{meBusy=false;meControls()}
+  const r=await hcRequest(hcPath+'/wand',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':hcToken},body:JSON.stringify(hcWandRequestBody(e))});
+  if(hcEdit.cams[cam]!==e||e.wand!==w||w.seq!==seq)return;
+  const im=await hcEditImage('data:image/png;base64,'+r.mask_png);
+  if(hcEdit.cams[cam]!==e||e.wand!==w||w.seq!==seq)return;
+  const c=document.createElement('canvas');c.width=e.width;c.height=e.height;const ctx=c.getContext('2d',{willReadFrequently:true});ctx.drawImage(im,0,0,e.width,e.height);
+  const px=ctx.getImageData(0,0,e.width,e.height);
+  for(let i=0;i<px.data.length;i+=4){const inside=px.data[i]>127;px.data[i]=px.data[i+1]=px.data[i+2]=255;px.data[i+3]=inside?255:0}
+  ctx.putImageData(px,0,0);w.mask=c;hcEdit.wandLoaded=true;
+  const how={text:'이름으로 찾음','text+points':'이름 + 클릭으로 다듬음',points:'클릭으로 분할'}[r.method]||r.method;
+  hcWandMessage('카메라 '+(cam+1)+' · '+how+' · '+r.area.toLocaleString()+'px · '+r.message+' 노란 영역을 확인하고 Enter(적용)를 누르세요.');
+ }catch(err){
+  if(hcEdit.cams[cam]===e&&e.wand===w&&w.seq===seq){w.points.pop();hcWandMessage(err.message,true)}
+ }finally{
+  if(e.wand===w&&w.seq===seq){w.busy=false;hcEditRender(cam);hcEditControls()}
+ }
 }
-async function openMaskEditor(cam=0){
- if(!hcMeta||hcStage!=='mask')return;hcStop();me=null;meBusy=false;$('meCanvas').getContext('2d').clearRect(0,0,$('meCanvas').width,$('meCanvas').height);$('meEpisode').textContent=hcMeta.episode;$('meDialog').showModal();await meLoad(cam,Number($('meObj').value),hcFrame,true)
+function hcWandApply(){
+ const e=hcWandEntry();if(!e?.wand?.mask||e.wand.busy||hcEdit.saving)return;
+ const cam=hcEdit.wandCam,mode=$('hcWandMode').value,ctx=e.mask.getContext('2d');
+ hcEditPushHistory(cam,e);
+ if(mode==='replace')ctx.clearRect(0,0,e.width,e.height);
+ ctx.globalCompositeOperation=mode==='subtract'?'destination-out':'source-over';ctx.drawImage(e.wand.mask,0,0);ctx.globalCompositeOperation='source-over';
+ e.wand=null;hcEdit.wandCam=null;e.dirty=true;hcEditRender(cam);
+ hcWandMessage('카메라 '+(cam+1)+'에 적용했습니다('+$('hcWandMode').selectedOptions[0].textContent+'). 저장하려면 수정 저장을 누르세요.');hcEditControls();
 }
-function closeMaskEditor(){if(meBusy)return;if(me?.dirty&&!confirm('저장하지 않은 수정을 버리고 닫을까요?'))return;meDrawing=false;$('meDialog').close();me=null}
-function mePoint(e){const r=$('meCanvas').getBoundingClientRect();return {x:Math.max(0,Math.min(me.width-1,(e.clientX-r.left)*me.width/r.width)),y:Math.max(0,Math.min(me.height-1,(e.clientY-r.top)*me.height/r.height))}}
-function meStroke(point){
- const ctx=meMask.getContext('2d'),radius=Number($('meRadius').value);ctx.globalCompositeOperation=$('meBrushMode').value==='add'?'source-over':'destination-out';ctx.fillStyle=ctx.strokeStyle='white';ctx.lineWidth=2*radius;ctx.lineCap='round';ctx.lineJoin='round';
- if(meLast){ctx.beginPath();ctx.moveTo(meLast.x,meLast.y);ctx.lineTo(point.x,point.y);ctx.stroke()}else{ctx.beginPath();ctx.arc(point.x,point.y,radius,0,Math.PI*2);ctx.fill()}
- ctx.globalCompositeOperation='source-over';meLast=point;me.dirty=true;meSchedule();meControls();
+function hcWandClear(){
+ const e=hcWandEntry();if(!e)return false;
+ const cam=hcEdit.wandCam;e.wand=null;hcEdit.wandCam=null;hcEditRender(cam);hcWandMessage('');hcEditControls();return true;
 }
-const meCanvas=$('meCanvas');
-meCanvas.onpointerdown=e=>{if(!me||meBusy||e.button!==0)return;e.preventDefault();meCanvas.focus({preventScroll:true});me.history.push(meSnapshot());me.future=[];if(me.history.length>20)me.history.shift();meDrawing=true;meLast=null;meCanvas.setPointerCapture(e.pointerId);meStroke(mePoint(e))};
-meCanvas.onpointermove=e=>{if(meDrawing&&me&&!meBusy){e.preventDefault();meStroke(mePoint(e))}};
-meCanvas.onpointerup=meCanvas.onpointercancel=()=>{meDrawing=false;meLast=null;meControls()};
-function meSnapshot(){return {pixels:meMask.getContext('2d').getImageData(0,0,me.width,me.height),dirty:me.dirty}}
-function meApply(snapshot){meMask.getContext('2d').putImageData(snapshot.pixels,0,0);me.dirty=snapshot.dirty;meLast=null;meRender();meControls()}
-function meUndo(){if(!me||meBusy||meDrawing||!me.history.length)return;me.future.push(meSnapshot());meApply(me.history.pop())}
-function meRedo(){if(!me||meBusy||meDrawing||!me.future.length)return;me.history.push(meSnapshot());meApply(me.future.pop())}
-function meSetTool(tool){if(meBusy||meDrawing)return;$('meBrushMode').value=tool;$('meBrush').setAttribute('aria-pressed',String(tool==='add'));$('meEraser').setAttribute('aria-pressed',String(tool==='erase'));$('meCanvas').style.cursor=tool==='erase'?'cell':'crosshair'}
-$('meBrush').onclick=()=>meSetTool('add');$('meEraser').onclick=()=>meSetTool('erase');
-$('meUndo').onclick=meUndo;$('meRedo').onclick=meRedo;
-$('meReset').onclick=()=>{if(!me||meBusy||meDrawing||!me.dirty)return;me.history.push(meSnapshot());if(me.history.length>20)me.history.shift();me.future=[];meApply({pixels:me.original,dirty:false})};
-$('meDialog').addEventListener('keydown',e=>{
- if(!me||meBusy||meDrawing||e.isComposing||e.target.closest('input,textarea,select,[contenteditable="true"]'))return;
- const key=e.key.toLowerCase();
- if((e.ctrlKey||e.metaKey)&&key==='z'){e.preventDefault();e.shiftKey?meRedo():meUndo()}
- else if(e.ctrlKey&&key==='y'){e.preventDefault();meRedo()}
- else if(!e.ctrlKey&&!e.metaKey&&!e.altKey&&(key==='b'||key==='e')){e.preventDefault();meSetTool(key==='b'?'add':'erase')}
-});
-$('meCam').onchange=$('meObj').onchange=$('meFrame').onchange=()=>meLoad(Number($('meCam').value),Number($('meObj').value),Math.max(0,Math.min(hcMeta.frames-1,Number($('meFrame').value)-1)));
-$('mePrev').onclick=()=>{if(me)meLoad(me.cam,me.obj,Math.max(0,me.frame-1))};$('meNext').onclick=()=>{if(me)meLoad(me.cam,me.obj,Math.min(hcMeta.frames-1,me.frame+1))};
-$('meZoom').oninput=()=>meZoomAt(Number($('meZoom').value));window.addEventListener('resize',meFit);$('meRadius').oninput=()=>$('meRadiusLabel').textContent=$('meRadius').value+'px';
-$('meClose').onclick=closeMaskEditor;$('meDialog').oncancel=e=>{e.preventDefault();closeMaskEditor()};
-$('hcEditMask').onclick=()=>openMaskEditor(0);
-$('meSave').onclick=async()=>{
- if(!me||meBusy||!me.dirty)return;
- if(me.approval.status==='approved'&&!confirm('수정 초안을 저장하면 기존 승인이 해제됩니다. 저장하고 다시 검수할까요?'))return;
- const opaque=document.createElement('canvas');opaque.width=me.width;opaque.height=me.height;const ctx=opaque.getContext('2d');ctx.fillStyle='black';ctx.fillRect(0,0,me.width,me.height);ctx.drawImage(meMask,0,0);const pixels=ctx.getImageData(0,0,me.width,me.height);for(let i=0;i<pixels.data.length;i+=4){const v=pixels.data[i]>=128?255:0;pixels.data[i]=pixels.data[i+1]=pixels.data[i+2]=v;pixels.data[i+3]=255}ctx.putImageData(pixels,0,0);
- const payload={cam:me.cam,obj:me.obj,frame:me.frame,basis:me.basis,file_sha256:me.file_sha256,mask_png:opaque.toDataURL('image/png').split(',')[1]};
- const episode=me.episode,frame=me.frame;meBusy=true;meControls();meMessage('수정 내용과 원본 변경 여부를 검사하고 저장하는 중…');
+function hcWandRerun(){const e=hcWandEntry();if(e?.wand.points.length)hcWandRun(hcEdit.wandCam)}
+
+// ---- 크게 보기 (더블클릭) ----
+function hcToggleSolo(cam){
+ hcEdit.solo=hcEdit.solo===cam?null:cam;
+ const grid=$('hcImages');grid.classList.toggle('hcSolo',hcEdit.solo!==null);
+ grid.querySelectorAll('figure').forEach(f=>f.classList.toggle('hcFocused',Number(f.dataset.cam)===hcEdit.solo));
+ for(let c=0;c<4;c++)hcEditRing(c,null);
+ if(hcEdit.solo!==null)grid.querySelector('figure[data-cam="'+cam+'"]').scrollIntoView({block:'nearest',behavior:'smooth'});
+}
+
+// ---- 되돌리기 ----
+function hcEditSwap(from,to){
+ const step=from.pop();if(!step)return;const e=step.entry;
+ if(hcEdit.cams[step.cam]!==e){hcEditControls();return}
+ to.push({cam:step.cam,entry:e,pixels:e.mask.getContext('2d').getImageData(0,0,e.width,e.height),dirty:e.dirty});
+ e.mask.getContext('2d').putImageData(step.pixels,0,0);e.dirty=step.dirty;hcEditSchedule(step.cam);hcEditControls();
+}
+function hcEditUndo(){if(!hcEdit.saving&&!hcEdit.stroke)hcEditSwap(hcEdit.history,hcEdit.future)}
+function hcEditRedo(){if(!hcEdit.saving&&!hcEdit.stroke)hcEditSwap(hcEdit.future,hcEdit.history)}
+function hcEditDiscard(){
+ if(!hcEditDirty()||hcEdit.saving)return;
+ if(!confirm('저장하지 않은 마스크 수정을 모두 버릴까요?'))return;
+ hcEditReset();
+}
+
+// ---- 저장 ----
+function hcEditPng(e){
+ const out=document.createElement('canvas');out.width=e.width;out.height=e.height;const ctx=out.getContext('2d');
+ ctx.fillStyle='black';ctx.fillRect(0,0,e.width,e.height);ctx.drawImage(e.mask,0,0);
+ const px=ctx.getImageData(0,0,e.width,e.height);
+ for(let i=0;i<px.data.length;i+=4){const v=px.data[i]>=128?255:0;px.data[i]=px.data[i+1]=px.data[i+2]=v;px.data[i+3]=255}
+ ctx.putImageData(px,0,0);return out.toDataURL('image/png').split(',')[1];
+}
+async function hcSaveEdits(){
+ const cams=hcEditDirtyCams();if(!cams.length||hcEdit.saving||hcBusy)return true;
+ if(hcApproved()&&!confirm('수정한 마스크를 저장하면 기존 승인이 해제되고 다시 검수해야 합니다. 저장할까요?'))return false;
+ hcStop();hcEdit.saving=true;hcEditControls();hcEditMessage('수정 내용과 원본 변경 여부를 검사하고 저장하는 중…');
+ const frame=hcFrame,messages=[];let ok=true;
  try{
-  const result=await hcRequest(me.base+'/edit',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':hcToken},body:JSON.stringify(payload)});
-  me.dirty=false;$('meDialog').close();me=null;meBusy=false;await openReview(episode,'mask');if(hcMeta)await hcShowFrame(frame);hcStatus(result.message);loadJobs();
- }catch(e){meMessage(e.message,true)}finally{meBusy=false;meControls()}
+  for(const cam of cams){
+   const e=hcEdit.cams[cam];
+   // 저장할 때마다 검수 기준값(basis)이 바뀌므로 카메라마다 최신 값을 다시 받아 저장합니다.
+   const fresh=await hcRequest(hcPath+'/edit?'+new URLSearchParams({cam,obj:e.obj,frame:e.frame}));
+   if(fresh.file_sha256!==e.data.file_sha256)throw Error('카메라 '+(cam+1)+' 마스크가 다른 곳에서 변경됐습니다. 수정을 버리고 다시 불러오세요.');
+   const payload={cam,obj:e.obj,frame:e.frame,basis:fresh.basis,file_sha256:e.data.file_sha256,mask_png:hcEditPng(e)};
+   const result=await hcRequest(hcPath+'/edit',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':hcToken},body:JSON.stringify(payload)});
+   e.dirty=false;messages.push('카메라 '+(cam+1)+': '+result.message);
+  }
+ }catch(err){ok=false;hcEditMessage(err.message,true)}
+ finally{hcEdit.saving=false}
+ try{const meta=await hcRequest(hcPath);if(meta&&hcMeta&&meta.episode===hcMeta.episode)hcMeta=meta}catch(_){}
+ if(ok){hcEditReset();hcStatus(messages.join(' · '));await hcShowFrame(frame,true);if(typeof loadJobs==='function')loadJobs()}
+ else hcEditControls();
+ hcEnable();return ok;
+}
+// 저장하지 않은 수정이 있을 때 프레임 이동 등을 하기 전에 호출합니다. true면 진행해도 됩니다.
+async function hcEditResolve(action='이동'){
+ if(!hcEditDirty())return true;
+ if(!confirm('저장하지 않은 마스크 수정이 있습니다.\n\n확인: 저장하고 '+action+'\n취소: 그대로 머무르기'))return false;
+ return hcSaveEdits();
+}
+function hcEditLeaveOk(){return !hcEditDirty()||confirm('저장하지 않은 마스크 수정이 있습니다. 버리고 나갈까요?')}
+
+// ---- 도구 ----
+function hcSetTool(tool){
+ $('hcBrushMode').value=tool;
+ for(const [id,t] of [['hcBrush','add'],['hcEraser','erase'],['hcWand','wand']])$(id).setAttribute('aria-pressed',String(tool===t));
+ $('hcWandTools').hidden=tool!=='wand';$('hcBrushTools').hidden=tool==='wand';
+ document.querySelectorAll('.hcEditCanvas').forEach(c=>c.style.cursor=tool==='wand'?'copy':'crosshair');
+ for(let c=0;c<4;c++)hcEditRing(c,null);
+}
+$('hcBrush').onclick=()=>hcSetTool('add');$('hcEraser').onclick=()=>hcSetTool('erase');$('hcWand').onclick=()=>hcSetTool('wand');
+$('hcRadius').oninput=()=>$('hcRadiusLabel').textContent=$('hcRadius').value+'px';
+$('hcEditUndo').onclick=hcEditUndo;$('hcEditRedo').onclick=hcEditRedo;
+$('hcDiscardEdits').onclick=hcEditDiscard;$('hcSaveEdits').onclick=()=>hcSaveEdits();
+$('hcWandApply').onclick=hcWandApply;$('hcWandClear').onclick=hcWandClear;
+$('hcWandText').oninput=()=>{hcEdit.names[Number($('hcEditObj').value)]=$('hcWandText').value};
+$('hcWandText').onchange=hcWandRerun;$('hcWandPrompt').onchange=()=>{$('hcWandText').disabled=$('hcWandPrompt').value!=='name';hcWandRerun()};$('hcWandThr').onchange=hcWandRerun;
+let hcEditObjValue=$('hcEditObj').value;
+$('hcEditObj').onchange=async()=>{
+ const next=$('hcEditObj').value;$('hcEditObj').value=hcEditObjValue;
+ if(!await hcEditResolve('대상 변경'))return;
+ $('hcEditObj').value=hcEditObjValue=next;hcEditReset();hcWandSyncName();
 };
+hcWandSyncName();
+document.addEventListener('keydown',e=>{
+ if(page!=='review'||!hcMeta||hcStage!=='mask'||$('hcWorkspace').classList.contains('hidden')||document.querySelector('dialog[open]')||e.isComposing||e.target.closest('input,textarea,select,[contenteditable="true"]'))return;
+ const key=e.key.toLowerCase();
+ if((e.ctrlKey||e.metaKey)&&key==='z'){e.preventDefault();e.shiftKey?hcEditRedo():hcEditUndo()}
+ else if(e.ctrlKey&&key==='y'){e.preventDefault();hcEditRedo()}
+ else if(!e.ctrlKey&&!e.metaKey&&!e.altKey&&(key==='b'||key==='e'||key==='w')){e.preventDefault();hcSetTool({b:'add',e:'erase',w:'wand'}[key])}
+ else if(key==='enter'&&hcWandEntry()?.wand.mask){e.preventDefault();hcWandApply()}
+ else if(key==='escape'){if(hcWandClear())e.preventDefault();else if(hcEdit.solo!==null){e.preventDefault();hcToggleSolo(hcEdit.solo)}}
+});
+window.addEventListener('beforeunload',e=>{if(hcEditDirty()){e.preventDefault();e.returnValue=''}});

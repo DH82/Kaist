@@ -1,0 +1,1 @@
+MANO_LEFT.pkl, MANO_RIGHT.pkl 을 여기에 두세요 (https://mano.is.tue.mpg.de 등록 후 다운로드). 그 다음 bin/kp setup-mano

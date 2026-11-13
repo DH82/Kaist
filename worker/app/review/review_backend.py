@@ -6,6 +6,28 @@ import json
 from pathlib import Path
 import sys
 from PIL import Image
+from contextlib import contextmanager
+import fcntl
+import time
+
+
+@contextmanager
+def episode_lock(project, ep, wait=5.0):
+    """에피소드 단위 잠금. 원본 mask_review.lock()은 프로젝트 전체 잠금(99_history/pipeline.lock)이라
+    다른 에피소드의 SAM3가 돌면 검수가 막혔습니다. 같은 에피소드의 SAM3(sam3_episode.py)와만 서로 막습니다."""
+    folder = Path(project) / '99_history/locks'
+    folder.mkdir(parents=True, exist_ok=True)
+    with (folder / f'{ep}.lock').open('a') as f:
+        deadline = time.monotonic() + wait
+        while True:
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise ValueError('이 에피소드의 추론 또는 다른 작업이 실행 중입니다. 완료 후 검수하세요.')
+                time.sleep(0.2)
+        yield
 
 
 def fingerprint(review, draft):
@@ -25,7 +47,7 @@ def context(config, episode):
 
 
 def inspect(review, project, ep):
-    with review.lock(project):
+    with episode_lock(project, ep):
         draft = review.prepare_draft(project, ep)
         d = review.root(project, ep)
         prepared = review.source(d)
@@ -36,7 +58,7 @@ def inspect(review, project, ep):
 
 
 def decide(review, project, ep, data):
-    with review.lock(project):
+    with episode_lock(project, ep):
         draft = review.prepare_draft(project, ep)
         if not data.get('basis') or data['basis'] != fingerprint(review, draft):
             raise ValueError('검수 중 마스크가 변경됐습니다. 화면을 새로 열고 다시 확인하세요.')
@@ -122,7 +144,7 @@ def tracking_inspect(project, ep):
 
 
 def tracking_decide(review, project, ep, data):
-    with review.lock(project):
+    with episode_lock(project, ep):
         tracking, case = tracking_context(project, ep)
         current = tracking_inspect(project, ep)
         if current['approval']['status'] == 'approved':

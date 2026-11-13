@@ -1,0 +1,47 @@
+Hand reconstruction after 10_reconstruct.py
+==========================================
+
+실행 (완료된 reconstruction 에피소드 폴더가 입력):
+python3 /home/cw-wfm/WFM_KAIST_test/00_scripts/18_fit_hands.py /home/cw-wfm/WFM_KAIST_test/06_reconstruction/ep_20260826_083803
+
+순서: 상위 결과 검증 -> GPU/모델 확인 -> 4캠 HaMBA -> 시간 연속 MANO fitting -> 파일 검증 -> 4캠 RGB+MANO 영상 -> 로컬 검수 창.
+출력 경로를 별도로 입력하지 않습니다. 기존 RAW/추적/3D 파일은 수정하지 않습니다.
+
+중단 후 같은 명령으로 재개합니다.
+- HaMBA: 검증된 완료 카메라는 건너뜁니다. 중단 카메라는 다시 처리합니다.
+- MANO: 원래 피팅 코드의 프레임 체크포인트로 재개합니다.
+- 완료 결과가 정상인 단계는 건너뜁니다.
+- 입력/코드/설정 변경 시 중단합니다. --new-attempt를 붙이면 기존 hands 폴더를 99_history/hands에 보존하고 다시 시작합니다.
+
+추론 없이 검사만: 위 명령에 --check 추가.
+검수 창 자동 실행 제외: --no-view 추가.
+현재 에피소드는 기존에 기록된 오른손 판별 근거를 사용합니다 (사람의 확인을 대신하지 않습니다).
+다른 에피소드에서 손 설정이 없으면 --hand-side right 또는 --hand-side both를 지정하세요.
+기존 피팅 코드는 단일 왼손 모드를 지원하지 않습니다. 왼손 촬영에 right를 지정하면 안 됩니다.
+
+산출물: 06_reconstruction/<episode>/hands/
+  hamba/              카메라별 초기 손 예측과 미리보기
+  hand_v1/
+    hand_reg.pkl       프레임별 손 정점 (각 손 778개)
+    hand_reg_params.pkl MANO 피팅 파라미터
+    hand_reg_cidx.pkl   카메라 관련 피팅 기록
+    fit_checkpoint.pkl 재개용 체크포인트
+  review/
+    mano_review.mp4    4캠 RGB 위 MANO 투영 비교 영상
+    frames/            로컬 검수용 프레임
+    validation.json    구조 검사 결과 (정확도 승인 아님)
+  settings.json        사용한 손/피팅 설정
+  state.json           실행 상태, 이번 실행 소요시간
+  logs/                실행 로그
+  _resume/             단계별 완료 및 입력 검증 기록
+  _runtime/            원본 입력을 상대 링크로 참조하는 실행 공간과 보조 결과
+
+검수 화면 다시 열기:
+python3 /home/cw-wfm/WFM_KAIST_test/00_scripts/19_review_hands.py /home/cw-wfm/WFM_KAIST_test/06_reconstruction/ep_20260826_083803/hands
+좌우 방향키: 프레임 이동 / Space: 재생·정지.
+손목 위치, 손가락 방향, 좌우 손, 프레임 간 튐을 4캠에서 확인합니다.
+현재 창은 결과 확인용입니다. 승인 기록이나 수동 손 자세 편집 기능은 포함하지 않습니다.
+
+주의: SOR/군집 제외 결과는 이 MANO 코드의 직접 입력이 아닙니다.
+현재 손 피팅은 RGB, 카메라 보정, HaMBA/MediaPipe 결과를 사용합니다.
+노이즈 필터 적용이 MANO에 자동 반영된다고 해석하면 안 됩니다.

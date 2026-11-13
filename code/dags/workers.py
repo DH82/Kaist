@@ -2,6 +2,8 @@
 import json,os
 from pathlib import Path
 DEFAULT_WORKER='gpu_4090_a'
+# PC 한 대에서 동시에 진행할 수 있는 에피소드 실행 수 (Airflow 실행 수·풀 슬롯·UI 검사 공통)
+MAX_PARALLEL_RUNS=2
 REGISTRY=Path(os.environ.get('KAIST_WORKERS_FILE',str(Path(__file__).with_name('workers.json'))))
 def workers():
     rows=json.loads(REGISTRY.read_text())['workers']

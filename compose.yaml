@@ -1,6 +1,6 @@
 # KAIST 단일 PC 스택: UI + Airflow + PostgreSQL을 GPU PC 안에서 실행합니다.
 # NAS는 NFS 마운트로 RAW를 읽고 결과를 쓰는 저장소로만 사용합니다.
-# GPU Worker(포트 8090)는 호스트의 systemd 서비스로 실행되며 이 Compose에 포함되지 않습니다.
+# GPU Worker(포트 8090)는 gpu 프로필의 컨테이너로 실행됩니다.
 #
 # 모든 서비스는 host 네트워크를 사용합니다.
 #  - Worker가 127.0.0.1:8090에만 열려 있어 SSH 터널 없이 바로 연결할 수 있습니다.
@@ -98,18 +98,21 @@ services:
 
 
   # ---- GPU 파이프라인 컨테이너 (SAM3 → 추적 → 3D 복원 → HaMBA·MANO → NAS 저장) ----
-  # gpu/setup_gpu.sh가 빌드·실행합니다. 프로필 gpu로만 켜집니다: docker compose --profile gpu up -d gpu-worker
+  # repro/install.sh가 빌드·실행합니다. 프로필 gpu로만 켜집니다: docker compose --profile gpu up -d gpu-worker
   # 이미지 안 경로(/home/cw-wfm/...)는 검증된 환경의 절대경로를 그대로 쓴 것으로, PC 사용자 이름과 무관합니다.
+  # Python 환경은 빌드 때 인터넷에서 받아 만들고, 모델 weight는 호스트 KAIST_WEIGHTS_ROOT에서 읽기 전용으로 마운트합니다.
   gpu-worker:
     profiles: [gpu]
     build:
       context: ./gpu
       additional_contexts:
-        dep: ${KAIST_DEP_ROOT:-/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace}
-        rev: ${KAIST_REV_ROOT:-/home/cw-wfm/Desktop/worker1/Kaist pipeline revising/02_current}
+        dependency-source: ./pipeline/dependency-source
+        rev: ${KAIST_REV_ROOT:-./pipeline/current}
         worker: ./worker/app
       args:
         HOST_UID: ${HOST_UID:?run setup.sh first}
+        # GPU 세대(compute capability). prepare_pc.py가 nvidia-smi로 채웁니다. 예: 4090=8.9
+        TORCH_CUDA_ARCH_LIST: ${TORCH_CUDA_ARCH_LIST:-8.9}
     image: kaist-gpu:latest
     restart: unless-stopped
     network_mode: host
@@ -134,6 +137,18 @@ services:
         target: ${NAS_MOUNT:-/mnt/kaist-data}
         bind: {propagation: rslave}
       - gpu-cache:/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace/runtime-cache
+      # ---- 모델 weight (gpu/env/weights.txt와 같은 목록). 호스트 폴더가 없으면 시작하지 않습니다.
+      # KAIST_WEIGHTS_ROOT 기본값은 원래 PC의 weight 위치(WFM_KAIST/workspace)입니다. ----
+      - {type: bind, read_only: true, bind: {create_host_path: false}, source: "${KAIST_WEIGHTS_ROOT:-/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace}/hf-cache/hub", target: "/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace/hf-cache/hub"}
+      - {type: bind, read_only: true, bind: {create_host_path: false}, source: "${KAIST_WEIGHTS_ROOT:-/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace}/runtime-cache/torch/hub", target: "/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace/runtime-cache/torch/hub"}
+      - {type: bind, read_only: true, bind: {create_host_path: false}, source: "${KAIST_WEIGHTS_ROOT:-/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace}/runtime-cache/iopath", target: "/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace/runtime-cache/iopath"}
+      - {type: bind, read_only: true, bind: {create_host_path: false}, source: "${KAIST_WEIGHTS_ROOT:-/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace}/kaist-full/PhysTwin/Mono/data_process/Hamba/_DATA/data/mano", target: "/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace/kaist-full/PhysTwin/Mono/data_process/Hamba/_DATA/data/mano"}
+      - {type: bind, read_only: true, bind: {create_host_path: false}, source: "${KAIST_WEIGHTS_ROOT:-/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace}/kaist-full/PhysTwin/Mono/data_process/Hamba/_DATA/data/mano_mean_params.npz", target: "/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace/kaist-full/PhysTwin/Mono/data_process/Hamba/_DATA/data/mano_mean_params.npz"}
+      - {type: bind, read_only: true, bind: {create_host_path: false}, source: "${KAIST_WEIGHTS_ROOT:-/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace}/kaist-full/PhysTwin/Mono/data_process/Hamba/_DATA/vitpose_ckpts", target: "/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace/kaist-full/PhysTwin/Mono/data_process/Hamba/_DATA/vitpose_ckpts"}
+      - {type: bind, read_only: true, bind: {create_host_path: false}, source: "${KAIST_WEIGHTS_ROOT:-/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace}/kaist-full/PhysTwin/Mono/data_process/Hamba/ckpts/hamba/checkpoints", target: "/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace/kaist-full/PhysTwin/Mono/data_process/Hamba/ckpts/hamba/checkpoints"}
+      - {type: bind, read_only: true, bind: {create_host_path: false}, source: "${KAIST_WEIGHTS_ROOT:-/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace}/kaist-full/PhysTwin/data_process/models/weights", target: "/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace/kaist-full/PhysTwin/data_process/models/weights"}
+      - {type: bind, read_only: true, bind: {create_host_path: false}, source: "${KAIST_WEIGHTS_ROOT:-/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace}/kaist-full/PhysTwin/data/mano_faces.pkl", target: "/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace/kaist-full/PhysTwin/data/mano_faces.pkl"}
+      - {type: bind, read_only: true, bind: {create_host_path: false}, source: "${KAIST_WEIGHTS_ROOT:-/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace}/kaist-full/PhysTwin/Mono/data/mano_faces.pkl", target: "/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace/kaist-full/PhysTwin/Mono/data/mano_faces.pkl"}
     deploy:
       resources:
         reservations:
@@ -149,5 +164,5 @@ services:
 
 volumes:
   pgdata:
-  # 모델 실행 캐시(warp·torch hub 등). 처음 실행할 때 이미지 내용으로 채워집니다.
+  # 쓰기 가능한 실행 캐시(warp 커널·matplotlib 등). 모델 weight는 여기 넣지 않고 호스트에서 마운트합니다.
   gpu-cache:

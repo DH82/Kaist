@@ -15,7 +15,7 @@ sys.path.insert(0,str(Path(__file__).parent))
 import intake,access,re
 sys.path.insert(0,str(ROOT/'dags'))
 from direct_worker import call,token,request_for,MANO_STAGES
-from workers import workers,worker,dag_entries,dag_worker,DEFAULT_WORKER,DAY_DAG,BATCH_DAG
+from workers import workers,worker,dag_entries,dag_worker,DEFAULT_WORKER,DAY_DAG,BATCH_DAG,MAX_PARALLEL_RUNS
 DIRECT_DAGS={"test":"kaist_mac_to_4090_test","pipeline":"kaist_direct_pipeline_4090","raw":"kaist_direct_raw_4090"}
 if os.environ.get('KAIST_GPU_TEST_ENABLED','true').lower()=='false':DIRECT_DAGS.pop('test')
 @asynccontextmanager
@@ -107,12 +107,17 @@ def local_api(method, path, **kwargs):
 def ensure_worker_pool(pc):
  path='/api/v2/pools/'+quote(pc['pool'],safe='')
  try:
-  local_api('GET',path)
+  current=local_api('GET',path)
+  # 예전 1슬롯 풀을 동시 실행 수에 맞춰 늘립니다.
+  if current.get('slots',0)<MAX_PARALLEL_RUNS:
+   # 실패해도 실행은 막지 않습니다(슬롯 1개로 순서 대기). Airflow 화면 Admin→Pools에서 직접 늘릴 수 있습니다.
+   try:local_api('PATCH',path,params={'update_mask':'slots'},json={'name':pc['pool'],'slots':MAX_PARALLEL_RUNS,'include_deferred':current.get('include_deferred',False)})
+   except httpx.HTTPError as exc:print('GPU 풀 슬롯 변경 실패:',pc['pool'],exc,flush=True)
   return
  except httpx.HTTPStatusError as exc:
   if exc.response.status_code!=404:raise
  try:
-  local_api('POST','/api/v2/pools',json={'name':pc['pool'],'slots':1,'description':pc['label']})
+  local_api('POST','/api/v2/pools',json={'name':pc['pool'],'slots':MAX_PARALLEL_RUNS,'description':pc['label']})
  except httpx.HTTPStatusError as exc:
   if exc.response.status_code!=409:raise
   local_api('GET',path)
@@ -238,6 +243,19 @@ class Launch(BaseModel):
  sam_prompt:str=Field(default='',max_length=200)
  confirmed:bool=False
  preview_episode:str=''
+ sam_object_mode:str='text'
+ sam_object_bboxes:dict|None=None
+
+def object_bboxes(value):
+ # 선택 옵션: 첫 프레임 bbox(카메라 1~4 → 0~3, 정규화 x,y,w,h). Worker에서도 같은 기준으로 다시 검사합니다.
+ if not isinstance(value,dict) or sorted(value)!=['0','1','2','3']:raise HTTPException(400,'bbox 물체 추적은 카메라 4대 모두 첫 프레임에서 물체 bbox를 그려야 합니다.')
+ result={}
+ for cam,box in value.items():
+  if not isinstance(box,list) or len(box)!=4 or any(isinstance(v,bool) or not isinstance(v,(int,float)) for v in box):raise HTTPException(400,'bbox 형식이 잘못되었습니다.')
+  x,y,w,h=(round(float(v),4) for v in box)
+  if not (0<=x<1 and 0<=y<1 and w>=0.01 and h>=0.01 and x+w<=1.0001 and y+h<=1.0001):raise HTTPException(400,f'카메라 {int(cam)+1} bbox가 화면 밖이거나 너무 작습니다.')
+  result[cam]=[x,y,w,h]
+ return result
 
 @app.post('/api/run')
 def launch(data:Launch,req:Request):
@@ -254,9 +272,9 @@ def launch(data:Launch,req:Request):
   if data.worker_id!=DEFAULT_WORKER or data.mode!='pipeline':raise HTTPException(400,'PC1 전체 파이프라인에서만 선택할 수 있습니다.')
   dag=DAY_DAG
  with lock:
-  if data.worker_id==DEFAULT_WORKER:check_batch_idle()
   active=local_api('GET',f'/api/v2/dags/{dag}/dagRuns',params={'limit':100,'order_by':'-logical_date'})
-  used_names=set()
+  # MANO 일괄 실행도 PC1의 동시 실행 1개로 셉니다(예전에는 일괄 실행 중이면 모든 실행을 막았습니다).
+  used_names=set();running_here=batch_active() if data.worker_id==DEFAULT_WORKER else 0
   for wid,other_mode,other_dag in active_dags():
    if wid!=data.worker_id:continue
    rows=active if other_dag==dag else local_api('GET',f'/api/v2/dags/{other_dag}/dagRuns',params={'limit':100,'order_by':'-logical_date'})
@@ -264,9 +282,11 @@ def launch(data:Launch,req:Request):
     conf=row.get('conf') or {}
     used_names.add(conf.get('episode_id'))
     if row['state'] not in ('queued','running'):continue
-    # 같은 DAG의 같은 RAW 재실행은 max_active_runs=1에 따라 순서대로 처리합니다.
-    if other_dag==dag and data.mode in ('pipeline','raw') and (conf.get('raw_episode_id') or conf.get('episode_id'))==data.episode_id:continue
-    raise HTTPException(409,'선택한 PC에 실행 중인 작업이 있습니다.')
+    # 같은 RAW를 같은 PC에서 동시에 두 번 돌리지 않습니다.
+    if data.mode in ('pipeline','raw') and (conf.get('raw_episode_id') or conf.get('episode_id'))==data.episode_id:raise HTTPException(409,'이 RAW는 선택한 PC에서 이미 실행 중입니다.')
+    running_here+=1
+  # PC 한 대에서 최대 MAX_PARALLEL_RUNS개까지 동시에 진행합니다.
+  if running_here>=MAX_PARALLEL_RUNS:raise HTTPException(409,f'선택한 PC에서 이미 {running_here}개 작업이 실행 중입니다. (최대 {MAX_PARALLEL_RUNS}개 동시 실행)')
   if data.mode=='pipeline':
    for other_wid,_,other_dag in active_dags():
     if other_wid==data.worker_id:continue
@@ -276,6 +296,8 @@ def launch(data:Launch,req:Request):
   if data.mode in ('raw','pipeline'):
    if data.mode=='pipeline' and data.preview_episode!=data.episode_id:raise HTTPException(400,'선택한 에피소드 이미지를 먼저 확인하세요.')
    if data.mode=='pipeline' and (not data.episode_id or not data.sam_prompt.strip() or not data.confirmed):raise HTTPException(400,'에피소드와 SAM3 대상을 입력하고 설정을 확인하세요.')
+   if data.sam_object_mode not in ('text','bbox_track'):raise HTTPException(400,'물체 분할 방식을 확인하세요.')
+   bboxes=object_bboxes(data.sam_object_bboxes) if data.mode=='pipeline' and data.sam_object_mode=='bbox_track' else None
    # Validate against live server episode list; no arbitrary path input.
    captures=call('GET','/worker/info',worker_id=data.worker_id)['episodes']
    used_names.update(ep for ep in captures if ep!=data.episode_id)
@@ -293,6 +315,7 @@ def launch(data:Launch,req:Request):
     if actual!=expected:raise HTTPException(409,'GPU PC가 같은 NAS 에피소드를 읽는지 확인되지 않았습니다. Worker 업데이트와 NAS 마운트를 확인하세요.')
    conf={'episode_id':data.episode_id,'operator_id':access.user(req)['name'],'worker_id':data.worker_id}
    if data.mode=='pipeline':conf.update(sam_prompt=data.sam_prompt.strip(),sam_scene='2d',sam_settings_confirmed=True)
+   if bboxes:conf.update(sam_object_mode='bbox_track',sam_object_bboxes=bboxes)
   ensure_worker_pool(pc)
   local_api('PATCH',f'/api/v2/dags/{dag}',json={'is_paused':False})
   now=datetime.now(timezone.utc);run='ui_'+now.strftime('%Y%m%dT%H%M%S_')+secrets.token_hex(3)
@@ -326,6 +349,9 @@ def airflow_runs(dag, **filters):
   yield from rows
   offset+=len(rows)
   if not rows or offset>=page['total_entries']:return
+
+def batch_active():
+ return sum(r['state'] in ('running','queued') for r in airflow_runs(BATCH_DAG))
 
 def check_batch_idle():
  if any(r['state'] in ('running','queued') for r in airflow_runs(BATCH_DAG)):
@@ -373,9 +399,9 @@ def launch_mano(data:ManoSelection,req:Request):
  if len(set(data.runs))!=len(data.runs):raise HTTPException(400,'중복된 실행입니다.')
  with lock:
   check_batch_idle()
-  for wid,mode,dag in active_dags():
-   if wid==DEFAULT_WORKER and any(r['state'] in ('running','queued') for r in airflow_runs(dag)):
-    raise HTTPException(409,'PC1 작업 완료 후 실행하세요.')
+  # PC1이 완전히 빌 때까지 기다리지 않고, 동시 실행 한도(MAX_PARALLEL_RUNS) 안에서 함께 실행합니다.
+  busy=sum(r['state'] in ('running','queued') for wid,mode,dag in active_dags() if wid==DEFAULT_WORKER for r in airflow_runs(dag))
+  if busy>=MAX_PARALLEL_RUNS:raise HTTPException(409,f'PC1에서 이미 {busy}개 작업이 실행 중입니다. 하나가 끝난 뒤 MANO를 실행하세요. (최대 {MAX_PARALLEL_RUNS}개 동시 실행)')
   sources=[]
   history=batch_history()
   for run_id in data.runs:
@@ -451,6 +477,7 @@ def jobs(req:Request):
       try:
        st=call('POST','/worker/jobs/status',json=request_for(t['task_id'],r['dag_run_id'],r.get('conf',{})),worker_id=wid,timeout=15)
        entry['worker_state']=st['state']
+       if st.get('progress'):entry['progress']=st['progress']
        if st['state']=='waiting':entry['state']='review_waiting'
       except (httpx.HTTPError,OSError,ValueError,subprocess.SubprocessError):
        entry['worker_state']='unavailable';item['connection_error']=True
@@ -749,17 +776,21 @@ def retry_job(data:RetryJob,req:Request):
  wid=dag_worker(data.dag_id)
  if data.dag_id not in [d for w,m,d in active_dags()] or data.stage not in order:raise HTTPException(400,'재시도할 단계를 확인하세요.')
  with lock:
-  if wid==DEFAULT_WORKER:check_batch_idle()
   base=f'/api/v2/dags/{data.dag_id}/dagRuns/'+quote(data.run_id,safe='')
   run=local_api('GET',base);conf=run.get('conf',{});ep=conf.get('episode_id','')
   owner=conf.get('operator_id') or access.owners().get(ep)
   if not owner or owner!=access.user(req)['name']:raise HTTPException(403,'이 에피소드를 실행한 작업자만 재시도할 수 있습니다.')
   if run['state']!='failed':raise HTTPException(409,'실패한 실행만 재시도할 수 있습니다.')
+  running_here=batch_active() if wid==DEFAULT_WORKER else 0
+  if running_here>=MAX_PARALLEL_RUNS:raise HTTPException(409,f'이 PC에서 이미 {MAX_PARALLEL_RUNS}개 작업이 실행 중입니다. 하나가 끝난 뒤 재시도하세요.')
   for other_wid,_,dag in active_dags():
    recent=local_api('GET',f'/api/v2/dags/{dag}/dagRuns',params={'limit':100,'order_by':'-logical_date'})['dag_runs']
    for other in recent:
     if other['dag_run_id']==data.run_id and dag==data.dag_id:continue
-    if other_wid==wid and other['state'] in ('running','queued'):raise HTTPException(409,'다른 작업이 실행 중입니다. 완료 후 재시도하세요.')
+    if other_wid==wid and other['state'] in ('running','queued'):
+     running_here+=1
+     if other.get('conf',{}).get('episode_id')==ep:raise HTTPException(409,'같은 에피소드가 실행 중입니다. 완료 후 재시도하세요.')
+     if running_here>=MAX_PARALLEL_RUNS:raise HTTPException(409,f'이 PC에서 이미 {MAX_PARALLEL_RUNS}개 작업이 실행 중입니다. 하나가 끝난 뒤 재시도하세요.')
     if other.get('conf',{}).get('episode_id')==ep and (other.get('logical_date') or '')>(run.get('logical_date') or ''):raise HTTPException(409,'더 최근에 실행한 에피소드입니다. 최신 실행을 확인하세요.')
   tasks=local_api('GET',base+'/taskInstances')['task_instances']
   failed=sorted((t for t in tasks if t['state']=='failed'),key=lambda t:order.index(t['task_id']))

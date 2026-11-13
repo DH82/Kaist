@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "note": "Initial engineering screening thresholds, not KAIST acceptance criteria. Calibrate on reviewed episodes. No tracks are deleted.",
+  "mask_tolerance_px": 5,
+  "outside_mask_fraction": 0.30,
+  "outside_image_fraction": 0.05,
+  "jump_diagonal_fraction": 0.08,
+  "jump_points_fraction": 0.15,
+  "low_visibility_fraction": 0.05,
+  "minimum_visible_points": 5,
+  "minimum_mask_pixels": 64,
+  "minimum_run_frames": 3
+}

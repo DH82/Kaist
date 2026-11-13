@@ -1,0 +1,53 @@
+07 추적 → 자동 QC → 예외 구간만 사람 검수
+
+실행:
+python3 00_scripts/07_track.py 04_masks/approved/<episode>
+--check: 환경 확인만 / --new-attempt: 기존 결과 보관 후 새 추적
+같은 명령으로 재개하면 검증된 카메라 결과를 재사용합니다.
+
+자동 흐름:
+1. 승인 마스크 참조 준비
+2. 물체·손 4캠 추적 (8개 NPZ)
+3. 검수 영상 생성
+4. 자동 QC 실행
+5. 이상 후보 없음 → 자동 승인 → 05_tracking/approved → 06_reconstruction 입력 자동 준비
+6. 이상 후보 있음 → 05_tracking/pending → 로컬에서 후보 구간만 확인
+7. 구조 오류 → 중단. 사람 승인으로 우회 불가
+기존 사람이 보류한 기록은 재실행만으로 자동 통과시키지 않습니다.
+07은 입력 준비까지만 자동 실행합니다. 실제 3D 복원은 python3 00_scripts/10_reconstruct.py 05_tracking/approved/<episode>로 실행합니다.
+
+예외 검수:
+python3 00_scripts/09_review_tracking.py 05_tracking/pending/<episode>
+후보 버튼: 대상·카메라·프레임 구간으로 이동 (앞뒤 3프레임 포함)
+각 후보 확인 체크 + 검수자 + 허용 사유 → 승인. 다음 단계 입력도 준비합니다.
+문제가 맞으면 사유를 기록하고 보류. 원인 수정 후 재추적합니다.
+마스크 오류: 06에서 수정/재승인 후 07 --new-attempt로 재추적.
+←/→ 프레임, Space 재생/정지. 후보 재생은 구간 끝에서 정지합니다.
+좌표 편집이나 점 삭제는 하지 않습니다. 추적 원본은 그대로 보존합니다.
+
+출력:
+05_tracking/pending/<episode> 또는 approved/<episode>
+- cotracker/{0..3}.npz: 물체 추적 (좌표 y,x)
+- cotracker_hand/{0..3}.npz: 손 추적
+- review/: 4캠 영상·진단·현재 decision.json 및 decisions/ 이력
+- qc/report.json: 검사 시각, 적용 기준, 카메라별 지표, 이상 구간/사유
+- qc/receipt.json: 검사 대상·정책·코드·보고서 무결성 기록
+- approval_source.json, manifest.json, mask/: 입력 상대 참조
+- logs/, _resume/, state.json: 실행·재개 정보
+자동 승인은 approval_type=automatic, reviewer=Automatic QC로 기록합니다.
+사람 승인은 approval_type=human과 실제 이름/시각으로 구분합니다.
+입력/추적/QC 기준/보고서 변경 시 기존 승인으로 다음 단계에 진행할 수 없습니다.
+
+기준: 00_scripts/tracking_qc_policy.json
+KAIST 확정 기준이 아닌 초기 엔지니어링 이상 탐지 기준이며, 실제 표본 검수로 보정해야 합니다.
+- 마스크 경계 허용 5px, 보이는 점 30% 초과 이탈이 3프레임 연속
+- 보이는 점 5% 초과 화면 밖 이탈이 3프레임 연속
+- 연속해서 보이는 점 중 15% 초과가 화면 대각선 8% 넘게 프레임 간 이동
+- 대상 마스크 64px 이상일 때 가시성 5% 미만 또는 보이는 점 5개 미만이 3프레임 연속
+가려진 점은 마스크/화면 이탈과 이동 검사 대상에서 제외합니다.
+일부 작은 오류는 놓칠 수 있으며, 정상 고속 움직임/가림도 후보로 나올 수 있습니다.
+자동 QC는 최종 3D 품질을 보증하지 않습니다.
+
+수동으로 다음 입력을 다시 준비할 때:
+python3 00_scripts/10_prepare_reconstruction.py 05_tracking/approved/<episode>
+06_reconstruction/<episode>에 상대 참조만 생성합니다. 승인본이 바뀌면 입력 참조만 있는 폴더는 이력 보관 후 갱신합니다. 실제 3D 산출물이 있으면 자동 덮어쓰지 않고 중단합니다.

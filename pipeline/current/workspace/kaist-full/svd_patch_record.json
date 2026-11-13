@@ -1,0 +1,7 @@
+{
+  "file": "/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace/kaist-full/PhysTwin/data_process/preprocess_rgbd.py",
+  "original_sha256": "aa1bbd1e0a5a8d74da55c19cc87a5748f60b72e0a8a1a8cf875389395bf38991",
+  "patched_sha256": "0117996275ae113458d0d7be3182b23053b31d973cc6f062ced8656cfd8ef320",
+  "old": "np.linalg.svd(inliers - c)",
+  "new": "np.linalg.svd(inliers - c, full_matrices=False)"
+}

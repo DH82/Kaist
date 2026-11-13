@@ -1,0 +1,1 @@
+wholebody.pth (ViTPose+ huge, 3.6GB, 사내 공유) 를 여기에 두세요

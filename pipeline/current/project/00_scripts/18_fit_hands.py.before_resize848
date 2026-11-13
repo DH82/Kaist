@@ -1,0 +1,172 @@
+#!/usr/bin/env python3
+"""Completed reconstruction -> HaMBA -> temporal MANO fit -> native review.
+No inference starts with --check. Existing source data is never modified.
+"""
+import argparse,importlib,json,os,shutil,subprocess,sys,time
+from pathlib import Path
+import pipeline
+from mask_review import lock
+from stage_refs import source,link
+from resume_steps import digest,snapshot,step,preserve
+from sam_settings import save
+from live_log import Display
+recon=importlib.import_module('10_reconstruct');HERE=Path(__file__).resolve().parent
+
+def resolve_side(root,episode,requested,previous=None):
+ if requested:return requested,'operator argument'
+ if previous:return previous['side'],previous.get('side_source','saved run setting')
+ config=root/'episodes.all.json'
+ record=json.loads(config.read_text()).get(episode,{}) if config.exists() else {}
+ if record.get('num_hands')==1 and record.get('hand_side')=='right' and record.get('hand_identity_source'):
+  return 'right',record['hand_identity_source']
+ raise ValueError('손 설정이 필요합니다: --hand-side right 또는 --hand-side both. 기존 코드의 단일 왼손 피팅은 아직 지원하지 않습니다.')
+
+def fit_settings(side,side_source):
+ if side not in ('right','both'):raise ValueError('Unsupported hand side')
+ settings={'algorithm':'mano-geometric-shared-shape-v6','rotation_representation':'6D_to_SO3','side':side,'side_source':side_source,'iterations':1500,'temp_weight':500000,'hamba_weight':.01,'seed':1027,'num_cams':4,'w_mask':1.0,'w_mask_cover':1.0,'cover_max_px':40.0,'wrist_weight':0.1,'staged_fit':True,'w_silhouette':0.0,'silhouette_size':64,'silhouette_every':10,'pose_temp_weight':500000,'w_pose_prior':25.0,'shared_shape':True,'shape_frames':'','shape_frame_count':12,'shape_iters':3000,'shape_lr':1e-3,'shape_prior_weight':1.0,'shape_max_delta':1.0,'camera_init_iters':300,'fit_shape':False,'fit_shape_lr':2e-3,'fit_shape_max_delta':0.0,'fit_shape_temporal_weight':1.0,'robust_joint_delta':5.0}
+ return settings
+
+def hand_mask_inputs(case):
+ # Approved tracking masks carry PNGs; their semantic ID metadata lives upstream.
+ from mask_paths import episode_root
+ mask=case/'mask'
+ approved=episode_root(case.parent.parent,case.name)/'mask'
+ infos={c:(mask/f'mask_info_{c}.json' if (mask/f'mask_info_{c}.json').is_file() else approved/f'mask_info_{c}.json') for c in range(4)}
+ for c,info in infos.items():
+  if not info.is_file():raise ValueError('SAM3 hand mask metadata missing: '+str(info))
+  labels=json.loads(info.read_text())
+  ids=[str(k) for k,v in labels.items() if isinstance(v,str) and 'hand' in v.lower()]
+  if not ids:raise ValueError('SAM3 hand mask ID missing: '+str(info))
+  for mid in ids:
+   if not (mask/str(c)/mid).is_dir():raise ValueError('SAM3 hand mask folder missing: '+str(mask/str(c)/mid))
+ return mask,infos
+
+def hand_mask_contract(case):
+ mask,infos=hand_mask_inputs(case)
+ return {'images':snapshot([mask],case),'labels':{str(c):digest(p) for c,p in infos.items()}}
+
+def make_hand_contract(case,prepared,mono,settings):
+ codepaths=[mono/'data_process/data_process_hands.py',mono/'data_process/Hamba/script_hand_recon.py',HERE/'hand_stage_worker.py',HERE/'18_fit_hands.py',HERE/'mano_integrity.py',mono/'data_process/models/mano_wrapper.py']
+ modelpaths=[mono/'data/mano_faces.pkl',mono/'data_process/Hamba/ckpts/hamba/checkpoints/hamba.ckpt',mono/'data_process/Hamba/_DATA/data/mano',mono/'data_process/Hamba/_DATA/vitpose_ckpts/vitpose+_huge/wholebody.pth']
+ return {'settings':settings,'hand_masks':hand_mask_contract(case),'inputs':snapshot([prepared/'color',prepared/'metadata.json',prepared/'calibrate.pkl',prepared/'source_frames.json'],prepared),'code':{str(p):digest(p) for p in codepaths},'models':snapshot(modelpaths,mono),'tracking_approval':json.loads((case/'tracking_approval.json').read_text())['decision_id']}
+
+def verify_hand_contract(out,prepared,mono):
+ settings=json.loads((out/'settings.json').read_text())
+ expected=fit_settings(settings['side'],settings['side_source'])
+ if settings!=expected:raise ValueError('손 복원 설정/알고리즘 변경: 새 시도로 재실행하세요.')
+ current=make_hand_contract(out.parent,prepared,mono,settings)
+ saved=json.loads((out/'_resume/contract.json').read_text())
+ if saved!=current:raise ValueError('손 복원 입력/코드/모델/설정 변경: 기존 결과를 보존하고 --new-attempt로 재실행하세요.')
+ return current
+
+def prepare_view(out,prepared,mono,episode):
+ # Stable relative links keep checkpoint arguments unchanged across restarts.
+ runtime=out/'_runtime';runmono=runtime/'Mono';data=runmono/'data_process';data.mkdir(parents=True,exist_ok=True)
+ for p in mono.iterdir():
+  if p.name!='data_process':link(runmono/p.name,p)
+ for p in (mono/'data_process').iterdir():link(data/p.name,p)
+ case=runtime/'inputs'/episode;case.mkdir(parents=True,exist_ok=True)
+ for name in ('color','metadata.json','calibrate.pkl','source_frames.json'):
+  link(case/name,prepared/name)
+ # Keep approved PNGs and semantic IDs together in the disposable runtime view.
+ mask,infos=hand_mask_inputs(out.parent)
+ (case/'mask').mkdir(exist_ok=True)
+ for c,info in infos.items():
+  link(case/'mask'/str(c),mask/str(c))
+  link(case/'mask'/f'mask_info_{c}.json',info)
+ (out/'hand_v1').mkdir(exist_ok=True);link(case/'hand_v1',out/'hand_v1')
+ return case,runmono
+
+def run(case,side=None,check=False,new=False,open_view=True):
+ case=case.resolve()
+ if case.parent.name!='06_reconstruction':raise ValueError('06_reconstruction/<episode> 폴더를 입력하세요.')
+ project=case.parent.parent
+ with lock(project):
+  recon.verify_outputs(case);prepared=source(case);root,pt,env=pipeline.runtime();mono=pt/'Mono';python=str(root/'hamba-env/bin/python');out=case/'hands'
+  previous=json.loads((out/'settings.json').read_text()) if (out/'settings.json').exists() else None
+  side,side_source=resolve_side(root,case.name,side,previous)
+  env['PYTHONPATH']=str(mono/'data_process')+os.pathsep+str(mono/'data_process/Hamba')+os.pathsep+env.get('PYTHONPATH','');env.pop('DISPLAY',None);env.pop('XAUTHORITY',None);env['PYOPENGL_PLATFORM']='egl';env['HF_HUB_OFFLINE']='1'
+  subprocess.run([python,str(HERE/'hand_stage_worker.py'),'check','--mono',str(mono)],cwd=mono,env=env,check=True)
+  print('선택한 손:',side,'· 근거:',side_source,flush=True)
+  hand_mask_inputs(case)
+  if check:print('HaMBA/MANO 실행 전 검사 완료 (추론은 실행하지 않음)');return
+  if new and out.exists():
+   # Archive entire self-contained run. Historic runtime links are reference-only.
+   target=project/'99_history/hands'/case.name/pipeline.stamp();target.parent.mkdir(parents=True,exist_ok=True);__import__('stage_refs').move(out,target)
+  out.mkdir(exist_ok=True);T=int(json.loads((prepared/'metadata.json').read_text())['frame_num'])
+  settings=fit_settings(side,side_source)
+  contract=make_hand_contract(case,prepared,mono,settings)
+  cp=out/'_resume/contract.json';cp.parent.mkdir(exist_ok=True)
+  if cp.exists() and json.loads(cp.read_text())!=contract:raise ValueError('손 복원 입력/코드/설정 변경: --new-attempt로 기존 결과를 보관하고 재실행하세요.')
+  save(cp,contract);save(out/'settings.json',settings)
+  work,runmono=prepare_view(out,prepared,mono,case.name);display=Display();started=time.monotonic()
+  hamba_out=out/'hamba'/case.name;hamba_out.mkdir(parents=True,exist_ok=True)
+  def validate(action):subprocess.run([python,str(HERE/'hand_stage_worker.py'),action,'--out',str(out),'--case',str(work),'--frames',str(T),'--side',side],cwd=runmono,env=env,check=True)
+  try:
+   save(out/'state.json',{'status':'running','side':side})
+   def hamba():
+    for dependent in ('19','preview'):preserve(out/'_resume'/f'{dependent}.json',out)
+    if (out/'hand_v1/fit_checkpoint.pkl').exists():
+     preserve(out/'hand_v1',out);(out/'hand_v1').mkdir()
+    # Only camera results from successful validation can be reused after interruption.
+    for c in range(4):
+     folder=hamba_out/str(c)
+     if (folder/'results.pt').exists():
+      receipt=out/'_resume'/f'hamba_camera_{c}.json'
+      try:
+       old=json.loads(receipt.read_text());valid=old['files']==snapshot([folder/'results.pt']+[folder/f'{f}_all.jpg' for f in range(T)],out)
+      except (OSError,ValueError,KeyError):valid=False
+      if not valid:preserve(folder,out)
+    cmd=[python,'-u','script_hand_recon.py','--img_folder',str(work.parent),'--out_folder',str(out/'hamba')]
+    try:recon.logged(cmd,mono/'data_process/Hamba',env,out/'logs/18_hamba.log','18 · HaMBA 손 복원',display)
+    finally:
+     # Save only individually validated completed cameras, even on interruption.
+     for c in range(4):
+      if not (hamba_out/str(c)/'results.pt').exists():continue
+      result=subprocess.run([python,str(HERE/'hand_stage_worker.py'),'camera','--camera',str(c),'--out',str(out),'--case',str(work),'--frames',str(T),'--side',side],cwd=runmono,env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+      if result.returncode==0:save(out/'_resume'/f'hamba_camera_{c}.json',{'files':snapshot([hamba_out/str(c)/'results.pt']+[hamba_out/str(c)/f'{f}_all.jpg' for f in range(T)],out)})
+    validate('hamba')
+    for c in range(4):save(out/'_resume'/f'hamba_camera_{c}.json',{'files':snapshot([hamba_out/str(c)/'results.pt']+[hamba_out/str(c)/f'{f}_all.jpg' for f in range(T)],out)})
+   step(out,'18',hamba,[f'hamba/{case.name}/{c}' for c in range(4)])
+   validate('hamba')
+   def fit():
+    preserve(out/'_resume/preview.json',out)
+    cmd=[python,'-u',str(runmono/'data_process/data_process_hands.py'),'--hamba_base_path',str(out/'hamba'),'--phystwin_base_path',str(work.parent),'--case_name',case.name,'--temp_weight','500000','--hamba_weight','0.01','--log','hand_v1','--seed','1027','--num_iters','1500','--num_hands','1' if side=='right' else '2','--num_cams','4','--resume','--observations-cache',str(out/'observations.pkl')]
+    for key in ('w_mask','w_mask_cover','cover_max_px','wrist_weight','w_silhouette','silhouette_size','silhouette_every','pose_temp_weight','w_pose_prior','camera_init_iters','fit_shape_lr','fit_shape_max_delta','fit_shape_temporal_weight','robust_joint_delta'):
+     cmd += ['--'+key,str(settings[key])]
+    if settings['fit_shape']:cmd += ['--fit_shape']
+    if settings['staged_fit']:cmd += ['--staged_fit']
+    if settings['shared_shape']:
+     cmd += ['--shared_shape']
+     for key in ('shape_frames','shape_frame_count','shape_iters','shape_lr','shape_prior_weight','shape_max_delta'):
+      cmd += ['--'+key,str(settings[key])]
+    recon.logged(cmd,runmono,env,out/'logs/19_mano.log','19 · MANO 시간축 피팅 (프레임 체크포인트 재개)',display);validate('fit')
+   fit_outputs=['hand_v1/hand_reg.pkl','hand_v1/hand_reg_params.pkl','hand_v1/hand_reg_cidx.pkl','hand_v1/integrity.json','observations.pkl']
+   if settings['shared_shape']:fit_outputs += ['hand_v1/shared_shape.pkl','hand_v1/shared_shape.json']
+   step(out,'19',fit,fit_outputs)
+   validate('fit')
+   step(out,'preview',lambda:validate('preview'),['review/mano_review.mp4','review/frames','review/validation.json'])
+   recon.verify_outputs(case);save(out/'state.json',{'status':'review_pending','seconds':round(time.monotonic()-started,2),'side':side})
+   print(f'손 복원 완료 · 이번 실행 {time.monotonic()-started:.1f}초\n결과: {out}\n검수: python3 {HERE/"19_review_hands.py"} {out}')
+  except BaseException as ex:save(out/'state.json',{'status':'interrupted','error':str(ex)});raise
+  finally:display.clear()
+ if open_view and os.environ.get('DISPLAY'):subprocess.Popen([sys.executable,str(HERE/'19_review_hands.py'),str(out)],start_new_session=True)
+
+def verify(out):
+ out=Path(out).resolve()
+ recon.verify_outputs(out.parent)
+ prepared=source(out.parent);root,pt,env=pipeline.runtime()
+ verify_hand_contract(out,prepared,pt/'Mono')
+ if json.loads((out/'state.json').read_text())['status']!='review_pending':raise ValueError('MANO 실행 완료 후 검수하세요.')
+ for stage in ('18','19','preview'):
+  r=json.loads((out/'_resume'/f'{stage}.json').read_text())
+  if r['files']!=snapshot([out/p for p in r['files']],out):raise ValueError('손 복원 결과 변경: '+stage)
+ return json.loads((out/'review/validation.json').read_text())
+
+def main():
+ p=argparse.ArgumentParser(description=__doc__);p.add_argument('input',type=Path);p.add_argument('--hand-side',choices=['right','both']);p.add_argument('--check',action='store_true');p.add_argument('--new-attempt',action='store_true');p.add_argument('--no-view',action='store_true');a=p.parse_args()
+ if a.check and a.new_attempt:p.error('--check와 --new-attempt 동시 사용 불가')
+ try:run(a.input,a.hand_side,a.check,a.new_attempt,not a.no_view)
+ except KeyboardInterrupt:p.exit(130,'중단됨. 같은 명령으로 재개하세요.\n')
+ except Exception as ex:p.exit(1,'중단: '+str(ex)+'\n')
+if __name__=='__main__':main()
