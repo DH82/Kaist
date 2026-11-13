@@ -203,8 +203,9 @@ $('folderRegister').onclick=async()=>{
 
 let rawBoardBusy=false;
 function rawCaptureDate(ep){const m=ep.match(/^ep_(\d{4})(\d{2})(\d{2})_/);return m?m[1]+'-'+m[2]+'-'+m[3]:'—'}
-let rawDateFilter='';
-const rawDateCal=createDateCalendar({toggle:$('rawDateToggle'),panel:$('rawCalendar'),
+// 기본값은 전날 기록(오늘 11/13 → 11/12). 📅에서 다른 날짜나 '전체 보기'로 바꿀 수 있습니다.
+let rawDateFilter=(()=>{const d=new Date();d.setDate(d.getDate()-1);return localDateKey(d)})();
+const rawDateCal=createDateCalendar({toggle:$('rawDateToggle'),panel:$('rawCalendar'),keepEmpty:true,
  counts:()=>{const c={};rawEpisodes.forEach(e=>{const d=rawCaptureDate(e.episode);c[d]=(c[d]||0)+1});return c},
  get:()=>rawDateFilter,set:v=>{if(v!==rawDateFilter){rawDateFilter=v;renderRawTable()}}});
 function renderRawTable(){
@@ -213,7 +214,7 @@ function renderRawTable(){
  rawEpisodes.forEach((e,i)=>{const d=rawCaptureDate(e.episode);if(!filter||filter===d)(groups[d]=groups[d]||[]).push(i)});
  const dates=Object.keys(groups).sort((a,b)=>a==='—'?1:b==='—'?-1:b.localeCompare(a));
  const row=i=>{const e=rawEpisodes[i];return '<tr data-raw-index="'+i+'" class="'+($('episode').value===e.episode?'rawSelected':'')+'"><td>'+(e.can_run?'<input type="radio" name="rawSelection" aria-label="'+escape(e.episode)+' 선택" '+($('episode').value===e.episode?'checked':'')+'>':'<span class="help">조회만</span>')+'</td><td>'+rawCaptureDate(e.episode)+'</td><td>'+escape(e.episode)+'</td><td>'+escape(e.operator||'—')+'</td><td>'+stageLabel(e.progress|| '단계 확인 중')+'</td><td><button class="smallbtn" data-raw-preview="'+i+'">미리보기</button></td></tr>'};
- $('rawRows').innerHTML=dates.map(d=>'<tr class="rawDateGroup"><td colspan="6">📅 '+(d==='—'?'날짜 미상':escape(d))+' · '+groups[d].length+'개</td></tr>'+groups[d].map(row).join('')).join('')||'<tr><td colspan="6">RAW 에피소드가 없습니다.</td></tr>';
+ $('rawRows').innerHTML=dates.map(d=>'<tr class="rawDateGroup"><td colspan="6">📅 '+(d==='—'?'날짜 미상':escape(d))+' · '+groups[d].length+'개</td></tr>'+groups[d].map(row).join('')).join('')||'<tr><td colspan="6">'+(filter&&rawEpisodes.length?escape(filter)+' 촬영 RAW 에피소드가 없습니다. 📅에서 다른 날짜나 전체 보기를 선택하세요.':'RAW 에피소드가 없습니다.')+'</td></tr>';
  $('rawRows').querySelectorAll('[data-raw-index]').forEach(row=>row.onclick=event=>{const e=rawEpisodes[+row.dataset.rawIndex];$('episode').value=e.episode;$('episode').dispatchEvent(new Event('change'));renderRawTable();if(event.target.closest('[data-raw-preview]'))revealSamPreview()});
 }
 async function refreshRawBoard(){
