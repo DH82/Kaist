@@ -1,0 +1,153 @@
+# KAIST 단일 PC 스택: UI + Airflow + PostgreSQL을 GPU PC 안에서 실행합니다.
+# NAS는 NFS 마운트로 RAW를 읽고 결과를 쓰는 저장소로만 사용합니다.
+# GPU Worker(포트 8090)는 호스트의 systemd 서비스로 실행되며 이 Compose에 포함되지 않습니다.
+#
+# 모든 서비스는 host 네트워크를 사용합니다.
+#  - Worker가 127.0.0.1:8090에만 열려 있어 SSH 터널 없이 바로 연결할 수 있습니다.
+#  - 포트는 .env의 UI_PORT / AIRFLOW_PORT / POSTGRES_PORT로 바꿉니다.
+name: kaist-pc
+
+x-airflow-base: &airflow-base
+  build: .
+  image: kaist-airflow:3.3.2
+  restart: unless-stopped
+  network_mode: host
+  # 호스트 계정 UID로 실행해 state/·intake_state/와 Worker secret 파일을 sudo 없이 읽고 씁니다.
+  user: "${HOST_UID:?run setup.sh first}:0"
+
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    network_mode: host
+    command: ["postgres", "-c", "port=${POSTGRES_PORT:-15432}", "-c", "listen_addresses=127.0.0.1"]
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?run setup.sh first}
+      POSTGRES_DB: airflow
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p ${POSTGRES_PORT:-15432} -U airflow"]
+      interval: 10s
+      retries: 10
+
+  airflow:
+    <<: *airflow-base
+    command: standalone
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      AIRFLOW_HOME: /opt/airflow
+      AIRFLOW__CORE__DAGS_FOLDER: /opt/kaist/dags
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__PARALLELISM: "6"
+      AIRFLOW__CORE__DEFAULT_TIMEZONE: Asia/Seoul
+      AIRFLOW__API__HOST: ${AIRFLOW_BIND:-0.0.0.0}
+      AIRFLOW__API__PORT: ${AIRFLOW_PORT:-18082}
+      AIRFLOW__API__BASE_URL: ${KAIST_AIRFLOW_PUBLIC_URL:?run setup.sh first}
+      AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://127.0.0.1:${AIRFLOW_PORT:-18082}/execution/
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:${POSTGRES_PASSWORD}@127.0.0.1:${POSTGRES_PORT:-15432}/airflow
+      # host 네트워크에서 기본 로그 포트(8793/8794) 충돌을 피합니다.
+      AIRFLOW__LOGGING__WORKER_LOG_SERVER_PORT: "18793"
+      AIRFLOW__LOGGING__TRIGGER_LOG_SERVER_PORT: "18794"
+      AIRFLOW__CORE__AUTH_MANAGER: airflow.api_fastapi.auth.managers.simple.simple_auth_manager.SimpleAuthManager
+      AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS: admin:admin
+      AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET:?run setup.sh first}
+      KAIST_WORKERS_FILE: /opt/kaist-config/workers.json
+      KAIST_WORKER_URL: ${WORKER_URL:-http://127.0.0.1:8090}
+      KAIST_WORKER_TOKEN_FILE: /run/secrets/worker_token
+    volumes:
+      - ./state:/opt/airflow
+      - ./code:/opt/kaist:ro
+      - ./config:/opt/kaist-config:ro
+      - ${WORKER_SECRET_FILE:?run setup.sh first}:/run/secrets/worker_token:ro
+
+  ui:
+    <<: *airflow-base
+    entrypoint: /bin/bash
+    command: ["-c", "exec python -m uvicorn platform_app:app --app-dir /opt/kaist/platform --host \"$$UI_BIND\" --port \"$$UI_PORT\""]
+    depends_on:
+      - airflow
+    environment:
+      HOME: /tmp
+      UI_BIND: ${UI_BIND:-0.0.0.0}
+      UI_PORT: ${UI_PORT:-18083}
+      KAIST_UI_ALLOWED_HOSTS: ${KAIST_UI_ALLOWED_HOSTS:?run setup.sh first}
+      KAIST_UI_USER: operator
+      KAIST_UI_PASSWORD_FILE: /run/secrets/ui_password
+      KAIST_AIRFLOW_API_URL: http://127.0.0.1:${AIRFLOW_PORT:-18082}
+      KAIST_AIRFLOW_PUBLIC_URL: ${KAIST_AIRFLOW_PUBLIC_URL}
+      KAIST_AIRFLOW_USERS_FILE: /opt/airflow/simple_auth_manager_passwords.json.generated
+      KAIST_WORKERS_FILE: /opt/kaist-config/workers.json
+      KAIST_WORKER_URL: ${WORKER_URL:-http://127.0.0.1:8090}
+      KAIST_WORKER_TOKEN_FILE: /run/secrets/worker_token
+      KAIST_GPU_TEST_ENABLED: "false"
+      KAIST_NAS_RAW_ROOT: /data/raw
+      KAIST_INTAKE_DB: /var/lib/kaist/catalog.sqlite
+    volumes:
+      - ./code:/opt/kaist:ro
+      - ./config:/opt/kaist-config:ro
+      - ./state:/opt/airflow:ro
+      - ./intake_state:/var/lib/kaist
+      - ./secrets/ui_password:/run/secrets/ui_password:ro
+      - ${WORKER_SECRET_FILE}:/run/secrets/worker_token:ro
+      - ${NAS_RAW_HOST_PATH:?run setup.sh first}:/data/raw:ro
+
+
+  # ---- GPU 파이프라인 컨테이너 (SAM3 → 추적 → 3D 복원 → HaMBA·MANO → NAS 저장) ----
+  # gpu/setup_gpu.sh가 빌드·실행합니다. 프로필 gpu로만 켜집니다: docker compose --profile gpu up -d gpu-worker
+  # 이미지 안 경로(/home/cw-wfm/...)는 검증된 환경의 절대경로를 그대로 쓴 것으로, PC 사용자 이름과 무관합니다.
+  gpu-worker:
+    profiles: [gpu]
+    build:
+      context: ./gpu
+      additional_contexts:
+        dep: ${KAIST_DEP_ROOT:-/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace}
+        rev: ${KAIST_REV_ROOT:-/home/cw-wfm/Desktop/worker1/Kaist pipeline revising/02_current}
+        worker: ./worker/app
+      args:
+        HOST_UID: ${HOST_UID:?run setup.sh first}
+    image: kaist-gpu:latest
+    restart: unless-stopped
+    network_mode: host
+    ipc: host
+    # NAS(Synology NFS)는 PC별 그룹(kaist-pc1=65536 등)으로 RAW·결과 폴더 권한을 줍니다.
+    group_add: ["${NAS_GID:-65536}"]
+    init: false
+    environment:
+      PC_ID: ${PC_ID:-pc1}
+      GPU_UUID: ${GPU_UUID:-}
+      NAS_MOUNT: ${NAS_MOUNT:-/mnt/kaist-data}
+      RAW_ROOT: ${NAS_RAW_HOST_PATH:-/mnt/kaist-data/rgbd_raw}
+      RESULTS_SUBDIR: results/${PC_ID:-pc1}
+      PROJECT_DIR: ${GPU_PROJECT_DIR:-/home/cw-wfm/kaist_work/pc1}
+      WORKER_PORT: ${GPU_WORKER_PORT:-8090}
+    volumes:
+      - ${GPU_STATE_DIR:-./gpu_state}/worker:/home/cw-wfm/Desktop/worker1/airflow/worker
+      - ${GPU_LOCK_FILE:-./gpu_state/worker/gpu_4090_a.lock}:/home/cw-wfm/Desktop/worker1/airflow/worker/gpu_4090_a.lock
+      - ${GPU_PROJECT_DIR:-/home/cw-wfm/kaist_work/pc1}:${GPU_PROJECT_DIR:-/home/cw-wfm/kaist_work/pc1}
+      - type: bind
+        source: ${NAS_MOUNT:-/mnt/kaist-data}
+        target: ${NAS_MOUNT:-/mnt/kaist-data}
+        bind: {propagation: rslave}
+      - gpu-cache:/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace/runtime-cache
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, compute, utility, graphics, video]
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request,urllib.error,os\ntry: urllib.request.urlopen('http://127.0.0.1:'+os.environ['WORKER_PORT']+'/worker/info',timeout=5)\nexcept urllib.error.HTTPError as e: exit(0 if e.code==401 else 1)\""]
+      interval: 30s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  pgdata:
+  # 모델 실행 캐시(warp·torch hub 등). 처음 실행할 때 이미지 내용으로 채워집니다.
+  gpu-cache:

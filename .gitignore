@@ -1,0 +1,24 @@
+# Local credentials and machine-specific configuration
+.env
+.env.*
+!.env.example
+secrets/
+config/workers.json
+.aws/
+.agents/
+.codex/
+
+# Runtime data and generated worker files
+state/
+intake_state/
+gpu_state/
+
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local distribution archives
+kaist-pc-stack-*.tar.gz
