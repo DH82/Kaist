@@ -54,12 +54,12 @@ let launchError='',launchErrorFor='';
 function updateLaunch(){
  const mode='pipeline';
  const selected=rawEpisodes.find(e=>e.episode===$('episode').value);
- $('episodeOwner').textContent=!selected?'RAW 표에서 에피소드를 선택하세요.':selected?.operator?(selected.can_run?'내가 선택한 데이터입니다.':selected.operator+' 작업자가 선택한 데이터입니다. 이미지 확인만 가능하며 중복 실행할 수 없습니다.'):'아직 다른 작업자가 선택하지 않은 데이터입니다.';
+ $('episodeOwner').textContent=!selected?'RAW 표에서 에피소드를 선택하세요.':selected?.operator?(selected.can_run?'내가 선택한 데이터입니다.':selected.operator+' 작업자가 진행 중인 데이터입니다. 이미지 확인만 가능하며 중복 실행할 수 없습니다.'):selected?.assigned_to?(selected.can_run?'나에게 배정된 데이터입니다.':selected.assigned_to+' 작업자에게 배정된 데이터입니다. 이미지 확인만 가능합니다.'):(selected?.can_run?'아직 배정되지 않은 데이터입니다.':'아직 배정되지 않은 데이터입니다. 나에게 배정된 데이터만 실행할 수 있습니다.');
  const ready=mode!=='pipeline'||(previewEpisode===$('episode').value&&previewLoaded.size===2&&$('confirmed').checked&&$('prompt').value.trim()&&objectModeReady());
  $('launch').disabled=busy||!connected||!ready||(mode!=='test'&&(!$('episode').value||selected?.can_run===false));
  // 버튼이 왜 눌리지 않는지, 마지막 실행 요청이 왜 거절됐는지 버튼 바로 아래에 보여 줍니다.
  const ep=$('episode').value;if(launchErrorFor!==ep){launchError='';launchErrorFor=ep}
- const reason=busy?'실행 요청 중…':!connected?'서버 연결을 확인하는 중입니다. 잠시 후 다시 시도하세요.':!ep?'RAW 표에서 에피소드를 선택하세요.':selected?.can_run===false?'다른 작업자가 선택한 데이터라 실행할 수 없습니다.'
+ const reason=busy?'실행 요청 중…':!connected?'서버 연결을 확인하는 중입니다. 잠시 후 다시 시도하세요.':!ep?'RAW 표에서 에피소드를 선택하세요.':selected?.can_run===false?'나에게 배정된 데이터가 아니라 실행할 수 없습니다.'
   :previewEpisode!==ep||previewLoaded.size!==2?'사진 2장을 불러온 뒤 실행할 수 있습니다.':!$('prompt').value.trim()?'SAM3 분할 대상을 입력하세요.':!objectModeReady()?objectModeHint():!$('confirmed').checked?'"사진과 분할 대상을 확인했습니다"를 체크하세요.':'';
  const hint=$('launchHint');hint.textContent=launchError?'실행 거절: '+launchError:reason;hint.classList.toggle('error',!!launchError);
 }
@@ -208,18 +208,35 @@ let rawDateFilter=(()=>{const d=new Date();d.setDate(d.getDate()-1);return local
 const rawDateCal=createDateCalendar({toggle:$('rawDateToggle'),panel:$('rawCalendar'),keepEmpty:true,
  counts:()=>{const c={};rawEpisodes.forEach(e=>{const d=rawCaptureDate(e.episode);c[d]=(c[d]||0)+1});return c},
  get:()=>rawDateFilter,set:v=>{if(v!==rawDateFilter){rawDateFilter=v;renderRawTable()}}});
+let rawTeam=null;
+function rawWho(e){
+ const me=rawTeam&&rawTeam.me,name=e.operator||e.assigned_to;if(!name)return '<span class="help">미배정</span>';
+ const label=escape(name)+(e.operator?'':' <span class="help">(배정·시작 전)</span>');
+ return name===me?'<span class="rawMe">'+label+'</span>':label;
+}
+function renderRawTeam(){
+ const t=rawTeam,el=$('rawTeam');if(!t){el.textContent='';return}
+ const ops=t.operators.map(n=>escape(n)+' '+(t.load[n]||0)+'/'+t.target+(n===t.me?' (나)':'')).join(' · ');
+ el.innerHTML='로그인 사용자 '+t.total_users+'명 · 작업자 '+t.operators.length+'명(관리자 '+t.admins+'명 제외) · 작업자마다 '+t.target+'개씩 자동 배정, 3D 복원이 끝나면 남은 RAW에서 다시 채웁니다.'+(ops?'<br>'+ops:'');
+}
 function renderRawTable(){
  rawDateCal.refresh();
- const filter=rawDateFilter,groups={};
- rawEpisodes.forEach((e,i)=>{const d=rawCaptureDate(e.episode);if(!filter||filter===d)(groups[d]=groups[d]||[]).push(i)});
+ const filter=rawDateFilter,groups={},me=rawTeam&&rawTeam.me;
+ // 내 작업(시작 전 배정 + 3D 복원이 끝나지 않은 내 담당)은 날짜 필터와 상관없이 맨 위에 고정합니다.
+ const isMine=e=>rawTeam&&rawTeam.role!=='admin'&&(e.assigned_to===me||(e.operator===me&&!e.done));
+ const mine=[];rawEpisodes.forEach((e,i)=>{if(isMine(e))mine.push(i)});
+ rawEpisodes.forEach((e,i)=>{const d=rawCaptureDate(e.episode);if(!isMine(e)&&(!filter||filter===d))(groups[d]=groups[d]||[]).push(i)});
+ renderRawTeam();
  const dates=Object.keys(groups).sort((a,b)=>a==='—'?1:b==='—'?-1:b.localeCompare(a));
- const row=i=>{const e=rawEpisodes[i];return '<tr data-raw-index="'+i+'" class="'+($('episode').value===e.episode?'rawSelected':'')+'"><td>'+(e.can_run?'<input type="radio" name="rawSelection" aria-label="'+escape(e.episode)+' 선택" '+($('episode').value===e.episode?'checked':'')+'>':'<span class="help">조회만</span>')+'</td><td>'+rawCaptureDate(e.episode)+'</td><td>'+escape(e.episode)+'</td><td>'+escape(e.operator||'—')+'</td><td>'+stageLabel(e.progress|| '단계 확인 중')+'</td><td><button class="smallbtn" data-raw-preview="'+i+'">미리보기</button></td></tr>'};
- $('rawRows').innerHTML=dates.map(d=>'<tr class="rawDateGroup"><td colspan="6">📅 '+(d==='—'?'날짜 미상':escape(d))+' · '+groups[d].length+'개</td></tr>'+groups[d].map(row).join('')).join('')||'<tr><td colspan="6">'+(filter&&rawEpisodes.length?escape(filter)+' 촬영 RAW 에피소드가 없습니다. 📅에서 다른 날짜나 전체 보기를 선택하세요.':'RAW 에피소드가 없습니다.')+'</td></tr>';
+ const row=i=>{const e=rawEpisodes[i];return '<tr data-raw-index="'+i+'" class="'+($('episode').value===e.episode?'rawSelected':'')+'"><td>'+(e.can_run?'<input type="radio" name="rawSelection" aria-label="'+escape(e.episode)+' 선택" '+($('episode').value===e.episode?'checked':'')+'>':'<span class="help">조회만</span>')+'</td><td>'+rawCaptureDate(e.episode)+'</td><td>'+escape(e.episode)+'</td><td>'+rawWho(e)+'</td><td>'+stageLabel(e.progress|| '단계 확인 중')+'</td><td><button class="smallbtn" data-raw-preview="'+i+'">미리보기</button></td></tr>'};
+ const mineHtml=mine.length?'<tr class="rawDateGroup rawMineGroup"><td colspan="6">👤 내 작업 · '+mine.length+' / '+rawTeam.target+'개 (날짜 필터와 무관)</td></tr>'+mine.map(i=>row(i).replace('<tr ','<tr data-mine="1" ')).join(''):'';
+ $('rawRows').innerHTML=mineHtml+(dates.map(d=>'<tr class="rawDateGroup"><td colspan="6">📅 '+(d==='—'?'날짜 미상':escape(d))+' · '+groups[d].length+'개</td></tr>'+groups[d].map(row).join('')).join('')||('<tr><td colspan="6">'+(filter&&rawEpisodes.length?escape(filter)+' 촬영 RAW 에피소드가 없습니다. 📅에서 다른 날짜나 전체 보기를 선택하세요.':'RAW 에피소드가 없습니다.')+'</td></tr>'));
+ $('rawRows').querySelectorAll('tr[data-mine]').forEach(r=>r.classList.add('rawMine'));
  $('rawRows').querySelectorAll('[data-raw-index]').forEach(row=>row.onclick=event=>{const e=rawEpisodes[+row.dataset.rawIndex];$('episode').value=e.episode;$('episode').dispatchEvent(new Event('change'));renderRawTable();if(event.target.closest('[data-raw-preview]'))revealSamPreview()});
 }
 async function refreshRawBoard(){
  if(rawBoardBusy||!currentUser)return;rawBoardBusy=true;
- const wid=selectedWorker();try{const d=await api('/api/raw-episodes?worker_id='+encodeURIComponent(selectedWorker()));if(wid!==selectedWorker())return;rawEpisodes=d.episodes;const selected=$('episode').value;$('episode').innerHTML=rawEpisodes.map(e=>'<option value="'+escape(e.episode)+'">'+escape(e.episode)+'</option>').join('');$('episode').value=rawEpisodes.some(e=>e.episode===selected)?selected:'';renderRawTable();updateLaunch()}
+ const wid=selectedWorker();try{const d=await api('/api/raw-episodes?worker_id='+encodeURIComponent(selectedWorker()));if(wid!==selectedWorker())return;rawEpisodes=d.episodes;rawTeam=d.team||null;const selected=$('episode').value;$('episode').innerHTML=rawEpisodes.map(e=>'<option value="'+escape(e.episode)+'">'+escape(e.episode)+'</option>').join('');$('episode').value=rawEpisodes.some(e=>e.episode===selected)?selected:'';renderRawTable();updateLaunch()}
  catch(e){notice(e.message,true)}finally{rawBoardBusy=false}
 }
 $('refreshRaw').onclick=refreshRawBoard;

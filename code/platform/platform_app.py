@@ -319,6 +319,7 @@ def launch(data:Launch,req:Request):
  guard(req)
  if data.mode=='test':access.admin(req)
  elif access.owners().get(data.episode_id) not in (None,access.user(req)['name']):raise HTTPException(403,'다른 작업자가 선택한 에피소드입니다.')
+ elif not access.selectable(req,data.episode_id):raise HTTPException(403,'본인에게 배정된 RAW만 시작할 수 있습니다. RAW 목록의 내 배정을 확인하세요.')
  if data.mode not in DIRECT_DAGS:raise HTTPException(400,'실행 모드를 선택하세요.')
  try:pc=worker(data.worker_id)
  except ValueError as e:raise HTTPException(400,str(e))
@@ -919,13 +920,17 @@ def raw_episodes(req:Request):
    if ep in episodes and (ep not in latest or stamp>latest[ep][0]):latest[ep]=(stamp,dag,r,mode)
  batch_states=batch_history() if any(v[3]=='day' and v[2]['state']=='success' for v in latest.values()) else {}
  labels={'prepare_raw':'RAW 전처리','sam_settings_ready':'분할 설정 확인','sam3':'SAM3','mask_approved':'마스크 검수','preflight':'추적 사전 검사','track':'추적','tracking_approved':'추적 검수','prepare_reconstruction':'복원 준비','reconstruct':'3D 복원','hands':'MANO 피팅','validate':'결과 검사','publish':'최종 저장'}
+ # 3D 복원까지 끝난 RAW(낮 실행 성공 → MANO 대기/완료, 또는 전체 파이프라인 성공)는 배정 부하에서 빠집니다.
+ done={ep for ep,(_,_,r,mode) in latest.items() if r['state']=='success' and mode!='raw'}
+ assigned,team=access.rebalance(selected_worker(req),episodes,done,set(latest))
  out=[]
  for ep in episodes:
-  row=raw_row(ep,owners.get(ep),user)
-  if not row['can_run'] and user['role']!='admin':
-   out.append(dict(row,progress='다른 작업자 담당'))
-   continue
-  progress='실행 전' if not owners.get(ep) else '실행 기록 확인 필요'
+  owner=owners.get(ep);row=raw_row(ep,owner,user)
+  # 다른 작업자의 담당·진행 단계도 모두 보여 줍니다(실행·수정은 본인 것만).
+  row.update(operator=owner,assigned_to=None if owner else assigned.get(ep),done=ep in done)
+  if user['role']!='admin':row['can_run']=owner==user['name'] or (not owner and assigned.get(ep)==user['name'])
+  progress='실행 전' if not owner else '실행 기록 확인 필요'
+  if not owner and ep not in latest:progress=('배정됨 · 실행 전' if assigned.get(ep) else '미배정 · 대기')
   if ep in latest:
    _,dag,r,mode=latest[ep]
    if mode=='day' and r['state']=='success':progress=mano_progress(r,batch_states)[0]
@@ -938,7 +943,8 @@ def raw_episodes(req:Request):
      progress=label+(' · 실패' if state=='failed' else ' · 재시도 대기' if state=='up_for_retry' else ' · 승인 대기' if active['task_id'] in ('mask_approved','tracking_approved') else ' · 진행 중')
     else:progress='실패' if r['state']=='failed' else '실행 대기'
   out.append(dict(row,progress=progress))
- return {'episodes':out}
+ return {'episodes':out,'team':{'total_users':team['total'],'operators':team['operators'],'admins':team['admins'],'target':team['target'],
+         'load':team['load'],'me':user['name'],'role':user['role']}}
 
 class RetryJob(BaseModel):
  dag_id:str

@@ -66,7 +66,7 @@ async function openReview(episode,stage='mask'){
  if(page!=='review')hcReturnPage=page;
  else if(!$('hcQueuePanel').classList.contains('hidden'))hcReturnPage='review';
  $('hcBack').textContent=hcReturnPage==='review'?'← 검수 목록':hcReturnPage==='jobs'?(currentUser.role==='admin'?'← 전체 작업 현황':'← 내 작업 현황'):'← 이전 화면';
- const generation=++hcLoadGeneration;hcStop();hcFrameLoading=false;hcMeta=null;hcStage=stage;hcEpoch++;$('hcQueuePanel').classList.add('hidden');$('hcWorkspace').classList.remove('hidden');show('review');rememberPage('review/'+encodeURIComponent(episode)+'/'+stage);$('hcMedia').classList.add('hidden');$('hcDecision').classList.add('hidden');$('hcResult').textContent='';hcFollowStop();$('hcNote').value='';
+ const generation=++hcLoadGeneration;hcStop();hcFrameLoading=false;hcMeta=null;hcStage=stage;hcEpoch++;$('hcQueuePanel').classList.add('hidden');$('hcWorkspace').classList.remove('hidden');show('review');rememberPage('review/'+encodeURIComponent(episode)+'/'+stage);$('hcMedia').classList.add('hidden');$('hcDecision').classList.add('hidden');$('hcResult').textContent='';$('hcSpotNav')?.remove();hcFollowStop();$('hcNote').value='';
  $('hcState').textContent='검수 대상 확인 중';$('hcState').className='badge';$('hcEpisode').textContent=episode;$('hcTitle').textContent=stage==='mask'?'마스크 HC 검수':'추적 HC 검수';hcStatus('검수 대상과 최신 승인 상태를 확인하는 중…');
  try{
   const path=HC_BASE+'/episodes/'+encodeURIComponent(episode)+(stage==='tracking'?'/tracking':'');
@@ -103,6 +103,7 @@ async function openReview(episode,stage='mask'){
 }
 async function hcShowFrame(value,skipEditCheck=false,keepEditsUntilLoaded=false){
  if(!hcMeta||hcFrameLoading)return;
+ if(hcBatch.running){$('hcSlider').value=hcFrame;$('hcMaskMode').value=hcShownMode;hcStatus('마법봉 일괄 적용 중에는 프레임을 옮길 수 없습니다. 끝나거나 일괄 중지를 누른 뒤 이동하세요.',true);return}
  if(!skipEditCheck&&hcEditDirty()){hcStop();if(!await hcEditResolve()){$('hcSlider').value=hcFrame;$('hcMaskMode').value=hcShownMode;return}if(!hcMeta||hcFrameLoading)return}
  if(!keepEditsUntilLoaded)hcEditReset();hcShownMode=$('hcMaskMode').value;hcFrameLoading=true;hcFrame=Math.max(0,Math.min(hcMeta.frames-1,Number(value)));$('hcSlider').value=hcFrame;$('hcFrameLabel').textContent=(hcFrame+1)+' / '+hcMeta.frames+'프레임';['hcPrevFrame','hcNextFrame','hcFirst','hcMiddle','hcLast','hcSlider','hcMaskMode'].forEach(id=>$(id).disabled=true);
  const epoch=++hcEpoch,frame=hcFrame,mode=$('hcMaskMode').value;
@@ -132,20 +133,26 @@ $('hcConfirmAccept').onclick=()=>$('hcConfirmDialog').close('confirm');
 $('hcConfirmDialog').addEventListener('cancel',e=>{e.preventDefault();$('hcConfirmDialog').close('cancel')});
 async function hcDecide(decision){
  if(!hcMeta||hcBusy||hcConfirmPending||hcApproved())return;
+ if(hcBatch.running){hcStatus('마법봉 일괄 적용이 끝난 뒤 검수 결정을 기록하세요.',true);return}
  if(decision==='approve'&&$('hcApprove').disabled)return;
  if(decision==='hold'&&!$('hcNote').value.trim()){hcStatus('카메라 번호, 프레임 번호와 문제 내용을 적어주세요.',true);return}
  const generation=hcLoadGeneration;hcStop();hcConfirmPending=true;
  let confirmed=false;try{confirmed=await hcConfirmDecision(decision)}finally{hcConfirmPending=false}
  if(!confirmed||generation!==hcLoadGeneration||!hcMeta||hcApproved())return;
  if(decision==='approve'&&$('hcApprove').disabled)return;
- hcStop();hcBusy=true;hcEnable();$('hcResult').textContent='검수 기준과 변경 여부를 확인하고 기록하는 중…';
+ hcStop();hcBusy=true;hcEnable();$('hcSpotNav')?.remove();$('hcResult').textContent='검수 기준과 변경 여부를 확인하고 기록하는 중…';
  const data={decision,basis:hcMeta.basis,note:$('hcNote').value};
  if(hcStage==='mask')data.checked=[0,1,2,3].map(cam=>$('hcCam'+cam).checked);
  else{data.checked_views=Array(8).fill($('hcTrackingReviewed').checked);data.checked=[...document.querySelectorAll('.hcEventCheck')].map(c=>c.checked)}
  try{
   const result=await hcRequest(hcPath+'/decision',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':hcToken},body:JSON.stringify(data)});
-  $('hcResult').textContent=result.message;hcMeta.approval.status=result.status;if(result.status==='approved')hcFollowStart();hcStatus(result.status==='approved'?'승인 완료. 중앙 Airflow가 결과를 확인한 뒤 다음 단계를 진행합니다.':'보류되었습니다. 후속 단계는 대기합니다.');loadJobs();
- }catch(e){$('hcResult').textContent=e.message}
+  $('hcResult').textContent=result.message;$('hcSpotNav')?.remove();hcMeta.approval.status=result.status;if(result.status==='approved')hcFollowStart();hcStatus(result.status==='approved'?'승인 완료. 중앙 Airflow가 결과를 확인한 뒤 다음 단계를 진행합니다.':'보류되었습니다. 후속 단계는 대기합니다.');loadJobs();
+ }catch(e){
+  // 누락·빈 마스크로 승인이 거부되면 서버가 붙인 위치 목록([빈마스크:카메라,대상,프레임;...])으로 이동 버튼을 보여 주고 첫 위치로 이동합니다.
+  const spots=hcParseMaskSpots(e.message);
+  $('hcResult').textContent=e.message.replace(/\s*\[빈마스크:[^\]]*\]/,'');
+  if(spots.length&&hcStage==='mask')hcGoMaskSpot(spots,0);
+ }
  finally{hcBusy=false;hcEnable()}
 }
 function returnToReviewQueue(){hcLoadGeneration++;hcEpoch++;hcStop();hcMeta=null;$('hcWorkspace').classList.add('hidden');$('hcQueuePanel').classList.remove('hidden');show('review')}

@@ -65,6 +65,25 @@ def missing_masks(review, project, ep):
             if not (draft/f'mask/{c}/{o}/{f}.png').exists()]
 
 
+def mask_exceptions(review, project, ep):
+    """승인 함수(mask_review.approve)와 같은 기준으로 누락(파일 없음)·빈(값이 모두 0) 마스크 위치를 찾습니다."""
+    d = review.root(project, ep)
+    draft = d/'review/draft'
+    meta = json.loads((review.source(d)/'metadata.json').read_text())
+    found = []
+    for c in range(4):
+        for o in range(2):
+            for f in range(meta['frame_num']):
+                path = draft/f'mask/{c}/{o}/{f}.png'
+                if not path.exists():
+                    found.append((c, o, f, 'missing'))
+                    continue
+                with Image.open(path) as im:
+                    if not im.convert('L').getbbox():
+                        found.append((c, o, f, 'empty'))
+    return found
+
+
 def fill_missing_masks(review, project, ep):
     """손에 완전히 가려지는 등 SAM3가 대상을 찾지 못한 프레임은 마스크 파일이 아예 없습니다.
     추적·QC·복원은 모든 프레임에 마스크 파일이 있다고 보므로, 승인 직전에 초안의 빈 자리를 빈 마스크(전부 0)로 채웁니다.
@@ -105,8 +124,14 @@ def decide(review, project, ep, data):
             if not isinstance(checked, list) or len(checked) != 4 or any(v is not True for v in checked):
                 raise ValueError('4개 카메라 검수 완료를 모두 확인하세요.')
             # 채운 뒤 승인이 사유 없음으로 실패하면 초안만 바뀌어 다음 승인 시 기준값이 어긋나므로, 채우기 전에 먼저 확인합니다.
-            if not note.strip() and missing_masks(review, project, ep):
-                raise ValueError('마스크가 없는 프레임(SAM3 미검출)이 있습니다. 승인 사유를 검수 의견에 기록하세요. 예: 손에 가려 물체가 보이지 않음')
+            # 화면이 바로 해당 프레임으로 이동할 수 있도록 위치 목록을 메시지 끝에 [빈마스크:카메라,대상,프레임;...]로 붙입니다(0부터).
+            if not note.strip():
+                found = mask_exceptions(review, project, ep)
+                if found:
+                    first = found[0]
+                    raise ValueError(f'누락·빈 마스크 {len(found)}건이 있습니다. 해당 프레임을 확인한 뒤 승인 사유를 검수 의견에 기록하세요. '
+                                     f'첫 위치: 카메라 {first[0]+1} · {"물체" if first[1] == 0 else "손"} · 프레임 {first[2]+1}. 예: 손에 가려 물체가 보이지 않음 '
+                                     '[빈마스크:' + ';'.join(f'{c},{o},{f}' for c, o, f, _ in found[:200]) + ']')
             filled = fill_missing_masks(review, project, ep)
             dest = review.approve(project, ep, name, checked, note)
             extra = f' 마스크가 없던 {len(filled)}개 프레임은 빈 마스크로 채웠습니다.' if filled else ''
