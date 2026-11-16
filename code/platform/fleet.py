@@ -28,6 +28,7 @@ CREATE TABLE raw_started (raw_episode TEXT PRIMARY KEY);
 CREATE TABLE published (sam_target TEXT, episode TEXT, run_key TEXT, at REAL);
 CREATE TABLE commands (id TEXT PRIMARY KEY, type TEXT, episode TEXT, run_id TEXT, source_pc TEXT, target_pc TEXT, state TEXT,
                        step TEXT, message TEXT, requested_by TEXT, created REAL, updated REAL);
+CREATE TABLE assignments (episode TEXT PRIMARY KEY, operator TEXT);
 """
 
 
@@ -53,7 +54,7 @@ def publish_status(snapshot):
         c.executescript(SCHEMA)
         meta = dict(snapshot.get('meta', {}), pc=PC_ID, updated_at=time.time())
         c.executemany('INSERT INTO meta VALUES(?,?)', [(k, json.dumps(v, ensure_ascii=False)) for k, v in meta.items()])
-        for table in ('gpu', 'runs', 'mano_waiting', 'published', 'commands'):
+        for table in ('gpu', 'runs', 'mano_waiting', 'published', 'commands', 'assignments'):
             rows = snapshot.get(table) or []
             if rows:
                 cols = list(rows[0])
@@ -72,8 +73,10 @@ def read_pc(pc):
         c = sqlite3.connect(f'file:{path}?mode=ro&immutable=1', uri=True)
         c.row_factory = sqlite3.Row
         out = {'pc': pc, 'meta': {r['key']: json.loads(r['value']) for r in c.execute('SELECT * FROM meta')}}
-        for table in ('gpu', 'runs', 'mano_waiting', 'published', 'commands'):
-            out[table] = [dict(r) for r in c.execute(f'SELECT * FROM {table}')]
+        tables = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        # 이전 버전 PC의 상태 파일에는 없는 표가 있을 수 있습니다(예: assignments) → 빈 목록.
+        for table in ('gpu', 'runs', 'mano_waiting', 'published', 'commands', 'assignments'):
+            out[table] = [dict(r) for r in c.execute(f'SELECT * FROM {table}')] if table in tables else []
         out['raw_started'] = [r[0] for r in c.execute('SELECT raw_episode FROM raw_started')]
         c.close()
     except (sqlite3.Error, ValueError) as e:
@@ -259,4 +262,34 @@ def raw_taken_elsewhere():
     out = {ep: pc for ep, pc in raw_claims().items() if pc != PC_ID}
     for ep, pc in started_elsewhere().items():
         out.setdefault(ep, pc)
+    return out
+
+
+def overlaps(pcs):
+    """PC 간 겹치는 RAW: 두 PC 이상이 시작 전 배정(assigned)했거나 실행(started)한 RAW.
+    정리 기준(keep): 실행한 PC → NAS 선점 PC → 번호가 낮은 PC. 두 PC 이상이 실행했으면 manual(자동 정리 안 함)."""
+    holders = {}
+    for st in pcs:
+        if not st or not st.get('meta'):
+            continue
+        started = set(st.get('raw_started') or [])
+        for ep in started:
+            holders.setdefault(ep, {})[st['pc']] = 'started'
+        for a in st.get('assignments') or []:
+            holders.setdefault(a['episode'], {}).setdefault(st['pc'], 'assigned')
+    claims = raw_claims()
+    out = []
+    for ep, by in sorted(holders.items()):
+        if len(by) < 2:
+            continue
+        ran = sorted(pc for pc, k in by.items() if k == 'started')
+        if len(ran) > 1:
+            keep = None                      # 두 PC 이상이 실행 → 결과가 있으므로 수동 확인
+        elif ran:
+            keep = ran[0]                    # 실행한 PC
+        else:
+            keep = claims.get(ep) if claims.get(ep) in by else sorted(by)[0]  # NAS 선점 PC → 번호 낮은 PC
+        out.append({'episode': ep, 'holders': [{'pc': pc, 'kind': by[pc]} for pc in sorted(by)], 'claim': claims.get(ep),
+                    'keep': keep, 'manual': len(ran) > 1,
+                    'release': [pc for pc in sorted(by) if keep and pc != keep and by[pc] == 'assigned']})
     return out

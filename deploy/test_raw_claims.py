@@ -73,5 +73,53 @@ class RawClaimTests(unittest.TestCase):
         self.assertEqual(fleet.raw_owner(EPS[2]), 'pc1')
 
 
+class OverlapTests(RawClaimTests):
+    def status(self, pc, started=(), assigned=()):
+        with self.as_pc(pc):
+            fleet.publish_status({'gpu': [{'idx': 0, 'name': 'g', 'uuid': 'u', 'used_mb': 0, 'total_mb': 24000, 'util': 0, 'processes': 0}],
+                                  'raw_started': list(started), 'assignments': [{'episode': e, 'operator': pc.upper()} for e in assigned]})
+
+    def test_overlap_rules(self):
+        self.status('pc1', started=[EPS[0]], assigned=[EPS[1]])
+        self.status('pc2', assigned=[EPS[0], EPS[1], EPS[2]])
+        self.status('pc3', started=[EPS[3]])
+        self.status('pc4', started=[EPS[3]])
+        with self.as_pc('pc2'):
+            fleet.raw_claim(EPS[1])  # PC2가 선점
+        o = {x['episode']: x for x in fleet.overlaps(fleet.read_all())}
+        self.assertEqual((o[EPS[0]]['keep'], o[EPS[0]]['release']), ('pc1', ['pc2']))   # 실행한 PC
+        self.assertEqual((o[EPS[1]]['keep'], o[EPS[1]]['release']), ('pc2', ['pc1']))   # NAS 선점 PC
+        self.assertTrue(o[EPS[3]]['manual']); self.assertEqual(o[EPS[3]]['release'], [])  # 둘 다 실행
+        self.assertNotIn(EPS[2], o)
+
+    def test_resolve_keeps_claim_holder_and_sends_reset_to_others(self):
+        self.status('pc1', assigned=[EPS[1]])
+        self.status('pc2', assigned=[EPS[1]])
+        with self.as_pc('pc2'):
+            fleet.raw_claim(EPS[1])
+        c = TestClient(ui.app); c.cookies.set('kaist_session', access.login('PC1', 'admin'))
+        h = {'Origin': 'http://testserver', 'X-Platform-CSRF': ui.CSRF}
+        r = c.post('/api/fleet/dispatch', headers=h, json={'type': 'resolve_overlaps'}).json()
+        self.assertEqual(r['sent'], ['pc1:' + EPS[1]])          # 선점한 PC2를 남기고 PC1 배정을 풂
+        self.assertEqual(fleet.raw_owner(EPS[1]), 'pc2')
+        with self.as_pc('pc1'):
+            cmds = fleet.claim()
+        self.assertEqual([(x['type'], x['episode']) for x in cmds], [('raw_reset', EPS[1])])
+
+    def test_queue_reset_handler(self):
+        with access.db() as c:
+            c.execute('INSERT INTO raw_assignments VALUES(?,?,?,?)', (EPS[0], 'PC1', 'gpu_4090_a', 0))
+            c.execute('INSERT INTO raw_assignments VALUES(?,?,?,?)', (EPS[1], 'PC1', 'gpu_4090_a', 0))
+            c.execute('INSERT INTO raw_exclusions VALUES(?,?,?,?)', ('gpu_4090_a', EPS[2], 'PC1', 0))
+            c.execute('INSERT INTO episode_owners VALUES(?,?)', (EPS[3], 'PC1'))
+        for e in (EPS[0], EPS[1], EPS[3]):
+            fleet.raw_claim(e)
+        with ui.fleet_db() as c:
+            c.execute("INSERT INTO fleet_tasks VALUES('t1','raw_reset','{}','received','','',0,0)")
+        ui.fleet_raw_reset({'id': 't1'}, {'requested_by': 'test'})
+        self.assertEqual(access.assignments(), {}); self.assertEqual(access.excluded_raw('PC1'), set())
+        self.assertIsNone(fleet.raw_owner(EPS[0])); self.assertEqual(fleet.raw_owner(EPS[3]), 'pc1')  # 담당 RAW 선점 유지
+
+
 if __name__ == '__main__':
     unittest.main()

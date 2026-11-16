@@ -984,9 +984,17 @@ def raw_episodes(req:Request):
  done={ep for ep,(_,_,r,mode) in latest.items() if r['state']=='success' and mode!='raw'}
  # 다른 PC(NAS 관제 기록)에서 이미 시작한 RAW는 이 PC에서 배정·표시하지 않습니다(이 PC에 담당·실행 기록이 있으면 유지).
  # 다른 PC가 선점(NAS control/claims)했거나 이미 시작한 RAW도 같습니다(배정만 하고 시작 전인 것 포함).
- try:elsewhere=fleet.raw_taken_elsewhere() if fleet.available() else {}
- except Exception:elsewhere={}
- episodes=[ep for ep in episodes if raw_in_queue(ep,owners,latest) and (ep not in elsewhere or owners.get(ep) or ep in latest)]
+ # 그런 RAW는 날짜별 칸에 '다른 PC 담당'으로 조회만 할 수 있게 따로 붙입니다(배정·실행·제외 불가).
+ started_other={};elsewhere={}
+ try:
+  if fleet.available():
+   started_other=fleet.started_elsewhere()
+   elsewhere={ep:pc for ep,pc in fleet.raw_claims().items() if pc!=fleet.PC_ID}
+   for ep,pc in started_other.items():elsewhere.setdefault(ep,pc)
+ except Exception:started_other,elsewhere={},{}
+ queued=[ep for ep in episodes if raw_in_queue(ep,owners,latest)]
+ episodes=[ep for ep in queued if ep not in elsewhere or owners.get(ep) or ep in latest]
+ others=[ep for ep in queued if ep not in set(episodes)]
  assigned,team=access.rebalance(selected_worker(req),episodes,done,set(latest),claim=fleet.raw_claim,release=fleet.raw_release)
  excluded=access.excluded_raw(user['name'],selected_worker(req))
  out=[]
@@ -1011,6 +1019,10 @@ def raw_episodes(req:Request):
      progress=label+(' · 실패' if state=='failed' else ' · 재시도 대기' if state=='up_for_retry' else ' · 승인 대기' if active['task_id'] in ('mask_approved','tracking_approved') else ' · 진행 중')
     else:progress='실패' if r['state']=='failed' else '실행 대기'
   out.append(dict(row,progress=progress))
+ for ep in others:
+  pc=elsewhere[ep];ran=started_other.get(ep)==pc
+  out.append({'episode':ep,'operator':None,'assigned_to':None,'can_run':False,'done':False,'excluded_from_mine':False,'can_exclude':False,
+              'elsewhere':pc.upper(),'elsewhere_started':ran,'progress':pc.upper()+(' 실행 시작' if ran else ' 배정 · 시작 전')})
  return {'episodes':out,'team':{'total_users':team['total'],'operators':team['operators'],'admins':team['admins'],'target':team['target'],
          'load':team['load'],'me':user['name'],'role':user['role']}}
 
@@ -1467,7 +1479,26 @@ def fleet_mano_release(task,p):
  with fleet_db() as c:n=c.execute('DELETE FROM mano_transfers WHERE run_id=?',(p['run_id'],)).rowcount
  task_update(task['id'],state='done',message='이관 표시 해제 · 다시 MANO 대기' if n else '이관 기록이 없습니다.')
 
-FLEET_HANDLERS={'run_raw':fleet_run_raw,'mano_export':fleet_mano_export,'mano_import':fleet_mano_import,'mano_release':fleet_mano_release}
+def fleet_raw_reset(task,p):
+ """이 PC의 시작 전 RAW 배정을 풉니다. episode가 있으면 그 RAW만(PC 간 겹침 정리), 없으면 대기열 전체 초기화
+ (배정 + '내 작업에서 제외' 기록). 실행을 시작한 RAW(담당·실행 기록)·결과 파일은 건드리지 않습니다."""
+ ep=p.get('episode') or None
+ if ep and not fleet.RAW_NAME.fullmatch(ep):raise RuntimeError('RAW 이름이 잘못되었습니다.')
+ own=access.owners()
+ with access._assign_lock:
+  with access.db() as c:
+   rows=[r[0] for r in (c.execute('SELECT episode FROM raw_assignments WHERE episode=?',(ep,)) if ep else c.execute('SELECT episode FROM raw_assignments'))]
+   c.execute('DELETE FROM raw_assignments WHERE episode=?',(ep,)) if ep else c.execute('DELETE FROM raw_assignments')
+   excl=0 if ep else c.execute('DELETE FROM raw_exclusions').rowcount
+   c.execute('INSERT INTO ui_audit VALUES(?,?,?)',(time.time(),str(p.get('requested_by')),'raw-reset '+(ep or 'all')))
+  for e in rows:
+   if not own.get(e):fleet.raw_release(e)
+  # 겹침 정리: 남기는 PC가 따로 있으면 이 PC의 선점도 풉니다(이 PC가 실행한 RAW는 제외).
+  if ep and not own.get(ep):fleet.raw_release(ep)
+ msg=(f'{ep} 시작 전 배정 해제' if ep else f'대기열 초기화: 시작 전 배정 {len(rows)}개 · 제외 기록 {excl}개 해제')+(' (배정 없음)' if not rows else '')
+ task_update(task['id'],state='done',message=msg)
+
+FLEET_HANDLERS={'raw_reset':fleet_raw_reset,'run_raw':fleet_run_raw,'mano_export':fleet_mano_export,'mano_import':fleet_mano_import,'mano_release':fleet_mano_release}
 
 def fleet_process():
  for cmd in fleet.claim():
@@ -1527,6 +1558,7 @@ def fleet_snapshot():
   cmds.append({'id':t['id'],'type':t['type'],'episode':p.get('episode'),'run_id':p.get('source_run_id') or p.get('run_id'),'source_pc':p.get('source_pc') or (fleet.PC_ID if t['type'] in ('mano_export','mano_release') else None),
                'target_pc':p.get('target_pc') or fleet.PC_ID,'state':t['state'],'step':t['step'],'message':t['message'],'requested_by':p.get('requested_by'),'created':t['created'],'updated':t['updated']})
  snap['commands']=cmds
+ snap['assignments']=[{'episode':ep,'operator':op} for ep,op in access.assignments().items()]
  return snap
 
 def reconcile_raw_claims(snap):
@@ -1593,14 +1625,15 @@ def fleet_status(req:Request):
  raw_free=[e for e in raws if re.match(r'ep_(\d{8})_',e) and re.match(r'ep_(\d{8})_',e).group(1)>=RAW_QUEUE_START and e not in started and not own.get(e)]
  mano=[dict(m,pc=p['pc']) for p in pcs for m in p.get('mano_waiting') or []]
  commands=sorted((c for p in pcs for c in p.get('commands') or []),key=lambda c:-(c.get('updated') or 0))[:60]
- return {'me':fleet.PC_ID,'control':str(fleet.CONTROL),'pcs':[fleet_view(p) for p in pcs],'raw_free':raw_free,'mano_waiting':mano,'commands':commands,
+ overlaps=fleet.overlaps(pcs)
+ return {'me':fleet.PC_ID,'control':str(fleet.CONTROL),'overlaps':overlaps,'pcs':[fleet_view(p) for p in pcs],'raw_free':raw_free,'mano_waiting':mano,'commands':commands,
          'idle_rule':{'util_below':fleet.IDLE_UTIL,'free_mb_at_least':fleet.IDLE_FREE_MB,'stale_seconds':fleet.STALE_SECONDS}}
 
 class FleetDispatch(BaseModel):
- type:str=Field(pattern=r'^(run_raw|mano_transfer|mano_release)$')
+ type:str=Field(pattern=r'^(run_raw|mano_transfer|mano_release|queue_reset|resolve_overlaps)$')
  target_pc:str=Field(default='',pattern=r'^(pc[1-6])?$')
  source_pc:str=Field(default='',pattern=r'^(pc[1-6])?$')
- episode:str=Field(pattern=r'^ep_[A-Za-z0-9_]+$')
+ episode:str=Field(default='',pattern=r'^(ep_[A-Za-z0-9_]+)?$')
  run_id:str=Field(default='',max_length=250)
  sam_prompt:str=Field(default='',max_length=200)
 
@@ -1609,6 +1642,29 @@ def fleet_dispatch(data:FleetDispatch,req:Request):
  guard(req);admin=access.admin(req)
  pcs={p['pc']:p for p in fleet.read_all()}
  by=admin['name']+'@'+fleet.PC_ID
+ if data.type=='queue_reset':
+  # PC 하나의 작업자 대기열 초기화(시작 전 배정·제외 기록). 실행 기록·결과는 그대로.
+  if not data.target_pc:raise HTTPException(400,'초기화할 PC를 고르세요.')
+  cmd=fleet.send(data.target_pc,{'type':'raw_reset','target_pc':data.target_pc,'requested_by':by})
+  with access.db() as c:c.execute('INSERT INTO ui_audit VALUES(?,?,?)',(time.time(),admin['name'],f"fleet queue_reset {data.target_pc} {cmd['id']}"))
+  return {'id':cmd['id'],'sent_to':data.target_pc}
+ if data.type=='resolve_overlaps':
+  # PC 간 겹치는 RAW마다 남길 PC 하나만 두고, 나머지 PC의 시작 전 배정을 풉니다(양쪽 실행은 수동 확인).
+  sent=[];manual=[]
+  for o in fleet.overlaps(list(pcs.values())):
+   if data.episode and o['episode']!=data.episode:continue
+   if o['manual'] or not o['keep']:manual.append(o['episode']);continue
+   if o['claim']!=o['keep']:
+    # 남기는 PC로 선점을 옮깁니다(선점이 비었거나 풀릴 PC가 갖고 있을 때).
+    try:
+     if o['claim']:os.unlink(fleet.CONTROL/'claims'/o['episode'])
+     os.symlink(o['keep'],fleet.CONTROL/'claims'/o['episode'])
+    except OSError:pass
+   for pc in o['release']:
+    fleet.send(pc,{'type':'raw_reset','episode':o['episode'],'target_pc':pc,'requested_by':by});sent.append(pc+':'+o['episode'])
+  with access.db() as c:c.execute('INSERT INTO ui_audit VALUES(?,?,?)',(time.time(),admin['name'],'fleet resolve_overlaps '+','.join(sent)))
+  return {'sent':sent,'manual':manual,'sent_to':', '.join(sorted({x.split(':')[0] for x in sent})) or '없음'}
+ if not data.episode:raise HTTPException(400,'에피소드를 고르세요.')
  if data.type=='run_raw':
   if not data.target_pc or not data.sam_prompt.strip():raise HTTPException(400,'대상 PC와 SAM3 분할 대상을 입력하세요.')
   if not pcs[data.target_pc].get('online'):raise HTTPException(409,data.target_pc+'가 연결되어 있지 않습니다.')
