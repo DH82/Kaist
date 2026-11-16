@@ -73,7 +73,7 @@ def _scan(include_manual):
  return {'configured':True,'message':'NAS 입고 목록','episodes':rows()}
 
 def assign(ep,operator,worker):
- if worker!='gpu_4090_a':raise ValueError('현재 등록된 실행 PC는 PC1뿐입니다.')
+ if worker!='gpu_4090_a':raise ValueError('현재 등록된 실행 PC는 이 PC('+os.environ.get('PC_ID','pc1').upper()+')뿐입니다.')
  if not operator.strip() or len(operator)>80:raise ValueError('작업자 이름을 입력하세요.')
  with db() as c:
   c.execute('BEGIN IMMEDIATE');r=c.execute('SELECT * FROM episodes WHERE episode=?',(ep,)).fetchone()

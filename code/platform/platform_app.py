@@ -387,11 +387,11 @@ def launch(data:Launch,req:Request):
  if data.mode not in DIRECT_DAGS:raise HTTPException(400,'실행 모드를 선택하세요.')
  try:pc=worker(data.worker_id)
  except ValueError as e:raise HTTPException(400,str(e))
- if data.mode=='test' and data.worker_id!=DEFAULT_WORKER:raise HTTPException(400,'GPU test is PC1 only')
+ if data.mode=='test' and data.worker_id!=DEFAULT_WORKER:raise HTTPException(400,'GPU 연결 테스트는 '+local_pc_label()+'에서만 실행할 수 있습니다.')
  dag=pc['dag_id'] if data.mode=='pipeline' else DIRECT_DAGS[data.mode]
- if data.mode=='raw' and data.worker_id!=DEFAULT_WORKER:raise HTTPException(400,'RAW-only compatibility mode is PC1 only')
+ if data.mode=='raw' and data.worker_id!=DEFAULT_WORKER:raise HTTPException(400,'RAW 전용 호환 실행은 '+local_pc_label()+'에서만 할 수 있습니다.')
  if data.defer_mano:
-  if data.worker_id!=DEFAULT_WORKER or data.mode!='pipeline':raise HTTPException(400,'PC1 전체 파이프라인에서만 선택할 수 있습니다.')
+  if data.worker_id!=DEFAULT_WORKER or data.mode!='pipeline':raise HTTPException(400,local_pc_label()+' 전체 파이프라인에서만 선택할 수 있습니다.')
   dag=DAY_DAG
  with lock:
   if data.mode in ('raw','pipeline') and not access.selectable(req,data.episode_id,data.worker_id):
@@ -487,9 +487,14 @@ def airflow_runs(dag, **filters):
 def batch_active():
  return sum(r['state'] in ('running','queued') for r in airflow_runs(BATCH_DAG))
 
+def local_pc_label():
+ """화면에 보일 이 PC 이름(예: 'PC 6 · RTX 4090'). 내부 식별자(gpu_4090_a, kaist_pc1_*, /api/pc1/…)는 그대로 둡니다."""
+ try:return worker(DEFAULT_WORKER)['label']
+ except (ValueError,KeyError,OSError):return (fleet.MACHINE_PC or 'pc1').upper()
+
 def check_batch_idle():
  if any(r['state'] in ('running','queued') for r in airflow_runs(BATCH_DAG)):
-  raise HTTPException(409,'PC1 MANO 일괄 실행이 진행 중입니다.')
+  raise HTTPException(409,local_pc_label()+' MANO 일괄 실행이 진행 중입니다.')
 
 BATCH_OF={}  # run_id → 그 실행이 들어 있는 가장 최근 MANO 일괄 실행 ID (batch_history가 갱신)
 
