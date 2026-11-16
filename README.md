@@ -78,6 +78,28 @@ NAS 그룹과 weight 경로는 해당 PC 값으로 지정합니다.
 기존 운영 작업 폴더·DB·검수 이력의 자동 이관은 하지 않습니다. 운영 전환 시 기존 서비스를 종료하고
 기존 상태 경로 및 포트를 선택해야 합니다. GPU 모델 점검은 실제 GPU 연산을 수행하므로 여유 시간에 실행하세요.
 
+## GitHub 업데이트 (PC 일괄 반영)
+
+`./start.sh`가 끝나면 업데이트 타이머(`systemd --user kaist-update.timer`, 3분 간격)가 자동으로 설치됩니다.
+수동 설치·제거는 `repro/install_updater.sh` / `repro/install_updater.sh --remove`입니다.
+
+1. 개발 PC에서 `git push origin main`.
+2. 관리자 화면 **통합 관리 · PC1~6 → PC별 현황**의 `버전 · 업데이트` 열에서 PC별 **업데이트** 또는 상단 **⟳ 전체 업데이트**를 누릅니다.
+3. 각 PC는 GitHub 코드를 받아(fast-forward) 새 이미지를 빌드·점검합니다. 이 동안 기존 서비스는 계속 동작합니다.
+   이후 GPU 작업·Airflow 태스크·MANO 일괄 실행이 없을 때 서비스를 재시작하고 UI 연결을 검사합니다.
+   `pipeline/`이 바뀐 경우에는 진행 중인 실행이 모두 끝날 때까지 기다립니다. 실행 중 코드 해시가 바뀌면 그 실행이 실패하기 때문입니다.
+4. 요청이 걸려 있는 동안 그 PC에서는 새 RAW 실행과 MANO 일괄 실행을 시작할 수 없습니다. 진행 중인 작업은 계속됩니다.
+   **요청 취소**를 누르면 차단이 풀립니다. 재시작 전이었다면 업데이트도 보류됩니다.
+5. 빌드나 재시작에 실패하면 이전 커밋으로 되돌려 다시 기동하고, 실패 내용을 대시보드에 표시합니다.
+   PC에서 직접 고친 파일이 있으면 업데이트하지 않습니다.
+
+요청과 상태는 NAS `control/update/<pc>/{request,status}.json`에 저장됩니다.
+로그는 `journalctl --user -u kaist-update -e`와 `state/updater/last_run.log`에서 확인합니다.
+상태만 확인하려면 `python3 repro/update_stack.py --status`를 실행합니다.
+요청 없이 새 커밋을 자동 반영하려면 `repro/install_updater.sh --auto`로 설치합니다.
+Docker 없이 native로 운영하는 PC는 코드를 받은 뒤 UI만 재시작합니다. GPU Worker와 파이프라인 사본은 수동으로 배포해야 합니다.
+로그아웃 후에도 타이머가 동작하려면 `sudo loginctl enable-linger $USER`가 한 번 필요합니다.
+
 ## 점검과 운영
 
 ```bash

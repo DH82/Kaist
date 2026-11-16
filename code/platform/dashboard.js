@@ -95,7 +95,7 @@ function renderDash(){
  const sum=a=>a.reduce((s,j)=>s+(dashLen(j)||0),0),uniq=a=>new Set(a.map(j=>j.episode)).size;
  // 상단 정보 · 경고
  const online=d.pcs.filter(p=>p.online).length,old=d.pcs.filter(p=>p.online&&!p.has_jobs).map(p=>dashPcName(p.pc));
- $('dashInfo').textContent=(d.nas?'PC 연결 '+online+'/'+d.pcs.length+'대':'NAS 연결 없음 · '+dashPcName(d.me)+' 기록만 표시')+' · 진행 중 '+running.filter(mine).length+'단계 · MANO 대기 '+d.mano_waiting.filter(mine).length+'개 · 남은 RAW '+d.raw_free+'개 · 30초마다 갱신';
+ $('dashInfo').textContent=(d.nas?'PC 연결 '+online+'/'+d.pcs.length+'대':'NAS 연결 없음 · '+dashPcName(d.me)+' 기록만 표시')+' · 진행 중 '+running.filter(mine).length+'단계 · MANO 대기 '+d.mano_waiting.filter(mine).length+'개 · 남은 RAW '+d.raw_free+'개'+dashLatest(d)+' · 30초마다 갱신';
  $('dashWarn').hidden=!old.length;$('dashWarn').textContent=old.length?old.join(', ')+'는 이전 버전 UI라 작업 시간 기록이 없습니다. 해당 PC의 UI를 업데이트하세요.':'';
  // 요약 카드
  const kpi=(label,val,sub,bad)=>'<div class="dbKpi'+(bad?' bad':'')+'"><span>'+label+'</span><b>'+val+'</b><small>'+sub+'</small></div>';
@@ -115,7 +115,7 @@ function renderDash(){
   const wait=d.mano_waiting.filter(of).length;
   return '<tr'+(dot?'':' class="off"')+'><td><b><span class="dbDot '+dot+'"></span>'+dashPcName(p.pc)+'</b>'+(p.online&&p.pc!==d.me?' <a class="dbLink" style="padding:0 4px" href="/api/fleet/open?pc='+p.pc+'" target="_blank" rel="noopener" title="'+dashPcName(p.pc)+' 화면을 관리자로 열기">원격 관리 ↗</a>':'')+'<span class="dbSub">'+state+gpu+'</span></td>'+
    dashNum(uniq(starts.filter(of)))+dashNum(recon.filter(of).length)+dashNum(mano.filter(of).length)+dashNum(pub.filter(of).length)+dashNum(f,true)+
-   (sum(work.filter(of))?'<td class="dbR">'+dashDur(sum(work.filter(of)))+'</td>':'<td class="dbR zero">—</td>')+'<td class="dbNow">'+(now||'<span class="zero">—</span>')+(wait?'<span class="dbSub">MANO 대기 '+wait+'개</span>':'')+'</td></tr>'}).join('');
+   (sum(work.filter(of))?'<td class="dbR">'+dashDur(sum(work.filter(of)))+'</td>':'<td class="dbR zero">—</td>')+'<td class="dbNow">'+(now||'<span class="zero">—</span>')+(wait?'<span class="dbSub">MANO 대기 '+wait+'개</span>':'')+'</td><td class="dbVer">'+dashVersion(p)+'</td></tr>'}).join('');
  // 에피소드
  const all=dashEpisodes(jobs.filter(mine));
  const onlyRun=$('dashEpRunning').checked;
@@ -149,6 +149,36 @@ function renderDash(){
   return '<tr title="'+escape([j.operator&&'작업자 '+j.operator,j.sam_prompt&&'분할 대상 '+j.sam_prompt,q].filter(Boolean).join(' · '))+'"><td class="dbR" style="text-align:left">'+dashHM(j.started)+' – '+(j.finished?dashHM(j.finished):'')+'</td><td>'+dashPcName(j.pc)+'</td><td>'+escape(j.episode||'')+'</td><td>'+escape(dashName(j.stage))+(j.attempt>0?'<span class="dbSub">이전 시도</span>':'')+'</td><td>'+dashState(j.state)+'</td><td class="dbR"><b>'+dashDur(dashLen(j))+'</b></td></tr>'}).join(''):'<tr><td colspan="6" class="dbEmpty">조건에 맞는 기록이 없습니다.</td></tr>';
  $('dashMore').hidden=log.length<=dashLimit;
 }
+// ---- 버전 · GitHub 업데이트 (각 PC의 repro/update_stack.py가 NAS control/update/<pc>/status.json에 기록) ----
+const DASH_UPD={idle:'',waiting:'재시작 대기',building:'빌드 중',restarting:'재시작 중',done:'완료',failed:'실패',paused:'보류'};
+function dashLatest(d){const r=d.pcs.map(p=>p.update&&p.update.status).filter(x=>x&&x.remote).sort((a,b)=>b.updated-a.updated)[0];return r?' · GitHub 최신 '+r.remote.slice(0,7):''}
+function dashVersion(p){
+ const u=p.update||{},st=u.status,rq=u.request;
+ if(!st)return '<span class="zero">업데이트 타이머 없음</span>'+(rq?'<span class="dbVerMsg">요청 대기 중 · 이 PC에 repro/install_updater.sh 설치 필요</span><button class="dbLink" data-upd-cancel="'+p.pc+'">요청 취소</button>':'');
+ const now=Date.now()/1000,stale=now-(st.updated||0)>600;
+ let h='<code title="'+escape((st.subject||'')+(st.mode==='native'?' · native':''))+'">'+escape(String(st.commit||'').slice(0,7))+'</code>';
+ if(st.behind>0)h+=' <span class="new" title="GitHub: '+escape(st.remote_subject||'')+'">새 버전 '+st.behind+'개</span>';
+ else if(st.behind===0)h+=' <span class="zero">최신</span>';
+ if(st.dirty)h+=' <span class="bad" title="이 PC에서 직접 고친 파일이 있어 업데이트가 멈춥니다.">수정됨</span>';
+ const label=stale?'업데이터 응답 없음':DASH_UPD[st.state];
+ if(label)h+=' <span class="'+(stale||st.state==='failed'?'bad':'new')+'">'+label+'</span>';
+ if(rq&&!['building','restarting','waiting'].includes(st.state))h+=' <span class="new">요청됨</span>';
+ // 지난 결과(완료·실패)는 마지막 기록을 보여줍니다.
+ const msg=st.message||(st.last&&now-st.last.at<86400?(st.last.ok?'최근 업데이트: ':'최근 실패: ')+st.last.message:'');
+ if(msg)h+='<span class="dbVerMsg">'+escape(msg)+'</span>';
+ h+=rq?'<button class="dbLink" data-upd-cancel="'+p.pc+'" title="재시작 전이면 업데이트를 보류합니다. 새 실행 시작 차단도 풀립니다.">요청 취소</button>'
+      :'<button class="dbLink" data-upd-pc="'+p.pc+'" title="GitHub 최신 코드를 이 PC에 반영합니다. 진행 중인 작업이 끝난 뒤 재시작하며, 그동안 이 PC에서 새 실행 시작이 막힙니다.">업데이트</button>';
+ return h;
+}
+async function dashUpdate(pcs,action){
+ if(!pcs.length){alert('업데이트할 PC가 없습니다. (업데이트 타이머가 설치되어 있고 요청 대기 중이 아닌 PC)');return}
+ const names=pcs.map(dashPcName).join(', ');
+ if(action==='request'&&!confirm(names+'에 GitHub 최신 코드를 반영합니다.\n\n· 각 PC는 진행 중인 GPU 작업이 끝난 뒤 서비스를 재시작합니다.\n· 업데이트가 끝날 때까지 해당 PC에서 새 RAW 실행·MANO 일괄 실행을 시작할 수 없습니다.\n\n진행할까요?'))return;
+ try{const r=await api('/api/fleet/update',{method:'POST',body:JSON.stringify({pcs,action})});$('dashMsg').hidden=false;$('dashMsg').textContent=(action==='request'?'업데이트 요청: ':'요청 취소: ')+(r.pcs.map(dashPcName).join(', ')||'없음');loadDash(true)}
+ catch(e){alert('업데이트 요청 실패: '+e.message)}
+}
+$('dashPcs').addEventListener('click',e=>{const b=e.target.closest('[data-upd-pc],[data-upd-cancel]');if(!b)return;b.dataset.updPc?dashUpdate([b.dataset.updPc],'request'):dashUpdate([b.dataset.updCancel],'cancel')});
+$('dashUpdateAll').onclick=()=>{const d=dashData;if(!d)return;dashUpdate(d.pcs.filter(p=>p.update&&p.update.status&&!p.update.request).map(p=>p.pc),'request')};
 function dashLogRows(){
  const d=dashData;if(!d)return [];
  const day=$('dashDate').value,pc=$('dashPc').value,st=$('dashFStage').value,state=$('dashFState').value,q=$('dashFText').value.trim().toLowerCase(),checks=$('dashFChecks').checked;

@@ -62,6 +62,30 @@ class RawClaimTests(unittest.TestCase):
             r = c.post('/api/run', headers=h, json={'mode': 'pipeline', 'episode_id': EPS[0], 'sam_prompt': 'towel', 'confirmed': True, 'preview_episode': EPS[0]})
         self.assertEqual(r.status_code, 409); self.assertIn('PC2', r.json()['detail'])
 
+    def test_pending_update_blocks_new_launch_until_cancelled(self):
+        c = TestClient(ui.app); c.cookies.set('kaist_session', access.login('PC1', 'admin'))
+        h = {'Origin': 'http://testserver', 'X-Platform-CSRF': ui.CSRF}
+        body = {'mode': 'pipeline', 'episode_id': EPS[0], 'sam_prompt': 'towel', 'confirmed': True, 'preview_episode': EPS[0]}
+        with patch.object(fleet, 'MACHINE_PC', 'pc1'):
+            fleet.update_request('pc1', '관리자@pc1')
+            r = c.post('/api/run', headers=h, json=body)
+            self.assertEqual(r.status_code, 503); self.assertIn('업데이트 대기', r.json()['detail'])
+            self.assertEqual(c.post('/api/pc1/mano', headers=h, json={'runs': ['x']}).status_code, 503)
+            fleet.update_cancel('pc1')
+            with patch.object(ui, 'local_api', return_value={'dag_runs': []}), patch.object(ui, 'worker', return_value={'dag_id': 'd', 'pool': 'p'}):
+                self.assertNotEqual(c.post('/api/run', headers=h, json=body).status_code, 503)
+
+    def test_admin_update_api_and_report(self):
+        c = TestClient(ui.app); c.cookies.set('kaist_session', access.login('관리자', 'admin'))
+        h = {'Origin': 'http://testserver', 'X-Platform-CSRF': ui.CSRF}
+        r = c.post('/api/fleet/update', headers=h, json={'pcs': ['pc2', 'pc3'], 'action': 'request'})
+        self.assertEqual(r.json()['pcs'], ['pc2', 'pc3'])
+        self.assertTrue(fleet.update_info('pc2')['request']['requested_by'].endswith('@pc1'))
+        self.assertEqual(c.post('/api/fleet/update', headers=h, json={'pcs': ['pc3'], 'action': 'cancel'}).json()['pcs'], ['pc3'])
+        self.assertIsNone(fleet.update_info('pc3')['request'])
+        op = TestClient(ui.app); op.cookies.set('kaist_session', access.login('PC1', 'operator'))
+        self.assertEqual(op.post('/api/fleet/update', headers=h, json={'pcs': ['pc2'], 'action': 'request'}).status_code, 403)
+
     def test_reconcile_releases_unused_and_drops_conflicting_assignment(self):
         fleet.raw_claim(EPS[3])  # 배정 없이 남은 선점 → 해제
         with access.db() as c:

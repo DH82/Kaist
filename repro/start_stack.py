@@ -36,6 +36,19 @@ def read_env(path):
     return result
 
 
+def record_deployed():
+    """repro/update_stack.py가 '지금 실행 중인 커밋'을 알 수 있게 기록합니다."""
+    try:
+        head = subprocess.check_output(['git', '-C', str(ROOT), 'rev-parse', 'HEAD'], text=True).strip()
+        path = ROOT / 'state/updater/state.json'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = json.loads(path.read_text()) if path.is_file() else {}
+        data.update(built=head, deployed=head)
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+    except (OSError, ValueError, subprocess.CalledProcessError) as exc:
+        print(f'Could not record deployed commit: {exc}', file=sys.stderr)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--env-file', type=Path, default=ROOT / '.env')
@@ -53,6 +66,9 @@ def main():
     parser.add_argument('--airflow-trigger-log-port', type=int)
     parser.add_argument('--configure-only', action='store_true', help='Write configuration without building or starting services')
     parser.add_argument('--check', action='store_true', help='Preflight only; no build or service restart')
+    # Used by repro/update_stack.py: build while the old containers keep running, restart later when idle.
+    parser.add_argument('--build-only', action='store_true', help='Build images and run the GPU self-check; do not restart services')
+    parser.add_argument('--skip-build', action='store_true', help='Restart services from already-built images and verify the UI')
     args = parser.parse_args()
     os.chdir(ROOT)
     env_file = args.env_file.resolve()
@@ -164,11 +180,22 @@ def main():
     if args.configure_only:
         print(f'Configuration ready: {env_file}')
         return
-    run(compose + ['build'], env=env)
-    # Exercise GPU packages, model assets, rendering and NAS before bringing the UI online.
-    run(compose + ['run', '--rm', '--no-deps', 'gpu-worker', 'check'], env=env)
+    if not args.skip_build:
+        run(compose + ['build'], env=env)
+        # Exercise GPU packages, model assets, rendering and NAS before bringing the UI online.
+        run(compose + ['run', '--rm', '--no-deps', 'gpu-worker', 'check'], env=env)
+    if args.build_only:
+        print('Images built and checked. Running services were not restarted.')
+        return
     run(compose + ['up', '-d', '--wait', '--wait-timeout', '600'], env=env)
     run([sys.executable, str(ROOT / 'repro/check_ui.py'), '--env-file', str(env_file)], env=env)
+    if stack_name == 'kaist-pc':
+        record_deployed()
+        # GitHub 업데이트 타이머(관리자 대시보드의 '업데이트' 요청을 처리). 실패해도 설치는 성공으로 둡니다.
+        if not args.skip_build and subprocess.run(['systemctl', '--user', 'is-enabled', 'kaist-update.timer'],
+                                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode:
+            if subprocess.run([str(ROOT / 'repro/install_updater.sh')]).returncode:
+                print('Update timer was not installed; run repro/install_updater.sh manually.', file=sys.stderr)
     run(compose + ['ps'], env=env)
     print(f'UI ready: http://{ip}:{ports["ui"]}/')
     print(f'Login: operator; password file: {state / "secrets/ui_password"}')

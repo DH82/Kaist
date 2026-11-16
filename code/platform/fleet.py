@@ -296,3 +296,48 @@ def overlaps(pcs):
                     'keep': keep, 'manual': len(ran) > 1,
                     'release': [pc for pc in sorted(by) if keep and pc != keep and by[pc] == 'assigned']})
     return out
+
+
+# ---- GitHub 업데이트: control/update/<pc>/{request,status}.json ----
+# request.json = 관리자가 요청(있는 동안 이 PC는 새 실행 시작을 막음), status.json = 호스트의 repro/update_stack.py가 기록.
+def _update_dir(pc):
+    if pc not in PCS:
+        raise ValueError('대상 PC가 잘못되었습니다.')
+    return CONTROL / 'update' / pc
+
+
+def _read(path):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def update_request(pc, by):
+    req = {'id': time.strftime('%Y%m%dT%H%M%S_') + secrets.token_hex(3), 'requested_by': by, 'at': time.time(), 'sent_from': PC_ID}
+    d = _update_dir(pc)
+    d.mkdir(parents=True, exist_ok=True)
+    tmp = d / ('.request.' + secrets.token_hex(4) + '.tmp')
+    tmp.write_text(json.dumps(req, ensure_ascii=False, indent=2))
+    os.replace(tmp, d / 'request.json')
+    return req
+
+
+def update_cancel(pc):
+    try:
+        (_update_dir(pc) / 'request.json').unlink()
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def update_info(pc):
+    d = _update_dir(pc)
+    return {'request': _read(d / 'request.json'), 'status': _read(d / 'status.json')}
+
+
+def update_pending():
+    """이 PC에 업데이트 요청이 걸려 있으면 그 요청(dict), 없으면 None."""
+    if not MACHINE_PC:
+        return None
+    return _read(_update_dir(MACHINE_PC) / 'request.json')

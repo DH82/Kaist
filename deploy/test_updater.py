@@ -1,0 +1,169 @@
+"""GitHub 업데이트(repro/update_stack.py · fleet 업데이트 요청). 임시 git 저장소·임시 NAS 폴더만 사용하고,
+실제 빌드·서비스 재시작(start_stack)은 가짜로 바꿉니다."""
+import importlib.util, json, os, sqlite3, subprocess, sys, tempfile, time, unittest
+from pathlib import Path
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / 'code/platform'))
+sys.path.insert(0, str(ROOT / 'repro'))
+import fleet
+import update_stack as us
+
+
+def sh(cwd, *args):
+    return subprocess.run(args, cwd=cwd, check=True, capture_output=True, text=True).stdout.strip()
+
+
+class UpdaterTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp()); self.addCleanup(subprocess.run, ['rm', '-rf', str(self.tmp)])
+        self.origin, self.dev, self.pc = self.tmp / 'origin.git', self.tmp / 'dev', self.tmp / 'pc'
+        self.nas = self.tmp / 'nas'; (self.nas / 'control').mkdir(parents=True)
+        sh(self.tmp, 'git', 'init', '-q', '--bare', '-b', 'main', str(self.origin))
+        sh(self.tmp, 'git', 'clone', '-q', str(self.origin), str(self.dev))
+        for k, v in (('user.email', 't@t'), ('user.name', 't')):
+            sh(self.dev, 'git', 'config', k, v)
+        self.commit('README.md', 'v1')
+        sh(self.tmp, 'git', 'clone', '-q', str(self.origin), str(self.pc))
+        (self.pc / '.env').write_text(f"PC_ID='pc2'\nNAS_MOUNT='{self.nas}'\nGPU_STATE_DIR='{self.pc / 'gpu_state'}'\n")
+        for p in (patch.object(us, 'ROOT', self.pc), patch.object(us, 'LOCAL', self.pc / 'state/updater'),
+                  patch.dict(os.environ, {'KAIST_UPDATE_MODE': 'docker'})):
+            p.start(); self.addCleanup(p.stop)
+        (self.pc / 'state/updater').mkdir(parents=True)
+        self.calls, self.fail_on = [], set()
+        self.deployed = sh(self.pc, 'git', 'rev-parse', 'HEAD')
+        us.write_json(us.LOCAL / 'state.json', {'built': self.deployed, 'deployed': self.deployed})
+        self.ui(busy={'running_tis': 0, 'batch': False})
+
+    def commit(self, name, text):
+        f = self.dev / name; f.parent.mkdir(parents=True, exist_ok=True); f.write_text(text)
+        sh(self.dev, 'git', 'add', '-A'); sh(self.dev, 'git', 'commit', '-qm', f'{name}={text}'); sh(self.dev, 'git', 'push', '-q', 'origin', 'main')
+
+    def ui(self, busy, inflight=0, age=0):
+        """이 PC UI가 NAS에 쓰는 상태 파일(필요한 부분만)."""
+        path = self.nas / 'control/status/pc2.sqlite'; path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            path.unlink()
+        c = sqlite3.connect(path)
+        c.executescript(fleet.SCHEMA)
+        c.executemany('INSERT INTO meta VALUES(?,?)', [('updated_at', json.dumps(time.time() - age)), ('update_busy', json.dumps(busy))])
+        c.executemany('INSERT INTO runs (run_id,state) VALUES(?,?)', [(f'r{i}', 'running') for i in range(inflight)])
+        c.commit(); c.close()
+
+    def job(self, state):
+        d = self.pc / 'gpu_state/worker/jobs/abc'; d.mkdir(parents=True, exist_ok=True)
+        (d / 'status.json').write_text(json.dumps({'state': state}))
+        (d / 'request.json').write_text(json.dumps({'episode': 'ep_1', 'stage': 'track'}))
+
+    def tick(self, **kw):
+        u = us.Updater(self.pc / '.env')
+
+        def fake(*flags):
+            self.calls.append(flags)
+            if flags in self.fail_on or (not flags and () in self.fail_on):
+                raise RuntimeError('boom')
+        u.start_stack = fake
+        u.tick(**kw)
+        return u.status
+
+    def request(self):
+        with patch.object(fleet, 'CONTROL', self.nas / 'control'):
+            return fleet.update_request('pc2', 'admin@pc1')
+
+    def head(self):
+        return sh(self.pc, 'git', 'rev-parse', 'HEAD')
+
+    def test_no_request_reports_behind_only(self):
+        self.commit('code/a.py', '1')
+        st = self.tick()
+        self.assertEqual((st['state'], st['behind'], self.calls), ('idle', 1, []))
+        self.assertEqual(self.head(), self.deployed)
+        self.assertEqual(json.loads((self.nas / 'control/update/pc2/status.json').read_text())['behind'], 1)
+
+    def test_request_builds_waits_for_jobs_then_restarts(self):
+        self.commit('code/a.py', '1'); self.request(); self.job('running')
+        st = self.tick()
+        self.assertEqual(st['state'], 'waiting'); self.assertIn('GPU 작업 1개', st['message'])
+        self.assertEqual(self.calls, [('--build-only',)])
+        self.assertNotEqual(self.head(), self.deployed)
+        self.assertTrue((self.nas / 'control/update/pc2/request.json').exists())
+        self.job('success')
+        st = self.tick()
+        self.assertEqual(st['state'], 'done'); self.assertEqual(self.calls, [('--build-only',), ('--skip-build',)])  # 다시 빌드하지 않음
+        self.assertFalse((self.nas / 'control/update/pc2/request.json').exists())
+        self.assertEqual(json.loads((us.LOCAL / 'state.json').read_text())['deployed'], self.head())
+
+    def test_pipeline_change_waits_for_inflight_runs(self):
+        self.commit('pipeline/current/project/00_scripts/x.py', '1'); self.request()
+        self.ui(busy={'running_tis': 0, 'batch': False}, inflight=2)
+        st = self.tick()
+        self.assertEqual(st['state'], 'waiting'); self.assertIn('진행 중인 실행 2개', st['message'])
+        # 코드만 바뀐 경우에는 실행 중(검수 대기 등)인 실행이 있어도 진행
+        self.ui(busy={'running_tis': 0, 'batch': False}, inflight=0)
+        self.assertEqual(self.tick()['state'], 'done')
+
+    def test_stale_ui_status_blocks_restart(self):
+        self.commit('code/a.py', '1'); self.request(); self.ui(busy={}, age=600)
+        st = self.tick()
+        self.assertEqual(st['state'], 'waiting'); self.assertIn('UI 상태를 확인할 수 없습니다', st['message'])
+
+    def test_build_failure_rolls_back(self):
+        self.commit('code/a.py', '1'); self.request(); self.fail_on = {('--build-only',)}
+        st = self.tick()
+        self.assertEqual(st['state'], 'failed'); self.assertIn('되돌', st['message'])
+        self.assertEqual(self.head(), self.deployed)
+        self.assertFalse((self.nas / 'control/update/pc2/request.json').exists())
+
+    def test_restart_failure_rolls_back_and_restarts_old(self):
+        self.commit('code/a.py', '1'); self.request(); self.fail_on = {('--skip-build',)}
+        st = self.tick()
+        self.assertEqual(st['state'], 'failed'); self.assertEqual(self.head(), self.deployed)
+        self.assertEqual(self.calls[-1], ())   # 이전 커밋으로 전체 빌드·기동
+
+    def test_local_edits_block_update(self):
+        self.commit('README.md', 'v2'); self.request()
+        (self.pc / 'README.md').write_text('local edit')
+        st = self.tick()
+        self.assertEqual(st['state'], 'failed'); self.assertIn('직접 고친 파일', st['message']); self.assertEqual(self.calls, [])
+
+    def test_cancel_while_waiting_pauses(self):
+        self.commit('code/a.py', '1'); self.request(); self.job('running')
+        self.assertEqual(self.tick()['state'], 'waiting')
+        with patch.object(fleet, 'CONTROL', self.nas / 'control'):
+            self.assertTrue(fleet.update_cancel('pc2'))
+        self.job('success')
+        self.assertEqual(self.tick()['state'], 'paused')
+        self.assertEqual(self.calls, [('--build-only',)])
+
+    def test_up_to_date_request_finishes_without_restart(self):
+        self.request()
+        st = self.tick()
+        self.assertEqual((st['state'], self.calls), ('done', []))
+
+    def test_auto_mode(self):
+        self.commit('code/a.py', '1')
+        self.assertEqual(self.tick(auto=True)['state'], 'done')
+
+    def test_native_mode_pulls_without_docker(self):
+        self.commit('docs.md', '1'); self.request()
+        with patch.dict(os.environ, {'KAIST_UPDATE_MODE': 'native'}):
+            st = self.tick()
+        self.assertEqual(st['state'], 'done'); self.assertEqual(self.calls, []); self.assertEqual(st['behind'], 0)
+
+
+class FleetUpdateRequestTests(unittest.TestCase):
+    def test_request_cancel_pending(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(fleet, 'CONTROL', Path(tmp)), patch.object(fleet, 'MACHINE_PC', 'pc3'):
+            self.assertIsNone(fleet.update_pending())
+            fleet.update_request('pc3', 'admin@pc1')
+            self.assertEqual(fleet.update_pending()['requested_by'], 'admin@pc1')
+            self.assertEqual(fleet.update_info('pc3')['status'], None)
+            self.assertTrue(fleet.update_cancel('pc3')); self.assertFalse(fleet.update_cancel('pc3'))
+            self.assertIsNone(fleet.update_pending())
+            with self.assertRaises(ValueError):
+                fleet.update_request('pc9', 'x')
+
+
+if __name__ == '__main__':
+    unittest.main()

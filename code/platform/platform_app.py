@@ -378,9 +378,16 @@ def run_waiting(dag,run):
  except Exception:return False
  return stage in WAIT_STAGES and state in ('up_for_reschedule','scheduled','queued','running',None)
 
+def update_block():
+ """관리자가 이 PC의 GitHub 업데이트를 요청해 두었으면 새 실행 시작을 막습니다(진행 중인 작업은 계속)."""
+ try:pending=fleet.update_pending()
+ except Exception:pending=None
+ if pending:raise HTTPException(503,'이 PC는 프로그램 업데이트 대기 중입니다. 진행 중인 작업이 끝나 업데이트가 반영되면 다시 시작할 수 있습니다. (요청: '+str(pending.get('requested_by') or '관리자')+')')
+
 @app.post('/api/run')
 def launch(data:Launch,req:Request):
  guard(req)
+ if data.mode!='test':update_block()
  if data.mode=='test':access.admin(req)
  elif access.owners().get(data.episode_id) not in (None,access.user(req)['name']):raise HTTPException(403,'다른 작업자가 선택한 에피소드입니다.')
  elif not access.selectable(req,data.episode_id,data.worker_id):raise HTTPException(403,'본인에게 배정된 RAW만 시작할 수 있습니다. RAW 목록의 내 배정을 확인하세요.')
@@ -557,7 +564,7 @@ def mano_candidates(req:Request):
 
 @app.post('/api/pc1/mano')
 def launch_mano(data:ManoSelection,req:Request):
- guard(req)
+ guard(req);update_block()
  if len(set(data.runs))!=len(data.runs):raise HTTPException(400,'중복된 실행입니다.')
  with lock:
   check_batch_idle()
@@ -1621,8 +1628,16 @@ def job_records(operators=None):
  owners=access.owners();operators=operators or {}
  return [dict(r,operator=owners.get(r['episode']) or operators.get(r['run_id'])) for r in rows]
 
+def update_busy():
+ """repro/update_stack.py가 서비스 재시작 전에 확인: 실행 중인 Airflow 태스크 수 · MANO 일괄 실행 여부."""
+ try:
+  tis=local_api('GET','/api/v2/dags/~/dagRuns/~/taskInstances',params={'state':['running','queued'],'limit':1})['total_entries']
+  batch=any(r['state'] in ('queued','running') for r in airflow_runs(BATCH_DAG))
+  return {'running_tis':tis,'batch':batch}
+ except Exception as e:return {'error':str(e)[-200:]}
+
 def fleet_snapshot():
- snap={'meta':{'host':os.uname().nodename,'label':worker(DEFAULT_WORKER).get('label'),'gpu_error':None,'ui_url':fleet.ui_url(ALLOWED_HOSTS)}}
+ snap={'meta':{'host':os.uname().nodename,'label':worker(DEFAULT_WORKER).get('label'),'gpu_error':None,'ui_url':fleet.ui_url(ALLOWED_HOSTS),'update_busy':update_busy()}}
  try:
   try:g=call('GET','/worker/gpu',worker_id=DEFAULT_WORKER)
   except (httpx.HTTPError,OSError,ValueError):g=local_gpu_status()
@@ -1770,12 +1785,30 @@ def fleet_report(req:Request):
   g=(p.get('gpu') or [None])[0]
   out['pcs'].append({'pc':p['pc'],'online':bool(p.get('online')),'missing':bool(p.get('missing')),'error':p.get('error'),'age':p.get('age'),
    'updated_at':(p.get('meta') or {}).get('updated_at'),'ui_url':(p.get('meta') or {}).get('ui_url'),'has_jobs':bool(p.get('has_jobs') or p.get('local_only')),
-   'gpu':g,'assignments':len(p.get('assignments') or []),'idle':bool(p.get('idle'))})
+   'gpu':g,'assignments':len(p.get('assignments') or []),'idle':bool(p.get('idle')),'update':fleet.update_info(p['pc']) if fleet.available() else None})
   for k in ('jobs','published','runs','mano_waiting'):
    out[k]+=[dict(r,pc=p['pc']) for r in p.get(k) or []]
  out['raw_free']=len(free_raws(started))
  out['stage_names']=JOB_STAGES+['adopt']
  return out
+
+class FleetUpdate(BaseModel):
+ pcs:list[str]=Field(min_length=1,max_length=6)
+ action:str=Field(pattern=r'^(request|cancel)$')
+
+@app.post('/api/fleet/update')
+def fleet_update(data:FleetUpdate,req:Request):
+ """GitHub 업데이트 요청/취소. 각 PC의 호스트 타이머(repro/update_stack.py)가 쉬는 시점에 받아 반영합니다."""
+ guard(req);admin=access.admin(req)
+ if not fleet.available():raise HTTPException(409,'NAS에 연결되어 있지 않아 업데이트를 요청할 수 없습니다.')
+ pcs=[pc for pc in dict.fromkeys(data.pcs) if pc in fleet.PCS]
+ if not pcs:raise HTTPException(400,'PC를 고르세요.')
+ by=admin['name']+'@'+fleet.PC_ID;done=[]
+ for pc in pcs:
+  if data.action=='request':fleet.update_request(pc,by);done.append(pc)
+  elif fleet.update_cancel(pc):done.append(pc)
+ with access.db() as c:c.execute('INSERT INTO ui_audit VALUES(?,?,?)',(time.time(),admin['name'],f"fleet update {data.action} {','.join(done)}"))
+ return {'ok':True,'pcs':done}
 
 class FleetDispatch(BaseModel):
  type:str=Field(pattern=r'^(run_raw|mano_transfer|mano_release|queue_reset|resolve_overlaps)$')
