@@ -141,11 +141,11 @@ async def tracking_decision(dag_id: str, episode: str, request: Request, user: G
 
 
 
-def edit_backend(dag_id,episode,action,extra=(),data=None):
+def edit_backend(dag_id,episode,action,extra=(),data=None,timeout=120):
     if not re.fullmatch(r'ep_[A-Za-z0-9_]+',episode):raise HTTPException(400,'Invalid episode')
     config=config_for(dag_id);cfg=json.loads(config.read_text())
     cmd=[cfg['control_python'],str(WORKER_ROOT/'mask_editor.py'),action,'--config',str(config),'--episode',episode,*extra]
-    result=subprocess.run(cmd,input=json.dumps(data).encode() if data is not None else None,capture_output=True,timeout=120)
+    result=subprocess.run(cmd,input=json.dumps(data).encode() if data is not None else None,capture_output=True,timeout=timeout)
     if result.returncode:raise HTTPException(409,result.stderr.decode(errors='replace')[-1500:])
     return json.loads(result.stdout)
 
@@ -170,7 +170,7 @@ async def edit_save(dag_id:str,episode:str,request:Request,user:GetUserDep):
 # sam-env에서 SAM3.1을 상주시키는 하위 프로세스(sam_wand_server.py)를 필요할 때만 띄웁니다.
 # 남은 GPU 메모리가 WAND_MIN_FREE_MB 이상이면 다른 GPU 작업 중에도 띄우며, WAND_IDLE초 동안
 # 쓰지 않으면 모델을 내려 GPU 메모리를 파이프라인 작업에 돌려줍니다.
-import fcntl,shlex,threading,time
+import fcntl,shlex,threading,time,uuid
 WAND_IDLE=int(os.environ.get('KAIST_WAND_IDLE','180'))
 # 마법봉(SAM3.1)을 띄우기 위해 남아 있어야 하는 GPU 메모리(MiB). KAIST_WAND_MIN_FREE_MB로 조정합니다.
 WAND_MIN_FREE_MB=int(os.environ.get('KAIST_WAND_MIN_FREE_MB','8192'))
@@ -216,6 +216,8 @@ class Wand:
         if not ready.strip().startswith('{"ready"'):
             self._stop();raise HTTPException(500,'SAM3 마법봉을 시작하지 못했습니다. worker/sam_wand.log를 확인하세요.')
     def segment(self,cfg,request):
+        return self.call(cfg,request)
+    def call(self,cfg,request):
         with self.lock:
             if self.proc and self.proc.poll() is not None:self._stop()
             if not self.proc:self._start(cfg)
@@ -260,6 +262,68 @@ async def wand_segment(dag_id:str,episode:str,request:Request,user:GetUserDep):
     cfg=json.loads(config_for(dag_id).read_text())
     import asyncio
     return await asyncio.to_thread(wand.segment,cfg,{'image':source['rgb'],'points':points,'text':text,'threshold':threshold})
+
+# ---- 추적 일괄 교체: 클릭한 프레임의 마법봉 시드를 SAM3 트래커로 앞뒤 전파해, 구간의 손/물체 마스크를 교체 ----
+# 수백 프레임이라 백그라운드로 실행하고, 화면은 상태(진행률)를 조회합니다. 한 번에 하나만 실행합니다.
+TRACK_ROOT=WORKER_ROOT/'wand_tracks'
+TRACK_JOBS={}
+_track_lock=threading.Lock()
+def _track_run(job,dag_id,episode,cfg,req,apply):
+    try:
+        res=wand.call(cfg,req)
+        job.update(state='applying',track=res)
+        out=edit_backend(dag_id,episode,'apply_track',data=apply,timeout=900)
+        job.update(state='done',result=out,finished=time.time())
+    except HTTPException as e:
+        job.update(state='failed',error=str(e.detail)[-800:],finished=time.time())
+    except Exception as e:
+        job.update(state='failed',error=str(e)[-800:],finished=time.time())
+    finally:
+        import shutil
+        shutil.rmtree(req['out'],ignore_errors=True)
+
+@app.post('/dags/{dag_id}/episodes/{episode}/wand/track',dependencies=[Depends(requires_access_dag(method='POST'))])
+async def wand_track_start(dag_id:str,episode:str,request:Request,user:GetUserDep):
+    if urlsplit(request.headers.get('origin','')).netloc!=request.headers.get('host'):raise HTTPException(403,'Same-origin editing required')
+    cookie=request.cookies.get('kaist_review_csrf','');header=request.headers.get('x-csrf-token','')
+    if not cookie or not secrets.compare_digest(cookie,header):raise HTTPException(403,'Invalid CSRF token')
+    raw=await request.body()
+    if len(raw)>8192:raise HTTPException(413,'Request too large')
+    try:
+        data=json.loads(raw)
+        cam,frame,obj=int(data['cam']),int(data['frame']),int(data['obj'])
+        a,b=int(data['from']),int(data['to'])
+        points=[[float(x),float(y),1 if int(l)==1 else 0] for x,y,l in data['points']][:20]
+        text=str(data.get('text') or '').strip()[:120]
+        threshold=min(0.95,max(0.05,float(data.get('threshold',0.5))))
+    except (KeyError,TypeError,ValueError):raise HTTPException(400,'Invalid track request')
+    if obj not in (0,1) or not points or not any(l==1 for _,_,l in points) or any(not(0<=x<=1 and 0<=y<=1) for x,y,_ in points):
+        raise HTTPException(400,'포함할 위치를 한 번 이상 클릭하세요.')
+    source=edit_backend(dag_id,episode,'track_source',['--cam',str(cam),'--frame',str(frame)])
+    n=source['frames'];a=max(0,min(a,n-1));b=max(0,min(b,n-1))
+    if a>b:a,b=b,a
+    if not a<=frame<=b:raise HTTPException(400,'클릭한 프레임이 적용 구간 안에 있어야 합니다.')
+    with _track_lock:
+        if any(j['state'] in ('tracking','applying') for j in TRACK_JOBS.values()):raise HTTPException(409,'다른 추적 일괄 교체가 진행 중입니다. 끝난 뒤 다시 시도하세요.')
+        job_id=uuid.uuid4().hex[:16];out=TRACK_ROOT/job_id;TRACK_ROOT.mkdir(exist_ok=True)
+        job={'id':job_id,'episode':episode,'cam':cam,'obj':obj,'frames':[a,b],'start':frame,'state':'tracking','created':time.time(),'out':str(out)}
+        TRACK_JOBS[job_id]=job
+    cfg=json.loads(config_for(dag_id).read_text())
+    req={'type':'track','color_dir':source['color_dir'],'start':frame,'from':a,'to':b,'fps':source.get('fps',30),
+         'points':points,'text':text,'threshold':threshold,'out':str(out)}
+    apply={'cam':cam,'obj':obj,'from':a,'to':b,'start':frame,'dir':str(out),'points':points,'text':text,'operator':user.get_name()}
+    threading.Thread(target=_track_run,args=(job,dag_id,episode,cfg,req,apply),daemon=True).start()
+    return {k:v for k,v in job.items() if k!='out'}
+
+@app.get('/dags/{dag_id}/episodes/{episode}/wand/track/{job_id}',dependencies=[Depends(requires_access_dag(method='GET'))])
+def wand_track_status(dag_id:str,episode:str,job_id:str):
+    job=TRACK_JOBS.get(job_id)
+    if not job or job['episode']!=episode:raise HTTPException(404,'추적 작업이 없습니다. (워커가 다시 시작됐을 수 있습니다)')
+    out={k:v for k,v in job.items() if k!='out'}
+    if job['state']=='tracking':
+        try:out['progress']=json.loads((Path(job['out'])/'progress.json').read_text())
+        except (OSError,ValueError):out['progress']={'done':0,'total':job['frames'][1]-job['frames'][0]+1,'phase':'load'}
+    return out
 
 @app.get('/dags/{dag_id}/wand/status',dependencies=[Depends(requires_access_dag(method='GET'))])
 def wand_status(dag_id:str):

@@ -1091,8 +1091,14 @@ def retry_job(data:RetryJob,req:Request):
    request=request_for(task['task_id'],data.run_id,conf)
    # Airflow만 실패로 표시되고 워커 작업은 계속 돌거나 이미 끝난 경우(예: 센서 'state mismatch')에는
    # 워커 작업을 건드리지 않고 Airflow 태스크만 다시 연결합니다. 센서가 진행 중인 작업을 이어서 확인합니다.
-   if call('POST','/worker/jobs/status',json=request,worker_id=wid,timeout=15).get('state') in ('running','queued','success'):continue
-   call('POST','/worker/jobs/retry',json=request,worker_id=wid)
+   # 'waiting'(검수 승인 대기)도 실패가 아니므로 같습니다. 다시 연결된 센서가 승인 여부를 다시 확인합니다.
+   if call('POST','/worker/jobs/status',json=request,worker_id=wid,timeout=15).get('state') in ('running','queued','success','waiting'):continue
+   try:call('POST','/worker/jobs/retry',json=request,worker_id=wid)
+   except httpx.HTTPStatusError as e:
+    # 워커가 거부한 실제 사유를 보여 줍니다(일반 '서버 연결 실패' 문구 대신).
+    try:detail=str(e.response.json().get('detail',''))
+    except ValueError:detail=e.response.text
+    raise HTTPException(409,f"{task['task_id']} 단계 재시도를 GPU PC가 거부했습니다: "+(detail.strip().splitlines()[-1][-300:] if detail.strip() else str(e.response.status_code))) from e
   local_api('POST',f'/api/v2/dags/{data.dag_id}/clearTaskInstances',json={**payload,'dry_run':False})
   access.audit(req,'retry '+data.run_id+' '+data.stage)
   return {'ok':True,'stage':data.stage}

@@ -44,6 +44,11 @@ function hcEditControls(){
  hcEmptyNavControls();
  $('hcBatchApply').textContent='빈 '+($('hcEditObj').value==='0'?'물체':'손')+' 마스크 일괄 적용';
  $('hcBatchApply').disabled=busy||hcBatch.running||!we?.wand.points.some(x=>x[2]===1)||we.wand.busy;$('hcBatchStop').hidden=!hcBatch.running;
+ // 추적 일괄 교체는 '마스크 수정 → 대상'에서 고른 마스크(손·분홍 / 물체·초록)에만 진행합니다.
+ const trackObj=$('hcEditObj').value==='0';
+ $('hcTrackApply').textContent=(trackObj?'● 물체(초록)':'● 손(분홍)')+' 추적 일괄 교체';
+ $('hcTrackApply').classList.toggle('hcTrackObject',trackObj);$('hcTrackApply').classList.toggle('hcTrackHand',!trackObj);
+ $('hcTrackApply').disabled=busy||hcBatch.running||!we?.wand.mask||we.wand.busy;
  $('hcWandApply').textContent=(ready.length>1?'마법봉 결과 적용·저장 · '+ready.map(c=>'카메라 '+(c+1)).join(', '):'마법봉 결과 적용·저장')+' (Enter)';
  for(let cam=0;cam<4;cam++){const tag=$('hcCamEdit'+cam);if(tag){const e=hcEdit.cams[cam],d=e?.ready&&e.dirty,none=e?.ready&&e.data.missing&&!d;
   // SAM3가 이 프레임에서 대상을 찾지 못해 마스크 파일이 없는 경우: 빈 마스크에서 새로 칠할 수 있습니다.
@@ -344,7 +349,7 @@ $('hcBrush').onclick=()=>hcSetTool('add');$('hcEraser').onclick=()=>hcSetTool('e
 $('hcRadius').oninput=()=>$('hcRadiusLabel').textContent=$('hcRadius').value+'px';
 $('hcEditUndo').onclick=hcEditUndo;$('hcEditRedo').onclick=hcEditRedo;
 $('hcDiscardEdits').onclick=hcEditDiscard;$('hcSaveEdits').onclick=()=>hcSaveEdits();
-$('hcWandApply').onclick=hcWandApply;$('hcBatchApply').onclick=hcBatchRun;$('hcBatchStop').onclick=()=>{hcBatch.stop=true;hcWandMessage('일괄 적용을 중지하는 중… 지금 처리 중인 프레임까지만 저장합니다.')};$('hcWandClear').onclick=hcWandClear;$('hcWandClearAll').onclick=hcWandClearAll;
+$('hcTrackApply').onclick=hcTrackRun;$('hcWandApply').onclick=hcWandApply;$('hcBatchApply').onclick=hcBatchRun;$('hcBatchStop').onclick=()=>{hcBatch.stop=true;hcWandMessage('일괄 적용을 중지하는 중… 지금 처리 중인 프레임까지만 저장합니다.')};$('hcWandClear').onclick=hcWandClear;$('hcWandClearAll').onclick=hcWandClearAll;
 $('hcWandText').oninput=()=>{hcEdit.names[Number($('hcEditObj').value)]=$('hcWandText').value};
 $('hcWandText').onchange=hcWandRerun;$('hcWandPrompt').onchange=()=>{$('hcWandText').disabled=$('hcWandPrompt').value!=='name';hcWandRerun()};$('hcWandThr').onchange=hcWandRerun;
 let hcEditObjValue=$('hcEditObj').value;
@@ -532,4 +537,47 @@ function hcRenderMaskSpots(){
   '<div class="hcSpotList">'+shown.map((x,i)=>'<button class="smallbtn'+(i===hcMaskSpotIndex?' current':'')+'" data-go="'+i+'">'+escape(hcSpotLabel(x))+'</button>').join('')+(hcMaskSpots.length>shown.length?'<span class="help">외 '+(hcMaskSpots.length-shown.length)+'건</span>':'')+'</div>'+
   '<p class="help">비어 있는 게 맞으면(예: 손에 가려 물체가 보이지 않음) 검수 의견에 사유를 적고 승인하세요. 아니면 브러시·마법봉으로 칠하고 저장하세요.</p>';
  nav.querySelectorAll('[data-go]').forEach(b=>b.onclick=()=>hcGoMaskSpot(hcMaskSpots,Number(b.dataset.go)));
+}
+
+// ---- 추적 일괄 교체 ----
+// 마지막으로 클릭한 카메라의 마법봉 결과(노란 영역)를 시드로, SAM3 트래커가 클릭한 프레임에서 앞뒤로 따라갑니다.
+// 일괄 프레임 구간(비우면 전체)의 이 카메라 손/물체 마스크를 기존 마스크가 있어도 모두 새 결과로 교체합니다
+// (추적 결과가 빈 프레임은 빈 마스크로). 이전 마스크는 워커 edit_history에 보관됩니다.
+async function hcTrackRun(){
+ if(hcBatch.running||hcEdit.saving||hcBusy)return;
+ const blocked=hcEditBlocked();if(blocked){hcWandMessage(blocked,true);return}
+ const e=hcWandEntry();
+ if(!e?.wand?.mask){hcWandMessage('먼저 품질이 나쁜 프레임에서 마법봉으로 대상을 클릭해 노란 결과를 확인하세요. 그 결과를 시드로 추적합니다.',true);return}
+ if(e.wand.busy){hcWandMessage('분할이 끝난 뒤 실행할 수 있습니다.',true);return}
+ const body=hcWandRequestBody(e),obj=e.obj,path=hcPath,token=hcToken,episode=hcMeta.episode,objName=obj===0?'물체(초록)':'손(분홍)';
+ // 마법봉 결과를 만든 뒤 대상을 바꿨다면 진행하지 않습니다(대상 전환 시 점이 지워지지만 한 번 더 확인).
+ if(String(obj)!==$('hcEditObj').value){hcWandMessage('마스크 수정 대상이 바뀌었습니다. 지금 대상으로 마법봉을 다시 클릭하세요.',true);return}
+ const [from,to]=hcBatchRange();
+ if(body.frame<from||body.frame>to){hcWandMessage('클릭한 프레임('+(body.frame+1)+')이 일괄 프레임 구간('+(from+1)+'~'+(to+1)+') 안에 있어야 합니다.',true);return}
+ if(!confirm('카메라 '+(body.cam+1)+' · '+objName+' 마스크 추적 일괄 교체\n(마스크 수정 대상: '+objName+' — 다른 대상의 마스크는 바뀌지 않습니다)\n\n프레임 '+(body.frame+1)+'의 마법봉 결과(노란 영역)를 시작점으로 SAM3가 앞뒤 프레임을 따라가며, 프레임 '+(from+1)+'~'+(to+1)+'('+(to-from+1)+'개)의 '+objName+' 마스크를 모두 새 결과로 바꿉니다.\n\n· 기존 마스크가 있어도 교체합니다. 추적에서 '+objName+'이 안 보인 프레임은 빈 마스크가 됩니다.\n· 이전 마스크는 수정 이력에 보관됩니다.\n· 프레임 수에 따라 수십 초~몇 분 걸립니다.'+(hcApproved()?'\n· 저장하면 기존 승인이 해제되고 다시 검수해야 합니다.':'')))return;
+ if(!await hcEditResolve('추적 일괄 교체'))return;
+ if(!hcMeta||hcMeta.episode!==episode||hcBatch.running)return;
+ hcBatch.running=true;hcStop();hcEditReset();hcEdit.saving=true;hcEditControls();
+ const headers={'Content-Type':'application/json','X-CSRF-Token':token};let job=null,summary='',error=false;
+ try{
+  hcWandMessage('추적 일괄 교체 · 시작하는 중…'+(hcEdit.wandLoaded?'':' 처음 한 번은 모델을 불러오느라 10~20초 걸립니다.'));
+  job=await hcRequest(path+'/wand/track',{method:'POST',headers,body:JSON.stringify({...body,obj,from,to})});
+  for(;;){
+   await new Promise(r=>setTimeout(r,1500));
+   job=await hcRequest(path+'/wand/track/'+encodeURIComponent(job.id));
+   if(job.state==='tracking'){const pg=job.progress||{};hcWandMessage('추적 일괄 교체 · 카메라 '+(body.cam+1)+' '+objName+' · '+(pg.phase==='seed'||pg.phase==='load'?'시드 만드는 중…':'추적 중 '+(pg.done||0)+'/'+(pg.total||'?')+' 프레임'));continue}
+   if(job.state==='applying'){hcWandMessage('추적 일괄 교체 · 마스크 저장 중…');continue}
+   break;
+  }
+  if(job.state==='done'){
+   const r=job.result||{},t=job.track||{};
+   summary='추적 일괄 교체 완료 · 카메라 '+(body.cam+1)+' '+objName+' · 프레임 '+(from+1)+'~'+(to+1)+' 중 교체 '+(r.changed||0)+'개'+(r.unchanged?' · 같아서 그대로 '+r.unchanged+'개':'')+((t.empty||[]).length?' · '+objName+'이 안 보여 빈 마스크 '+t.empty.length+'개':'')+' · 결과를 넘겨 보며 확인하세요.';
+  }else{summary='추적 일괄 교체 실패: '+(job.error||job.state);error=true}
+ }catch(err){summary='추적 일괄 교체 실패: '+err.message;error=true}
+ finally{hcBatch.running=false;hcEdit.saving=false;hcEdit.wandLoaded=true}
+ if(hcMeta&&hcMeta.episode===episode){
+  try{const meta=await hcRequest(path);if(meta&&hcMeta&&meta.episode===episode)hcMeta=meta}catch(_){}
+  hcImageRev++;await hcShowFrame(hcFrame,true);hcEnable();if(typeof loadJobs==='function')loadJobs();
+ }
+ hcEditControls();hcWandMessage(summary,error);
 }

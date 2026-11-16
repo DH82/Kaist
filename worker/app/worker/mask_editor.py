@@ -57,6 +57,56 @@ def wand_source(review,project,ep,cam,frame):
   if not rgb.is_file():raise ValueError('원본 RGB 프레임이 없습니다.')
   return {'rgb':str(rgb),'width':meta['WH'][0],'height':meta['WH'][1]}
 
+def track_source(review,project,ep,cam,frame):
+ # 추적 일괄 교체 입력: 이 카메라의 원본 RGB 폴더·프레임 수. 계산 중인 에피소드는 거부합니다.
+ with episode_lock(project,ep):
+  idle(ep)
+  d,draft,p,meta=target(review,project,ep,cam,0,frame)
+  color=review.source(d)/f'color/{cam}'
+  if not (color/f'{frame}.png').is_file():raise ValueError('원본 RGB 프레임이 없습니다.')
+  return {'color_dir':str(color),'frames':int(meta['frame_num']),'fps':meta.get('fps',30),'width':meta['WH'][0],'height':meta['WH'][1]}
+
+def apply_track(review,project,ep,data,operator):
+ """추적 일괄 교체: 구간 [from,to]의 이 카메라·대상 마스크를 추적 결과(dir/<프레임>.png, 없으면 빈 마스크)로 바꿉니다.
+ 기존 마스크가 있어도 교체합니다. 바뀐 프레임의 이전 파일은 edit_history/<event>/before/ 에 보관하고 이력 한 건으로 남깁니다."""
+ if not str(operator).strip():raise ValueError('검수자 정보가 필요합니다.')
+ cam,obj,a,b=data.get('cam'),data.get('obj'),data.get('from'),data.get('to')
+ src=Path(str(data.get('dir') or ''))
+ if not src.is_dir() or src.resolve().parent!=(ROOT/'wand_tracks').resolve():raise ValueError('추적 결과 폴더가 잘못되었습니다.')
+ with episode_lock(project,ep):
+  idle(ep)
+  d,draft,p,meta=target(review,project,ep,cam,obj,a)
+  target(review,project,ep,cam,obj,b)
+  if a>b:raise ValueError('구간이 잘못되었습니다.')
+  W,H=meta['WH'];event=uuid.uuid4().hex;history=None;changed=[];same=0;emptied=[]
+  for f in range(a,b+1):
+   d=review.root(project,ep);path=d/f'review/draft/mask/{cam}/{obj}/{f}.png'
+   if path.is_symlink() or (path.exists() and not path.is_file()):raise ValueError('편집할 독립 마스크 파일이 없습니다: 프레임 '+str(f+1))
+   new_file=src/f'{f}.png'
+   if new_file.exists():
+    with Image.open(new_file) as im:
+     if im.size!=(W,H):raise ValueError('추적 마스크 크기가 원본과 다릅니다.')
+     mask=im.convert('L').point(lambda v:255 if v else 0)
+   else:
+    mask=Image.new('L',(W,H),0)
+   before=path.read_bytes() if path.exists() else None
+   if before is None:
+    unchanged=not mask.getbbox()
+   else:
+    with Image.open(io.BytesIO(before)) as old:unchanged=old.convert('L').point(lambda v:255 if v else 0).tobytes()==mask.tobytes()
+   if unchanged:same+=1;continue
+   if history is None:history=d/'review/edit_history'/event;(history/'before').mkdir(parents=True)
+   if before is not None:(history/'before'/f'{f}.png').write_bytes(before)
+   review.write_mask(project,ep,cam,obj,f,mask);changed.append(f)
+   if not mask.getbbox():emptied.append(f)
+  if history is not None:
+   d=review.root(project,ep);history=d/'review/edit_history'/event
+   audit={'event':event,'kind':'track_replace','episode':ep,'camera':cam,'object':obj,'frames':[a,b],'start_frame':data.get('start'),
+          'points':data.get('points'),'text':data.get('text'),'changed_frames':changed,'emptied_frames':emptied,'unchanged':same,
+          'operator':str(operator).strip(),'time':datetime.now(ZoneInfo('Asia/Seoul')).isoformat(),'status':'saved'}
+   (history/'edit.json').write_text(json.dumps(audit,indent=2,ensure_ascii=False))
+  return {'changed':len(changed),'unchanged':same,'emptied':len(emptied),'approval':review.approval_summary(project,ep)}
+
 def decode_mask(data,expected_size):
  value=data.get('mask_png','')
  if not isinstance(value,str) or len(value)>2500000:raise ValueError('마스크 파일 크기가 너무 큽니다.')
@@ -100,12 +150,15 @@ def save_frame(review,project,ep,data,operator):
           'message':'수정 초안을 저장했습니다. 기존 승인은 해제됐으며 다시 검수·승인해야 합니다. 후속 추적·복원 결과도 새 승인본 기준으로 다시 실행해야 합니다.'}
 
 if __name__=='__main__':
- parser=argparse.ArgumentParser();parser.add_argument('action',choices=['frame','save','wand_source']);parser.add_argument('--config',required=True);parser.add_argument('--episode',required=True)
+ parser=argparse.ArgumentParser();parser.add_argument('action',choices=['frame','save','wand_source','track_source','apply_track']);parser.add_argument('--config',required=True);parser.add_argument('--episode',required=True)
  parser.add_argument('--cam',type=int);parser.add_argument('--obj',type=int);parser.add_argument('--frame',type=int);args=parser.parse_args()
  try:
   review,project,ep=context(args.config,args.episode)
   if args.action=='frame':value=frame_data(review,project,ep,args.cam,args.obj,args.frame)
   elif args.action=='wand_source':value=wand_source(review,project,ep,args.cam,args.frame)
+  elif args.action=='track_source':value=track_source(review,project,ep,args.cam,args.frame)
+  elif args.action=='apply_track':
+   payload=json.load(sys.stdin);value=apply_track(review,project,ep,payload,payload.get('operator',''))
   else:
    payload=json.load(sys.stdin);value=save_frame(review,project,ep,payload,payload.get('operator',''))
   print(json.dumps(value,ensure_ascii=False))

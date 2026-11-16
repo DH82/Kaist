@@ -94,7 +94,7 @@ async function openReview(episode,stage='mask'){
    // 자동 검사에서 표시된 이상 구간을 검수 의견 칸에 영어로 미리 적어 둡니다(비어 있고 아직 승인 전일 때만). 검수자가 고쳐 쓸 수 있습니다.
    const reasonEn={outside_mask:'Tracking points outside the mask',outside_image:'Tracking points outside the image',jump:'Sudden point jump',low_visibility:'Occlusion or low visibility',low_coverage:'Low tracking coverage'};
    if(!hcApproved()&&!$('hcNote').value.trim()&&hcMeta.events.length)$('hcNote').value=hcMeta.events.map(event=>(event.group==='cotracker_hand'?'Hand':'Object')+' · Camera '+event.camera+' · '+(reasonEn[event.reason]||event.reason)+' · Frames '+event.start_frame+'–'+event.end_frame).join('\n');
-   $('hcEvents').querySelectorAll('[data-event]').forEach(b=>b.onclick=()=>hcSeek(hcMeta.events[+b.dataset.event].start_frame));$('hcEvents').onchange=hcEnable;
+   $('hcEvents').querySelectorAll('[data-event]').forEach(b=>b.onclick=()=>hcSeek(hcMeta.events[+b.dataset.event].start_frame));$('hcEvents').onchange=()=>{hcEnable();hcEventsAllSync()};hcEventsFit();hcEventsAllSync();
   }
   hcStatus('');hcEnable();
   // 이미 승인된 검수를 열면 그 뒤 진행 중인 단계의 로그를 바로 보여 줍니다.
@@ -235,3 +235,109 @@ async function hcFollowTick(){
  }catch(e){box.querySelector('.jobLogText').textContent='로그를 불러오지 못했습니다: '+e.message}
  finally{hcFollow.busy=false}
 }
+
+// ---- 카메라 3·4 아래 재생 컨트롤: 위 컨트롤과 같은 동작, 상태(활성·글자·프레임·슬라이더)는 항상 위와 같게 ----
+function hcMirrorSync(){
+ document.querySelectorAll('[data-hc-mirror]').forEach(b=>{const src=$(b.dataset.hcMirror);if(src){b.disabled=src.disabled;b.textContent=src.textContent}});
+ document.querySelectorAll('[data-hc-mirror-label]').forEach(l=>{const src=$(l.dataset.hcMirrorLabel);if(src)l.textContent=src.textContent});
+ const top=$('hcSlider'),bottom=$('hcSliderBottom');if(top&&bottom){bottom.max=top.max;bottom.value=top.value;bottom.disabled=top.disabled}
+}
+document.querySelectorAll('[data-hc-mirror]').forEach(b=>b.addEventListener('click',()=>{const src=$(b.dataset.hcMirror);if(src&&!src.disabled)src.click()}));
+$('hcSliderBottom').oninput=e=>{$('hcSlider').value=e.target.value;$('hcSlider').dispatchEvent(new Event('input'))};
+// 위 컨트롤의 글자·활성 상태와 프레임 표시가 바뀔 때마다 아래를 맞춥니다(슬라이더 위치는 프레임 표시와 함께 바뀜).
+new MutationObserver(hcMirrorSync).observe(document.querySelector('#hcMask .hcToolbar'),{subtree:true,childList:true,characterData:true,attributes:true,attributeFilter:['disabled','max']});
+hcMirrorSync();
+
+// ---- 확인이 필요한 구간: 처음엔 2개 높이만 보이고, 스크롤(휠·스크롤바) 또는 마우스로 끌어서 아래 항목을 확인 ----
+const HC_EVENTS_VISIBLE=2;
+function hcEventsFit(){
+ const box=$('hcEvents'),items=box.querySelectorAll('.hcEvent');box.scrollTop=0;
+ box.classList.toggle('hcEventsScroll',items.length>HC_EVENTS_VISIBLE);
+ let hint=$('hcEventsHint');
+ if(!hint){hint=document.createElement('p');hint.id='hcEventsHint';hint.className='help';box.parentNode.insertBefore(hint,box.nextSibling)}
+ if(items.length<=HC_EVENTS_VISIBLE){box.style.maxHeight='';hint.textContent='';return}
+ // 화면에 그려진 뒤 3번째 항목 시작 위치까지를 보이는 높이로 둡니다.
+ // 목록 상자가 기준(position:relative)이라 항목의 offsetTop은 상자 안 위치입니다. 숨겨진 상태면 0이므로 보일 때까지 다시 잽니다.
+ box.style.maxHeight='17rem';
+ let tries=0;const measure=()=>{const third=box.querySelectorAll('.hcEvent')[HC_EVENTS_VISIBLE];if(!third)return;
+  if(third.offsetTop>0)box.style.maxHeight=(third.offsetTop-6)+'px';else if(++tries<40)setTimeout(measure,250)};
+ requestAnimationFrame(measure);
+ hint.textContent='총 '+items.length+'개 중 '+HC_EVENTS_VISIBLE+'개씩 표시 · 아래로 스크롤하거나 끌어서 나머지를 확인하세요.';
+}
+(()=>{
+ const box=$('hcEvents');let drag=null;
+ box.addEventListener('pointerdown',e=>{
+  if(!box.classList.contains('hcEventsScroll')||e.button!==0||e.target.closest('button,input,label,a'))return;
+  drag={y:e.clientY,top:box.scrollTop,moved:false};box.setPointerCapture(e.pointerId);
+ });
+ box.addEventListener('pointermove',e=>{if(!drag)return;const dy=e.clientY-drag.y;if(Math.abs(dy)>3){drag.moved=true;box.classList.add('hcEventsDragging')}box.scrollTop=drag.top-dy});
+ const end=()=>{drag=null;box.classList.remove('hcEventsDragging')};
+ box.addEventListener('pointerup',end);box.addEventListener('pointercancel',end);
+})();
+
+// ---- 일괄 확인 완료: 확인이 필요한 구간을 모두 확인 완료로 표시(다시 누르면 모두 해제) ----
+function hcEventsAllSync(){
+ const b=$('hcEventsAll'),checks=[...document.querySelectorAll('.hcEventCheck')],usable=checks.filter(c=>!c.disabled);
+ b.hidden=!checks.length;b.disabled=!usable.length;
+ const all=usable.length&&usable.every(c=>c.checked);
+ b.textContent=all?'↺ 모두 해제':'✔ 일괄 확인 완료 ('+usable.filter(c=>c.checked).length+'/'+usable.length+')';
+}
+$('hcEventsAll').onclick=()=>{
+ const usable=[...document.querySelectorAll('.hcEventCheck')].filter(c=>!c.disabled);if(!usable.length)return;
+ const all=usable.every(c=>c.checked);
+ if(!all&&!confirm('확인이 필요한 구간 '+usable.length+'개를 모두 확인 완료로 표시합니다.\n각 구간을 실제로 확인했는지 다시 한 번 살펴보세요. 진행할까요?'))return;
+ usable.forEach(c=>{c.checked=!all});hcEnable();hcEventsAllSync();
+};
+
+// ---- 오른쪽 위 알림: 마스크 승인 대기 · 추적 승인 대기가 새로 생기면 알려 줍니다 ----
+// 20초마다 내 검수 목록(작업자는 본인 것, 관리자는 전체)을 확인해, 처음 보는 대기 항목만 알림으로 띄웁니다.
+// 이미 본 항목은 이 브라우저 세션 동안 기억하므로 새로고침해도 다시 뜨지 않습니다. 검수가 끝난 항목의 알림은 자동으로 닫힙니다.
+const HC_ALERT_MS=20000,HC_ALERT_MAX=5;
+let hcAlertSeen=null,hcAlertUser='',hcAlertBusy=false;
+function hcAlertKey(x){return x.episode+'|'+x.stage}
+function hcAlertStore(){try{sessionStorage.setItem('kaistAlertSeen:'+hcAlertUser,JSON.stringify([...hcAlertSeen]))}catch(e){}}
+function hcAlertClose(el){if(el&&el.parentNode)el.remove()}
+function hcAlertShow({key,title,episode,meta,kind,stage}){
+ const box=$('hcAlerts');if(key&&box.querySelector('[data-key="'+CSS.escape(key)+'"]'))return;
+ const el=document.createElement('div');el.className='hcAlert '+kind;if(key)el.dataset.key=key;el.setAttribute('role','alert');
+ el.innerHTML='<b>'+escape(title)+'</b>'+(episode?'<div class="hcAlertEp">'+escape(episode)+'</div>':'')+(meta?'<div class="hcAlertMeta">'+escape(meta)+'</div>':'')+
+  '<div class="hcAlertActions">'+(episode||kind==='summary'?'<button class="smallbtn primary" data-act="open">검수 열기</button>':'')+'<button class="smallbtn" data-act="close">닫기</button></div>';
+ el.querySelector('[data-act="close"]').onclick=()=>hcAlertClose(el);
+ const open=el.querySelector('[data-act="open"]');
+ if(open)open.onclick=()=>{hcAlertClose(el);if(episode)openReview(episode,stage);else{show('review');if(typeof loadHcQueue==='function')loadHcQueue()}};
+ box.prepend(el);while(box.children.length>HC_ALERT_MAX)box.lastElementChild.remove();
+}
+async function hcAlertPoll(){
+ if(hcAlertBusy||!currentUser||document.hidden)return;
+ hcAlertBusy=true;
+ try{
+  if(hcAlertUser!==currentUser.name+'/'+currentUser.role){
+   hcAlertUser=currentUser.name+'/'+currentUser.role;$('hcAlerts').innerHTML='';
+   try{hcAlertSeen=new Set(JSON.parse(sessionStorage.getItem('kaistAlertSeen:'+hcAlertUser)||'null')||[])}catch(e){hcAlertSeen=null}
+  }
+  const d=await hcRequest(HC_BASE+'/queue');if(!currentUser)return;
+  const pending=(d.reviews||[]).filter(x=>x.status!=='approved'&&(x.stage==='mask'||x.stage==='tracking'));
+  const keys=new Set(pending.map(hcAlertKey));
+  // 검수가 끝나 대기 목록에서 빠진 항목의 알림은 닫습니다.
+  $('hcAlerts').querySelectorAll('.hcAlert[data-key]').forEach(el=>{if(!keys.has(el.dataset.key))hcAlertClose(el)});
+  if(hcAlertSeen===null){
+   // 이 세션의 첫 확인: 이미 대기 중인 것은 한 번에 요약해서 알려 줍니다.
+   hcAlertSeen=new Set(keys);hcAlertStore();
+   const m=pending.filter(x=>x.stage==='mask').length,t=pending.length-m;
+   if(pending.length)hcAlertShow({kind:'summary',title:'검수 대기 '+pending.length+'건',meta:[m?'마스크 승인 대기 '+m+'건':'',t?'추적 승인 대기 '+t+'건':''].filter(Boolean).join(' · ')});
+   return;
+  }
+  for(const x of pending){
+   const k=hcAlertKey(x);if(hcAlertSeen.has(k))continue;hcAlertSeen.add(k);
+   hcAlertShow({key:k,kind:x.stage,stage:x.stage,episode:x.episode,title:x.stage==='mask'?'🟡 마스크 승인 대기':'🟣 추적 승인 대기',
+    meta:(x.worker_label||'')+(x.frames?' · '+x.frames+'프레임':'')+' · '+new Date().toLocaleTimeString('ko-KR',{hour:'2-digit',minute:'2-digit'})});
+  }
+  // 승인돼 목록에서 빠진 항목은 기억에서 지워, 다시 대기가 되면(재실행 등) 또 알려 줍니다.
+  for(const k of [...hcAlertSeen])if(!keys.has(k))hcAlertSeen.delete(k);
+  hcAlertStore();
+ }catch(e){/* 알림 확인 실패는 화면 동작에 영향을 주지 않습니다 */}
+ finally{hcAlertBusy=false}
+}
+setInterval(hcAlertPoll,HC_ALERT_MS);
+document.addEventListener('visibilitychange',()=>{if(!document.hidden)hcAlertPoll()});
+setTimeout(hcAlertPoll,3000);

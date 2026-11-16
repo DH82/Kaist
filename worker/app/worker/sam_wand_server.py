@@ -8,6 +8,12 @@ GPU 잠금과 유휴 종료는 이 프로세스를 띄운 worker_service가 관�
   - text가 있으면 SAM3 개념(텍스트) 검출로 같은 종류의 물체를 모두 찾은 뒤, 첫 양성 클릭이 들어간 물체를 고르고
     나머지 클릭으로 그 물체를 다듬습니다. 클릭 위치에 해당 물체가 없으면 클릭만으로 분할합니다.
 응답: {"ok": true, "mask_png": base64, "width", "height", "method", "score", "instances", "message"}
+
+추적 일괄 교체 요청: {"type": "track", "color_dir": "<.../color/<cam>>", "start": f, "from": a, "to": b, "fps": 30,
+                    "points": [...], "text": "", "threshold": 0.5, "out": "<새 폴더>"}
+  - start 프레임에서 위와 같은 방법으로 시드 마스크를 만들고, SAM3 트래커로 start→to(정방향), start→from(역방향)
+    전파합니다. 프레임별 마스크를 out/<프레임>.png 로 쓰고(빈 프레임은 파일 없음), 진행률은 out/progress.json.
+  응답: {"ok": true, "frames": [a, b], "start", "nonempty", "empty": [...], "seed_area", "method", "message"}
 """
 import base64, io, json, os, sys, time, traceback
 
@@ -75,6 +81,13 @@ def add(sid, **kw):
 
 
 def segment(req):
+    mask, info = seed_mask(req)
+    out = io.BytesIO()
+    Image.fromarray((mask.astype(np.uint8) * 255)).save(out, format='PNG')
+    return {'ok': True, 'mask_png': base64.b64encode(out.getvalue()).decode(), **info}
+
+
+def seed_mask(req):
     path = req['image']
     if not os.path.isfile(path):
         raise ValueError('원본 RGB 프레임이 없습니다.')
@@ -130,10 +143,75 @@ def segment(req):
         method = 'points'
         message = message or '클릭 위치로 분할했습니다.'
 
-    out = io.BytesIO()
-    Image.fromarray((mask.astype(np.uint8) * 255)).save(out, format='PNG')
-    return {'ok': True, 'mask_png': base64.b64encode(out.getvalue()).decode(), 'width': W, 'height': H,
-            'method': method, 'score': score, 'instances': instances, 'area': int(mask.sum()), 'message': message}
+    return mask, {'width': W, 'height': H, 'method': method, 'score': score, 'instances': instances,
+                  'area': int(mask.sum()), 'message': message}
+
+
+def track(req):
+    """클릭한 프레임의 시드 마스크를 SAM3 트래커로 앞뒤로 전파합니다(sam_object_point_track.py와 같은 추적 경로)."""
+    import subprocess
+    color, out = req['color_dir'], req['out']
+    a, b, s = int(req['from']), int(req['to']), int(req['start'])
+    if not (0 <= a <= s <= b):
+        raise ValueError('추적 구간이 잘못되었습니다.')
+    os.makedirs(out)  # 새 폴더만 사용
+    n = b - a + 1
+    def progress(done, phase):
+        tmp = os.path.join(out, '.progress.tmp')
+        with open(tmp, 'w') as f:
+            json.dump({'done': done, 'total': n, 'phase': phase}, f)
+        os.replace(tmp, os.path.join(out, 'progress.json'))
+    progress(0, 'seed')
+    seed, info = seed_mask(dict(req, image=os.path.join(color, f'{s}.png')))
+    H, W = seed.shape
+    # 구간만 무손실 mp4로 만듭니다(원본 PNG는 바꾸지 않음). 영상 안 프레임 번호 = 원래 번호 - a
+    video = os.path.join(out, 'track_input.mp4')
+    subprocess.run(['ffmpeg', '-v', 'error', '-n', '-framerate', str(req.get('fps') or 30), '-start_number', str(a),
+                    '-i', os.path.join(color, '%d.png'), '-frames:v', str(n), '-c:v', 'libx264rgb', '-crf', '0',
+                    '-preset', 'fast', video], check=True)
+    sid = PREDICTOR.handle_request(request=dict(type='start_session', resource_path=video,
+                                                offload_video_to_cpu=True))['session_id']
+    model = PREDICTOR.model
+    nonempty, empty, done, last = 0, [], 0, 0.0
+    try:
+        state = PREDICTOR._get_session(sid)['state']
+        init = torch.from_numpy(seed.astype(np.float32) * 2 - 1).to(model.device)[None]
+        # 정방향(start→to), 역방향(start→from). 방향마다 시드에서 새 추적을 시작합니다.
+        for reverse, frames in ((False, range(s - a, n)), (True, range(s - a, -1, -1))):
+            model._prepare_backbone_feats(state, s - a, False)
+            trackers = model._tracker_add_new_objects(
+                frame_idx=s - a, num_frames=n, new_obj_ids=[0], new_obj_masks=init, tracker_states_local=[],
+                orig_vid_height=H, orig_vid_width=W, feature_cache=state['feature_cache'])
+            for f in frames:
+                model._prepare_backbone_feats(state, f, False)
+                ids, low, _ = model._propogate_tracker_one_frame_local_gpu(
+                    trackers, frame_idx=f, reverse=reverse, run_mem_encoder=True)
+                if reverse and f == s - a:
+                    continue  # 시작 프레임은 정방향에서 이미 저장
+                if list(ids) != [0]:
+                    raise RuntimeError(f'추적 결과가 예상과 다릅니다: {ids} (프레임 {f + a})')
+                # 시작 프레임은 화면에서 확인한 시드 마스크를 그대로 씁니다.
+                m = seed if f == s - a else model._convert_low_res_mask_to_video_res(low[0], state).detach().cpu().numpy().astype(bool).squeeze()
+                if m.shape != (H, W):
+                    raise RuntimeError(f'마스크 크기가 다릅니다: {m.shape}')
+                if m.any():
+                    Image.fromarray(m.astype(np.uint8) * 255).save(os.path.join(out, f'{f + a}.png'))
+                    nonempty += 1
+                else:
+                    empty.append(f + a)
+                done += 1
+                if time.monotonic() - last > 1.5:
+                    progress(done, 'track'); last = time.monotonic()
+    finally:
+        try:
+            PREDICTOR.handle_request(request=dict(type='close_session', session_id=sid))
+        except Exception:
+            pass
+        if os.path.exists(video):
+            os.unlink(video)
+    progress(n, 'done')
+    return {'ok': True, 'frames': [a, b], 'start': s, 'nonempty': nonempty, 'empty': sorted(empty),
+            'seed_area': int(seed.sum()), 'method': info['method'], 'message': info['message']}
 
 
 PROTO.write(json.dumps({'ready': True}) + '\n'); PROTO.flush()
@@ -142,7 +220,8 @@ for line in sys.stdin:
         continue
     try:
         with torch.inference_mode():
-            resp = segment(json.loads(line))
+            req = json.loads(line)
+            resp = track(req) if req.get('type') == 'track' else segment(req)
     except Exception as e:
         traceback.print_exc(file=sys.stderr)
         resp = {'ok': False, 'error': str(e)}
