@@ -11,7 +11,7 @@ const DASH_WAITS=[['mask','마스크 검수 대기','sam3','preflight'],['tracki
 // 에피소드 진행 막대의 구간(색)
 const DASH_PHASES=[['전처리',['prepare_raw'],'#c9c3f5'],['SAM3',['sam3'],'#8f80e8'],['추적',['preflight','track'],'#5fb3d9'],['3D 복원',['prepare_reconstruction','reconstruct'],'#4b9b7a'],['MANO',['adopt','hands'],'#e3a548'],['검사·저장',['validate','publish'],'#d9788c']];
 function dashName(s){return (typeof taskName!=='undefined'&&taskName[s])||({adopt:'이관 받기'})[s]||s}
-function dashPage(on){clearInterval(dashTimer);dashTimer=null;if(on){if(!$('dashDate').value)$('dashDate').value=dashDay(Date.now()/1000);dashSetTab(dashTab);loadDash();dashTimer=setInterval(()=>{if(!document.hidden)loadDash(true)},30000)}}
+function dashPage(on){clearInterval(dashTimer);dashTimer=null;clearInterval(updTimer);updTimer=null;if(on){loadUpd(true);updTimer=setInterval(()=>{if(!document.hidden)loadUpd()},5000);if(!$('dashDate').value)$('dashDate').value=dashDay(Date.now()/1000);dashSetTab(dashTab);loadDash();dashTimer=setInterval(()=>{if(!document.hidden)loadDash(true)},30000)}}
 function dashDay(t){const d=new Date(t*1000);return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0')}
 function dashDur(s){if(s==null||!isFinite(s)||s<0)return '—';s=Math.round(s);if(s<60)return s+'초';const m=Math.floor(s/60);if(m<60)return m+'분 '+String(s%60).padStart(2,'0')+'초';const h=Math.floor(m/60);return h+'시간 '+String(m%60).padStart(2,'0')+'분'}
 function dashHM(t){if(!t)return '';const d=new Date(t*1000);return String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0')}
@@ -239,11 +239,82 @@ async function dashUpdate(pcs,action){
  if(!pcs.length){alert('업데이트할 PC가 없습니다. (업데이트 타이머가 설치되어 있고 요청 대기 중이 아닌 PC)');return}
  const names=pcs.map(dashPcName).join(', ');
  if(action==='request'&&!confirm(names+'에 GitHub 최신 코드를 반영합니다.\n\n· 각 PC는 진행 중인 GPU 작업이 끝난 뒤 서비스를 재시작합니다.\n· 업데이트가 끝날 때까지 해당 PC에서 새 RAW 실행·MANO 일괄 실행을 시작할 수 없습니다.\n\n진행할까요?'))return;
- try{const r=await api('/api/fleet/update',{method:'POST',body:JSON.stringify({pcs,action})});$('dashMsg').hidden=false;$('dashMsg').textContent=(action==='request'?'업데이트 요청: ':'요청 취소: ')+(r.pcs.map(dashPcName).join(', ')||'없음');loadDash(true)}
+ try{const r=await api('/api/fleet/update',{method:'POST',body:JSON.stringify({pcs,action})});$('dashMsg').hidden=false;$('dashMsg').textContent=(action==='request'?'업데이트 요청: ':'요청 취소: ')+(r.pcs.map(dashPcName).join(', ')||'없음');loadDash(true);loadUpd(true)}
  catch(e){alert('업데이트 요청 실패: '+e.message)}
 }
 $('dashPcs').addEventListener('click',e=>{const b=e.target.closest('[data-upd-pc],[data-upd-cancel]');if(!b)return;b.dataset.updPc?dashUpdate([b.dataset.updPc],'request'):dashUpdate([b.dataset.updCancel],'cancel')});
 $('dashUpdateAll').onclick=()=>{const d=dashData;if(!d)return;dashUpdate(d.pcs.filter(p=>p.update&&p.update.status&&!p.update.request).map(p=>p.pc),'request')};
+// ---- 업데이트 진행 패널: 요청이 걸렸거나 최근 6시간 안에 끝난 PC. 진행 중이면 5초마다 갱신 ----
+let updData=null,updTimer=null,updFetched=0,updBusy=false;
+const UPD_ACTIVE=['building','restarting','waiting','rollback','paused'];
+const UPD_LABEL={building:'빌드 중',restarting:'재시작 중',waiting:'재시작 대기',rollback:'되돌리는 중',paused:'보류',done:'완료',failed:'실패',idle:'대기'};
+const updOpen=new Set();
+function updIsActive(p){return !!p.request||UPD_ACTIVE.includes(p.status?.state)}
+function updRun(p){return p.status?.run||(p.request?null:p.status?.last?.run)}
+function updShown(p){const st=p.status;return updIsActive(p)||!!(st&&st.last&&st.last.run&&Date.now()/1000-st.last.at<6*3600)}
+function updAgo(t){return t?dashDur(Date.now()/1000-t):'—'}
+function updPhases(p,run){
+ const st=p.status,list=[...(st.phases||[])];
+ if(run.phases?.rollback)list.push(['rollback','되돌리기']);
+ const keys=list.map(x=>x[0]),reached=keys.filter(k=>run.phases?.[k]),lastIdx=Math.max(-1,...reached.map(k=>keys.indexOf(k)));
+ const finished=!!run.finished;
+ return '<div class="dbPh">'+list.map(([k,label],i)=>{
+  const ph=run.phases?.[k];
+  if(ph){
+   const cur=!finished&&run.phase===k,end=ph.end||(cur?null:Date.now()/1000);
+   const failed=finished&&!run.ok&&run.phase===k;
+   return '<span class="'+(failed?'fail':cur?'cur':'ok')+'">'+(failed?'✕ ':cur?'● ':'✓ ')+escape(label)+' '+dashDur((end||Date.now()/1000)-ph.start)+'</span>';
+  }
+  return i<lastIdx?'<span class="skip" title="필요 없어 건너뜀">'+escape(label)+'</span>':'<span>○ '+escape(label)+'</span>';
+ }).join('')+'</div>';
+}
+function updBuild(groups){
+ if(!groups||!groups.length)return '';
+ return '<div class="dbBuild">'+groups.map(g=>{const pct=g.total?Math.round(100*g.done/g.total):0;
+  return '<span>'+escape(g.label)+'</span><div class="bar"><i style="width:'+pct+'%"></i></div><span>'+g.done+'/'+g.total+(g.cached?' · 캐시 '+g.cached:'')+'</span>'}).join('')+'</div>';
+}
+function updRow(p){
+ const st=p.status,rq=p.request,name=dashPcName(p.pc);
+ if(!st)return '<div class="dbUpdRow"><div class="dbUpdTop"><b>'+name+'</b><span class="dbState failed">업데이트 타이머 없음</span><span class="dbSub">요청 '+updAgo(rq?.at)+' 전 · 이 PC에서 repro/install_updater.sh를 설치해야 진행됩니다.</span></div></div>';
+ const run=updRun(p),now=Date.now()/1000,stale=now-(st.updated||0)>600;
+ const state=rq&&!run?'요청 접수 대기':stale&&updIsActive(p)?'업데이터 응답 없음':(UPD_LABEL[st.state]||st.state);
+ const cls=stale&&updIsActive(p)||st.state==='failed'||(run&&run.finished&&!run.ok)?'failed':st.state==='done'||(run&&run.ok)?'success':updIsActive(p)?'running':'';
+ let h='<div class="dbUpdRow" data-upd-row="'+p.pc+'"><div class="dbUpdTop"><b>'+name+'</b><span class="dbState '+cls+'">'+escape(state)+'</span>';
+ if(run){
+  const from=String(run.from||'').slice(0,7),to=String(run.to||st.commit||'').slice(0,7);
+  h+='<span class="dbSub">'+(from&&from!==to?from+' → '+to+' · ':to?to+' · ':'')+(run.finished?'소요 '+dashDur(run.finished-run.started)+' · '+dashClock(run.finished)+' 종료':'시작 '+dashHM(run.started)+' · 경과 '+updAgo(run.started))+(run.requested_by?' · 요청 '+escape(run.requested_by):'')+'</span>';
+ }else if(rq)h+='<span class="dbSub">요청 '+updAgo(rq.at)+' 전 · 타이머가 3분 안에 가져갑니다</span>';
+ h+='</div>';
+ if(run)h+=updPhases(p,run);
+ const live=!run?.finished&&st.progress;
+ const groups=live&&st.progress.groups?.length?st.progress.groups:run?.build?.groups;
+ if(groups&&(!run?.finished||!run.ok))h+=updBuild(groups);
+ else if(groups&&run?.finished)h+='<div class="dbStep">빌드 층 '+groups.map(g=>escape(g.label)+' '+g.done+'/'+g.total+(g.cached?' (캐시 '+g.cached+')':'')).join(' · ')+'</div>';
+ if(live)for(const c of st.progress.current||[])h+='<div class="dbStep">▸ ['+escape(c.label)+' '+c.i+'/'+c.n+'] '+escape(c.text)+' · '+dashDur(c.elapsed)+(c.last?'<br><code>'+escape(c.last)+'</code>':'')+'</div>';
+ const msg=run?.finished?(st.last?.message||''):st.message;
+ if(msg)h+='<div class="dbStep">'+escape(msg)+'</div>';
+ const tail=live?st.progress.tail:null;
+ if(tail&&tail.length)h+='<details'+(updOpen.has(p.pc)?' open':'')+' data-upd-log="'+p.pc+'"><summary>최근 로그 '+tail.length+'줄</summary><pre>'+escape(tail.join('\n'))+'</pre></details>';
+ return h+'</div>';
+}
+function renderUpd(){
+ const box=$('dashUpd'),pcs=(updData?.pcs||[]).filter(updShown);
+ box.hidden=!pcs.length;if(!pcs.length){box.innerHTML='';return}
+ const n=f=>pcs.filter(f).length;
+ const running=n(p=>p.status&&['building','restarting','rollback'].includes(p.status.state));
+ const waiting=n(p=>updIsActive(p)&&!(p.status&&['building','restarting','rollback'].includes(p.status.state)));
+ const done=n(p=>!updIsActive(p)&&p.status?.last?.ok),failed=n(p=>!updIsActive(p)&&p.status?.last&&!p.status.last.ok);
+ box.innerHTML='<div class="dbUpdHead"><b>업데이트 진행</b><span class="dbUpdSum">'+(running?'<span>진행 중 '+running+'</span>':'')+(waiting?'<span>대기 '+waiting+'</span>':'')+(done?'<span>완료 '+done+'</span>':'')+(failed?'<span class="bad">실패 '+failed+'</span>':'')+'<span>'+(pcs.some(updIsActive)?'5초마다 갱신':'최근 6시간')+'</span></span></div>'+pcs.map(updRow).join('');
+}
+async function loadUpd(force){
+ if(updBusy)return;
+ const active=(updData?.pcs||[]).some(updIsActive);
+ if(!force&&!active&&Date.now()-updFetched<30000)return;
+ updBusy=true;
+ try{updData=await api('/api/fleet/updates');updFetched=Date.now();renderUpd()}catch(e){}
+ finally{updBusy=false}
+}
+$('dashUpd').addEventListener('toggle',e=>{const d=e.target.closest('[data-upd-log]');if(d)d.open?updOpen.add(d.dataset.updLog):updOpen.delete(d.dataset.updLog)},true);
 function dashLogRows(){
  const d=dashData;if(!d)return [];
  const day=$('dashDate').value,pc=$('dashPc').value,st=$('dashFStage').value,state=$('dashFState').value,q=$('dashFText').value.trim().toLowerCase(),checks=$('dashFChecks').checked;

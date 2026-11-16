@@ -21,10 +21,12 @@ kaist-ui만 재시작합니다. GPU Worker·파이프라인 사본(~/Desktop/wor
   python3 repro/update_stack.py --status   # 상태만 출력
 """
 import argparse
+from collections import deque
 import fcntl
 import json
 import os
 from pathlib import Path
+import re
 import socket
 import sqlite3
 import subprocess
@@ -39,6 +41,60 @@ BRANCH = 'main'
 PINNED = ('pipeline/',)          # 실행 시작 때 해시를 고정하는 파이프라인 코드
 STALE = 120                      # UI 상태 파일이 이보다 오래되면 '쉬는지 모름'으로 봅니다
 LOCAL = ROOT / 'state' / 'updater'
+REPORT_EVERY = 5                 # 빌드·재시작 중 NAS 상태 갱신 간격(초)
+# 관리자 대시보드에 보이는 단계. rollback은 실패했을 때만 나타납니다.
+PHASES = {'docker': [['fetch', '코드 받기'], ['build', '이미지 빌드'], ['check', 'GPU 점검'], ['wait', '작업 종료 대기'],
+                     ['restart', '서비스 재시작'], ['verify', 'UI 확인']],
+          'native': [['fetch', '코드 받기'], ['restart', 'UI 재시작']]}
+
+
+class BuildProgress:
+    """start_stack.py 출력(docker compose --progress plain + '==> [phase] x' 표시)에서 진행도를 뽑습니다."""
+    STEP = re.compile(r'^#(\d+) \[([^\]]*?)\s*(\d+)/(\d+)\]\s*(.*)')
+    END = re.compile(r'^#(\d+) (DONE|CACHED|ERROR|CANCELED)\b')
+    OUT = re.compile(r'^#(\d+) \d+(?:\.\d+)? (.*)')
+    PHASE = re.compile(r'^==> \[phase\] (\w+)')
+    ANSI = re.compile(r'\x1b\[[0-9;?]*[A-Za-z]')
+
+    def __init__(self):
+        self.steps, self.totals, self.tail = {}, {}, deque(maxlen=15)
+
+    def feed(self, line):
+        """한 줄 처리. 단계 표시 줄이면 단계 이름을 돌려줍니다."""
+        line = self.ANSI.sub('', line).rstrip()
+        if not line.strip():
+            return None
+        m = self.PHASE.match(line)
+        if m:
+            return m.group(1)
+        self.tail.append(line[:240])
+        now = time.time()
+        if m := self.STEP.match(line):
+            sid, label, i, n, text = m.groups()
+            label = label.strip() or 'build'
+            self.totals[label] = int(n)
+            self.steps.setdefault(sid, {'label': label, 'i': int(i), 'n': int(n), 'text': text[:160], 'start': now})
+        elif m := self.END.match(line):
+            st = self.steps.get(m.group(1))
+            if st and 'end' not in st:
+                st.update(end=now, result=m.group(2).lower())
+        elif m := self.OUT.match(line):
+            st = self.steps.get(m.group(1))
+            if st:
+                st['last'] = m.group(2)[:200]
+        return None
+
+    def snapshot(self):
+        groups = []
+        for label, total in self.totals.items():
+            mine = [x for x in self.steps.values() if x['label'] == label]
+            groups.append({'label': label, 'total': total, 'done': sum('end' in x for x in mine),
+                           'cached': sum(x.get('result') == 'cached' for x in mine)})
+        now = time.time()
+        current = [{'label': x['label'], 'i': x['i'], 'n': x['n'], 'text': x['text'], 'last': x.get('last'),
+                    'elapsed': round(now - x['start'])} for x in self.steps.values() if 'end' not in x]
+        current.sort(key=lambda x: -x['elapsed'])
+        return {'groups': groups, 'current': current[:4], 'tail': list(self.tail)}
 
 
 def log(*a):
@@ -81,6 +137,8 @@ class Updater:
         self.local = read_json(LOCAL / 'state.json') or {}
         self.mode = os.environ.get('KAIST_UPDATE_MODE') or self.detect_mode()
         self.status = {}
+        self.progress = None
+        self.cur = ('idle', '')
 
     # ---------- 공통 ----------
     def detect_mode(self):
@@ -98,6 +156,36 @@ class Updater:
     def request(self):
         return read_json(self.dir / 'request.json')
 
+    # ---------- 진행 기록 (관리자 대시보드용) ----------
+    def begin_run(self, req):
+        run = self.local.get('run')
+        if run and run.get('id') == req.get('id'):
+            return
+        self.save_local(run={'id': req.get('id'), 'requested_by': req.get('requested_by'), 'requested_at': req.get('at'),
+                             'started': time.time(), 'from': git('rev-parse', 'HEAD'), 'phase': None, 'phases': {}})
+
+    def set_phase(self, name):
+        run = self.local.get('run')
+        if not run or run.get('phase') == name:
+            return
+        now = time.time()
+        if run.get('phase'):
+            run['phases'][run['phase']].setdefault('end', now)
+        run['phases'].setdefault(name, {'start': now})
+        run['phases'][name].pop('end', None)
+        run['phase'] = name
+        self.save_local(run=run)
+
+    def end_run(self, ok):
+        run = self.local.get('run')
+        if not run:
+            return None
+        now = time.time()
+        if run.get('phase'):
+            run['phases'][run['phase']].setdefault('end', now)
+        run.update(finished=now, ok=ok, to=git('rev-parse', 'HEAD'))
+        return run
+
     def finish_request(self, req):
         if not req:
             return
@@ -109,6 +197,7 @@ class Updater:
             pass
 
     def report(self, state, message='', **extra):
+        self.cur = (state, message)
         head = git('rev-parse', 'HEAD')
         remote = git('rev-parse', f'origin/{BRANCH}', check=False) or None
         behind = int(git('rev-list', '--count', f'HEAD..origin/{BRANCH}', check=False) or 0) if remote else None
@@ -117,7 +206,9 @@ class Updater:
                            commit=head, subject=git('log', '-1', '--format=%s'), commit_time=int(git('log', '-1', '--format=%ct')),
                            remote=remote, remote_subject=git('log', '-1', '--format=%s', remote, check=False) if remote else None,
                            behind=behind, dirty=bool(self.dirty()), request=req, built=self.local.get('built'),
-                           deployed=self.local.get('deployed'), last=self.local.get('last'), updated=time.time(), **extra)
+                           deployed=self.local.get('deployed'), last=self.local.get('last'), updated=time.time(),
+                           phases=PHASES.get(self.mode), run=self.local.get('run'),
+                           progress=self.progress.snapshot() if self.progress else None, **extra)
         if self.control.is_dir():
             try:
                 write_json(self.dir / 'status.json', self.status)
@@ -205,17 +296,37 @@ class Updater:
     def start_stack(self, *flags):
         cmd = [sys.executable, str(ROOT / 'repro/start_stack.py'), '--env-file', str(self.env_file), *flags]
         log('실행:', ' '.join(cmd))
+        self.progress = BuildProgress()
+        env = dict(os.environ, KAIST_COMPOSE_PROGRESS='plain', PYTHONUNBUFFERED='1')
         with (LOCAL / 'last_run.log').open('a') as out:
             out.write(f'\n===== {time.strftime("%F %T")} {" ".join(flags) or "full"} =====\n')
             out.flush()
-            r = subprocess.run(cmd, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
-        if r.returncode:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                    env=env, text=True, errors='replace', bufsize=1)
+            last = 0
+            for line in proc.stdout:
+                out.write(line)
+                phase = self.progress.feed(line)
+                if phase:
+                    self.set_phase(phase)
+                if phase or time.time() - last >= REPORT_EVERY:
+                    out.flush()
+                    self.report(*self.cur)
+                    last = time.time()
+            returncode = proc.wait()
+        run = self.local.get('run')
+        if run and self.progress.totals:
+            run['build'] = {'groups': self.progress.snapshot()['groups'], 'flags': ' '.join(flags) or 'full', 'ok': returncode == 0}
+            self.save_local(run=run)
+        if returncode:
             tail = (LOCAL / 'last_run.log').read_text(errors='replace').strip().splitlines()[-3:]
             raise RuntimeError(f'start_stack {" ".join(flags)} 실패: ' + ' / '.join(tail)[-400:])
 
     def rollback(self, prev, restart):
         if not prev or prev == git('rev-parse', 'HEAD'):
             return ''
+        self.set_phase('rollback')
+        self.report('rollback', f'실패 → 이전 커밋 {prev[:7]}로 되돌리는 중')
         git('reset', '--hard', '--quiet', prev)
         self.save_local(built=None)
         try:
@@ -226,12 +337,16 @@ class Updater:
             return f' → 이전 커밋 {prev[:7]}로 되돌렸지만 재기동 실패: {e}'
 
     def done(self, req, message):
-        self.save_local(last={'at': time.time(), 'ok': True, 'message': message, 'request': (req or {}).get('id')}, prev=None, changed=[])
+        run = self.end_run(True)
+        self.save_local(last={'at': time.time(), 'ok': True, 'message': message, 'request': (req or {}).get('id'), 'run': run},
+                        prev=None, changed=[], run=None)
         self.finish_request(req)
         self.report('done', message)
 
     def fail(self, req, message):
-        self.save_local(last={'at': time.time(), 'ok': False, 'message': message, 'request': (req or {}).get('id')}, prev=None, changed=[])
+        run = self.end_run(False)
+        self.save_local(last={'at': time.time(), 'ok': False, 'message': message, 'request': (req or {}).get('id'), 'run': run},
+                        prev=None, changed=[], run=None)
         self.finish_request(req)   # 실패한 요청은 반복하지 않습니다. 원인 확인 후 다시 요청하세요.
         self.report('failed', message)
 
@@ -248,8 +363,12 @@ class Updater:
         if not req:
             # 대기 중에 관리자가 요청을 취소함 → 재시작 보류. 다시 요청하면 받아 둔 코드·이미지로 이어서 진행합니다.
             return self.report('paused', f"요청 취소로 재시작 보류 · 실행 중 {self.local['prev'][:7]} / 받아 둔 코드 {git('rev-parse', '--short', 'HEAD')}")
+        self.begin_run(req)
         if fetch_error and not in_progress:
+            self.set_phase('fetch')
             return self.report('waiting', fetch_error)
+        if not in_progress:
+            self.set_phase('fetch')
         try:
             prev, changed = self.fast_forward()
         except RuntimeError as e:
@@ -267,6 +386,7 @@ class Updater:
 
     def native(self, req, prev, changed):
         notes = []
+        self.set_phase('restart')
         if any(f.startswith('code/') for f in changed):
             r = subprocess.run(['systemctl', '--user', 'restart', 'kaist-ui'], capture_output=True, text=True)
             if r.returncode:
@@ -280,6 +400,7 @@ class Updater:
 
     def docker(self, req, prev, head, changed):
         if self.local.get('built') != head:
+            self.set_phase('build')
             self.report('building', f'{head[:7]} 이미지 빌드·GPU 점검 중 (기존 서비스는 계속 동작)')
             try:
                 self.start_stack('--build-only')
@@ -289,9 +410,11 @@ class Updater:
         if self.local.get('deployed') == head and not changed:
             return self.done(req, '이미 최신입니다')
         pinned = any(f.startswith(PINNED) for f in changed)
+        self.set_phase('wait')
         reasons = self.idle_reasons(pinned)
         if reasons:
             return self.report('waiting', '빌드 완료 · 이 PC가 쉬면 재시작합니다: ' + ' · '.join(reasons))
+        self.set_phase('restart')
         self.report('restarting', f'{head[:7]}로 서비스 재시작 중')
         try:
             self.start_stack('--skip-build')

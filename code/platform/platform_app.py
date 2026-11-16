@@ -1949,6 +1949,13 @@ def fleet_update(data:FleetUpdate,req:Request):
  with access.db() as c:c.execute('INSERT INTO ui_audit VALUES(?,?,?)',(time.time(),admin['name'],f"fleet update {data.action} {','.join(done)}"))
  return {'ok':True,'pcs':done}
 
+@app.get('/api/fleet/updates')
+def fleet_updates(req:Request):
+ """업데이트 진행 상황만 가볍게(대시보드가 업데이트 중 5초마다 조회). NAS control/update/<pc>/*.json"""
+ guard(req);access.admin(req)
+ if not fleet.available():return {'nas':False,'pcs':[]}
+ return {'nas':True,'now':time.time(),'pcs':[dict(pc=pc,**fleet.update_info(pc)) for pc in fleet.PCS]}
+
 class FleetDispatch(BaseModel):
  type:str=Field(pattern=r'^(run_raw|mano_transfer|mano_release|queue_reset|resolve_overlaps)$')
  target_pc:str=Field(default='',pattern=r'^(pc[1-6])?$')

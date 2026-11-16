@@ -36,6 +36,11 @@ def read_env(path):
     return result
 
 
+def phase(name):
+    """진행 단계 표시. repro/update_stack.py가 이 줄을 읽어 관리자 대시보드에 단계를 보여줍니다."""
+    print(f'==> [phase] {name}', flush=True)
+
+
 def record_deployed():
     """repro/update_stack.py가 '지금 실행 중인 커밋'을 알 수 있게 기록합니다."""
     try:
@@ -177,17 +182,24 @@ def main():
     temp.chmod(0o600)
     temp.replace(env_file)
     compose = ['docker', 'compose', '--env-file', str(env_file)]
+    # repro/update_stack.py는 빌드 진행도를 읽으려고 plain 출력을 요청합니다.
+    if os.environ.get('KAIST_COMPOSE_PROGRESS'):
+        compose[2:2] = ['--progress', os.environ['KAIST_COMPOSE_PROGRESS']]
     if args.configure_only:
         print(f'Configuration ready: {env_file}')
         return
     if not args.skip_build:
+        phase('build')
         run(compose + ['build'], env=env)
         # Exercise GPU packages, model assets, rendering and NAS before bringing the UI online.
+        phase('check')
         run(compose + ['run', '--rm', '--no-deps', 'gpu-worker', 'check'], env=env)
     if args.build_only:
         print('Images built and checked. Running services were not restarted.')
         return
+    phase('restart')
     run(compose + ['up', '-d', '--wait', '--wait-timeout', '600'], env=env)
+    phase('verify')
     run([sys.executable, str(ROOT / 'repro/check_ui.py'), '--env-file', str(env_file)], env=env)
     if stack_name == 'kaist-pc':
         record_deployed()

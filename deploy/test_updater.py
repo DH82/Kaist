@@ -152,6 +152,68 @@ class UpdaterTests(unittest.TestCase):
         self.assertEqual(st['state'], 'done'); self.assertEqual(self.calls, []); self.assertEqual(st['behind'], 0)
 
 
+PLAIN = """==> [phase] build
+#1 [internal] load build definition from Dockerfile
+#1 DONE 0.0s
+#5 [gpu-worker envs 1/3] FROM docker.io/nvidia/cuda
+#5 CACHED
+#6 [gpu-worker envs 2/3] RUN build_envs.sh sam
+#6 12.31 Building wheel for sam3
+#7 [ui airflow 1/2] COPY code/ /opt/kaist/
+#7 DONE 0.4s
+"""
+
+
+class ProgressTests(unittest.TestCase):
+    def test_plain_build_output(self):
+        b = us.BuildProgress()
+        phases = [b.feed(l) for l in PLAIN.splitlines()]
+        self.assertEqual([x for x in phases if x], ['build'])
+        snap = b.snapshot()
+        g = {x['label']: x for x in snap['groups']}
+        self.assertEqual((g['gpu-worker envs']['done'], g['gpu-worker envs']['total'], g['gpu-worker envs']['cached']), (1, 3, 1))
+        self.assertEqual((g['ui airflow']['done'], g['ui airflow']['total']), (1, 2))
+        self.assertEqual(snap['current'][0]['text'], 'RUN build_envs.sh sam')
+        self.assertEqual(snap['current'][0]['last'], 'Building wheel for sam3')
+        self.assertNotIn('==> [phase] build', snap['tail'])
+
+
+class StreamingTests(UpdaterTests):
+    """실제 start_stack 호출 경로: 가짜 repro/start_stack.py의 출력을 읽어 단계·빌드 진행을 NAS 상태에 기록합니다."""
+    def fake_stack(self, fail=False):
+        script = self.pc / 'repro/start_stack.py'; script.parent.mkdir(exist_ok=True)
+        script.write_text('import sys\nprint(%r)\nprint("==> [phase] check", flush=True)\nprint("selfcheck 10/10")\nsys.exit(%d)\n' % (PLAIN, 1 if fail else 0))
+
+    def real_tick(self):
+        u = us.Updater(self.pc / '.env'); u.tick(); return u
+
+    def test_progress_recorded_through_phases(self):
+        self.commit('code/a.py', '1'); self.request(); self.job('running'); self.fake_stack()
+        u = self.real_tick()
+        st = json.loads((self.nas / 'control/update/pc2/status.json').read_text())
+        self.assertEqual(st['state'], 'waiting')
+        run = st['run']
+        self.assertEqual(list(run['phases']), ['fetch', 'build', 'check', 'wait'])
+        self.assertTrue(all('end' in run['phases'][k] for k in ('fetch', 'build', 'check')))
+        self.assertEqual(run['phase'], 'wait')
+        self.assertEqual({g['label'] for g in run['build']['groups']}, {'gpu-worker envs', 'ui airflow'})
+        self.assertEqual(st['phases'][1], ['build', '이미지 빌드'])
+        self.job('success')
+        u = self.real_tick()
+        st = json.loads((self.nas / 'control/update/pc2/status.json').read_text())
+        self.assertEqual(st['state'], 'done'); self.assertIsNone(st['run'])
+        last = st['last']['run']
+        self.assertTrue(last['ok']); self.assertIn('restart', last['phases']); self.assertEqual(last['to'], self.head())
+
+    def test_failed_build_keeps_failed_phase(self):
+        self.commit('code/a.py', '1'); self.request(); self.fake_stack(fail=True)
+        self.real_tick()
+        st = json.loads((self.nas / 'control/update/pc2/status.json').read_text())
+        self.assertEqual(st['state'], 'failed')
+        last = st['last']['run']
+        self.assertFalse(last['ok']); self.assertIn('rollback', last['phases'])
+
+
 class FleetUpdateRequestTests(unittest.TestCase):
     def test_request_cancel_pending(self):
         with tempfile.TemporaryDirectory() as tmp, patch.object(fleet, 'CONTROL', Path(tmp)), patch.object(fleet, 'MACHINE_PC', 'pc3'):
