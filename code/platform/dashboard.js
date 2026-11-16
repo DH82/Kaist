@@ -24,7 +24,7 @@ function dashState(s){return '<span class="dbState '+escape(s||'')+'">'+escape(D
 function dashPcName(pc){return String(pc||'').toUpperCase()}
 function dashNum(n,bad){return '<td class="dbR'+(!n?' zero':bad?' bad':'')+'">'+n+'</td>'}
 function dashSetTab(t){dashTab=t;document.querySelectorAll('[data-dash-tab]').forEach(b=>b.setAttribute('aria-selected',String(b.dataset.dashTab===t)));document.querySelectorAll('[data-dash-panel]').forEach(p=>p.hidden=p.dataset.dashPanel!==t);try{localStorage.setItem('kaistDashTab',t)}catch(e){}}
-try{const t=localStorage.getItem('kaistDashTab');if(['pcs','eps','stages','log'].includes(t))dashTab=t}catch(e){}
+try{const t=localStorage.getItem('kaistDashTab');if(['pcs','eps','stages','log','raws'].includes(t))dashTab=t}catch(e){}
 
 // 에피소드(실행) 단위로 묶기: 이관된 실행(transfer__<원본>__<run>)은 원본 실행과 합칩니다.
 function dashEpisodes(jobs){
@@ -148,6 +148,71 @@ function renderDash(){
   const q=j.created&&j.started&&j.started-j.created>1?'GPU 자리 대기 '+dashDur(j.started-j.created):'';
   return '<tr title="'+escape([j.operator&&'작업자 '+j.operator,j.sam_prompt&&'분할 대상 '+j.sam_prompt,q].filter(Boolean).join(' · '))+'"><td class="dbR" style="text-align:left">'+dashHM(j.started)+' – '+(j.finished?dashHM(j.finished):'')+'</td><td>'+dashPcName(j.pc)+'</td><td>'+escape(j.episode||'')+'</td><td>'+escape(dashName(j.stage))+(j.attempt>0?'<span class="dbSub">이전 시도</span>':'')+'</td><td>'+dashState(j.state)+'</td><td class="dbR"><b>'+dashDur(dashLen(j))+'</b></td></tr>'}).join(''):'<tr><td colspan="6" class="dbEmpty">조건에 맞는 기록이 없습니다.</td></tr>';
  $('dashMore').hidden=log.length<=dashLimit;
+ renderDashRaws();
+}
+// ---- RAW 프레임: NAS RAW마다 카메라별 프레임 수 ----
+let dashRawRetry=null;
+function dashCamName(c){const n=String(c).match(/(\d+)$/);return n?'카메라 '+n[1]:c}
+function dashRawRows(){
+ const d=dashData;if(!d||!d.raws)return [];
+ const day=$('dashDate').value,pc=$('dashPc').value,all=$('dashRawAll').checked,q=$('dashRawText').value.trim().toLowerCase();
+ return d.raws.filter(r=>(all||dashDay(r.at)===day)&&(!pc||r.pc===pc)&&(!q||r.episode.toLowerCase().includes(q)||String(r.object||'').toLowerCase().includes(q)));
+}
+const DASH_FPS=30;
+function dashSec(n){return n.toLocaleString(undefined,{maximumFractionDigits:1})+'초'}
+function dashRawStats(r){const v=r.cameras.map(c=>r.frames[c]).filter(n=>n!=null);return {min:v.length?Math.min(...v):null,max:v.length?Math.max(...v):null,missing:r.cameras.length-v.length}}
+function renderDashRaws(){
+ if(dashData&&dashData.raws===null){$('dashRawHead').innerHTML='';$('dashRawInfo').textContent='';$('dashRawSum').innerHTML='';$('dashRaws').innerHTML='<tr><td class="dbEmpty">NAS RAW 폴더를 읽는 중입니다. 잠시 후 자동으로 표시됩니다.</td></tr>';clearTimeout(dashRawRetry);dashRawRetry=setTimeout(()=>{if(dashTimer)loadDash(true)},5000);return}
+ const rows=dashRawRows(),idx=dashRunIndex(),pc=$('dashPc').value;
+ const every=dashData.raws.filter(r=>!pc||r.pc===pc);
+ const sum=(list,k)=>{let f=0,n=0;for(const r of list){const v=dashRawStages(r,idx)[k];if(v!=null){f+=v;n++}}return [f,n]};
+ const scope=$('dashRawAll').checked?'모든 날짜':$('dashDate').value.slice(5).replace('-','/')+' 촬영';
+ // 단계별 합계 카드: 큰 숫자 = 선택한 날짜(또는 모든 날짜)의 30fps 길이, 아래 = 프레임 · RAW 수 · 전체 누적
+ $('dashRawSum').innerHTML=DASH_FSTAGES.map(([k,label])=>{const [f,n]=sum(rows,k),[af]=sum(every,k);
+  return '<div class="dbKpi"><span>'+label+'</span><b>'+dashSec(f/DASH_FPS)+'</b><small>'+f.toLocaleString()+'프레임 · '+n+'개<br>전체 누적 '+dashSec(af/DASH_FPS)+(af/DASH_FPS>=60?' ('+dashDur(af/DASH_FPS)+')':'')+'</small></div>'}).join('');
+ const warn=rows.filter(r=>r.failed.length||dashRawStats(r).missing).length;
+ $('dashRawInfo').textContent=rows.length+'개 RAW · '+scope+(pc?' · '+dashPcName(pc):'')+(warn?' · 카메라 누락 '+warn+'개':'');
+ $('dashRawHead').innerHTML='<tr><th>촬영</th><th>RAW</th><th>대상</th>'+DASH_FSTAGES.map(([,label])=>'<th class="dbR">'+label+'</th>').join('')+'<th>PC</th></tr>';
+ $('dashRaws').innerHTML=rows.length?rows.map(r=>{
+  const st=dashRawStages(r,idx),s=dashRawStats(r);
+  const cams=r.cameras.map(c=>{const n=r.frames[c],bad=r.failed.includes(c)||n==null;return '<span'+(bad?' class="bad" title="'+escape(dashCamName(c))+': 촬영 실패 또는 프레임 정보 없음"':' title="'+escape(dashCamName(c))+'"')+'>'+(n==null?'×':n)+'</span>'}).join(' / ');
+  const cell=(k)=>{const v=st[k];if(v==null)return '<td class="dbR zero">—</td>';
+   let sub=dashSec(v/DASH_FPS);
+   if(k==='raw')sub+=(s.max!==s.min?' · 최대 '+s.max:'')+'<br>'+cams;
+   if(k==='masks'&&st.object!=null&&st.object<v)sub+='<br>물체 '+st.object;
+   return '<td class="dbR"><b>'+v.toLocaleString()+'</b><span class="dbSub">'+sub+'</span></td>'};
+  const obj=r.object?escape(r.object)+(r.interaction?'<span class="dbSub">'+escape(r.interaction)+'</span>':''):'<span class="zero">—</span>';
+  // 같은 RAW를 여러 번 실행했으면 가장 멀리 진행한 실행(출력 이름)을 표시합니다.
+  const run=st.runs>1||(st.run&&st.run!==r.episode)?'<span class="dbSub" title="단계별 숫자는 이 실행 기준">'+escape(st.run||'')+(st.runs>1?' · 실행 '+st.runs+'개 중':'')+'</span>':'';
+  return '<tr><td class="dbR" style="text-align:left" title="'+(r.duration!=null?'촬영 길이 '+escape(dashDur(r.duration)):'')+'">'+dashClock(r.at)+'</td><td>'+escape(r.episode)+(r.source==='csv'?' <span class="zero" title="촬영 앱 기록이 없어 타임스탬프 파일 줄 수로 셌습니다.">*</span>':'')+run+'</td><td>'+obj+'</td>'+
+   DASH_FSTAGES.map(([k])=>cell(k)).join('')+'<td>'+(st.pc||r.pc?dashPcName(st.pc||r.pc):'<span class="zero">미시작</span>')+'</td></tr>'}).join(''):
+  '<tr><td colspan="'+(4+DASH_FSTAGES.length)+'" class="dbEmpty">'+($('dashRawAll').checked?'NAS에 RAW가 없습니다.':'이 날짜에 촬영한 RAW가 없습니다.')+'</td></tr>';
+}
+// 처리 단계: RAW(가장 적은 카메라) → 동기화(4대 카메라 시각 맞춤) → 전처리(앞뒤 자르기 후) → SAM3 마스크 → 추적 → 3D 복원 → MANO → 최종 저장.
+// 추적 이후 단계는 전처리 프레임 전체를 그대로 쓰므로(빠지는 프레임 없음) 그 단계가 성공했으면 전처리 프레임 수입니다.
+const DASH_FSTAGES=[['raw','RAW'],['synced','동기화'],['prepared','전처리'],['masks','SAM3 마스크'],['track','추적'],['recon','3D 복원'],['mano','MANO'],['final','최종 저장']];
+const DASH_FDONE={track:'track',recon:'reconstruct',mano:'hands',final:'publish'};
+function dashRawOf(ep){const m=String(ep||'').match(/^ep_\d{8}_\d{6}/);return m?m[0]:null}
+function dashRunIndex(){
+ // 출력 에피소드(실행)별: 단계 프레임 수(여러 PC 기록 합침) + 성공한 단계 + 실행한 PC
+ const d=dashData,runs=new Map();
+ const get=ep=>{let x=runs.get(ep);if(!x){x={episode:ep,raw:dashRawOf(ep),done:new Set(),pc:null,at:0};runs.set(ep,x)}return x};
+ for(const f of d.frames||[]){const x=get(f.episode);if(f.raw_episode)x.raw=f.raw_episode;for(const k of ['synced','prepared','masks','object_frames'])if(f[k]!=null)x[k]=f[k];x.pc=x.pc||f.pc}
+ for(const j of d.jobs||[]){if(!j.episode)continue;const x=get(j.episode);if(j.state==='success')x.done.add(j.stage);x.at=Math.max(x.at,j.started||0);if(j.stage==='prepare_raw')x.pc=j.pc}
+ for(const p of d.published||[]){if(p.episode&&runs.has(p.episode))runs.get(p.episode).done.add('publish')}
+ const byRaw=new Map();
+ for(const x of runs.values()){if(!x.raw)continue;if(!byRaw.has(x.raw))byRaw.set(x.raw,[]);byRaw.get(x.raw).push(x)}
+ return byRaw;
+}
+function dashRawStages(r,idx){
+ const s=dashRawStats(r),out={raw:s.min,runs:0};
+ const list=idx.get(r.episode)||[];out.runs=list.length;if(!list.length)return out;
+ // 가장 멀리 진행한 실행을 보여 줍니다(같으면 최근 실행).
+ const reach=x=>{let n=x.prepared!=null?3:x.synced!=null?2:0;if(x.masks!=null)n=4;['track','reconstruct','hands','publish'].forEach((k,i)=>{if(x.done.has(k))n=Math.max(n,5+i)});return n};
+ const best=[...list].sort((a,b)=>reach(b)-reach(a)||b.at-a.at)[0];
+ Object.assign(out,{synced:best.synced,prepared:best.prepared,masks:best.masks,object:best.object_frames,run:best.episode,pc:best.pc});
+ for(const [k,stage] of Object.entries(DASH_FDONE))if(best.done.has(stage)&&best.prepared!=null)out[k]=best.prepared;
+ return out;
 }
 // ---- 버전 · GitHub 업데이트 (각 PC의 repro/update_stack.py가 NAS control/update/<pc>/status.json에 기록) ----
 const DASH_UPD={idle:'',waiting:'재시작 대기',building:'빌드 중',restarting:'재시작 중',done:'완료',failed:'실패',paused:'보류'};
@@ -198,8 +263,19 @@ $('dashToday').onclick=()=>{$('dashDate').value=dashDay(Date.now()/1000);dashLim
 $('dashDate').onchange=()=>{dashLimit=200;renderDash()};
 $('dashRefresh').onclick=()=>loadDash();
 $('dashMore').onclick=()=>{dashLimit+=200;renderDash()};
-['dashPc','dashFStage','dashFState','dashFChecks','dashEpRunning'].forEach(id=>$(id).onchange=()=>renderDash());
+['dashPc','dashFStage','dashFState','dashFChecks','dashEpRunning','dashRawAll'].forEach(id=>$(id).onchange=()=>renderDash());
 $('dashFText').oninput=()=>renderDash();
+$('dashRawText').oninput=()=>renderDashRaws();
+$('dashRawCsv').onclick=()=>{
+ const rows=dashRawRows();if(!rows.length)return;
+ const cams=[...new Set(rows.flatMap(r=>r.cameras))].sort((a,b)=>(+String(a).replace(/\D/g,'')||0)-(+String(b).replace(/\D/g,'')||0));
+ const cell=v=>{v=v==null?'':String(v);return /[",\n]/.test(v)?'"'+v.replace(/"/g,'""')+'"':v};
+ const idx=dashRunIndex(),sec=v=>v==null?'':Math.round(v/DASH_FPS*100)/100;
+ const head=['episode','captured','object','interaction',...cams,'raw_max','duration_sec','failed_cameras',...DASH_FSTAGES.flatMap(([k])=>[k+'_frames',k+'_sec_30fps']),'mask_object_frames','run','pc','source'];
+ const lines=[head.join(',')].concat(rows.map(r=>{const s=dashRawStats(r),st=dashRawStages(r,idx);return [r.episode,new Date(r.at*1000).toLocaleString('sv-SE'),r.object,r.interaction,...cams.map(c=>r.frames[c]),
+  s.max,r.duration!=null?Math.round(r.duration*10)/10:'',r.failed.join(' '),...DASH_FSTAGES.flatMap(([k])=>[st[k],sec(st[k])]),st.object,st.run,st.pc||r.pc,r.source].map(cell).join(',')}));
+ const a=document.createElement('a');a.href=URL.createObjectURL(new Blob(['﻿'+lines.join('\n')],{type:'text/csv'}));a.download='kaist_raw_frames_'+($('dashRawAll').checked?'all':$('dashDate').value)+'.csv';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),5000);
+};
 document.querySelectorAll('[data-dash-tab]').forEach(b=>b.onclick=()=>dashSetTab(b.dataset.dashTab));
 $('dashEps').onclick=e=>{const row=e.target.closest('.dbEp');if(!row||e.target.closest('.dbDetail'))return;const k=row.dataset.ep;dashOpen.has(k)?dashOpen.delete(k):dashOpen.add(k);renderDash()};
 $('dashCsv').onclick=()=>{

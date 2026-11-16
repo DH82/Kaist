@@ -1642,6 +1642,66 @@ def job_records(operators=None):
  owners=access.owners();operators=operators or {}
  return [dict(r,operator=owners.get(r['episode']) or operators.get(r['run_id'])) for r in rows]
 
+# ---- 처리 단계별 프레임 수(관리자 'RAW 프레임' 탭): 이 PC 작업 폴더(GPU_PROJECT_DIR)의 단계 기록 ----
+# 동기화(4대 카메라 시각 맞춤) → 전처리(앞뒤 자르기 후) → SAM3 마스크. 그 뒤 추적·3D 복원·MANO는 전처리 프레임 전체를 그대로 씁니다
+# (추적은 metadata.json frame_num 전체, MANO 검증은 모든 프레임이 있어야 통과). 작업 폴더가 정리돼도 남도록 UI DB에 기록해 둡니다.
+WORK_DIR=os.environ.get('KAIST_WORK_DIR') or os.environ.get('GPU_PROJECT_DIR') or ''
+FRAME_SCAN_SECONDS=60
+_frame_scan=[0.0]
+
+def _read_json(p):
+ try:return json.loads(p.read_text())
+ except (OSError,ValueError):return None
+
+def _int(v):return v if isinstance(v,int) and not isinstance(v,bool) and v>=0 else None
+
+def stage_frames(root,ep):
+ """{synced,prepared,masks,object_frames} 중 작업 폴더에서 확인된 값만."""
+ out={}
+ trim=_read_json(root/'03_prepared'/ep/'trim.json') or {}
+ prep=_read_json(root/'03_prepared'/ep/'preparation.json') or {}
+ if _int(trim.get('before')) is not None:out['synced']=trim['before']
+ if _int(prep.get('frames')) is not None:out['prepared']=prep['frames']
+ elif _int(trim.get('after')) is not None:out['prepared']=trim['after']
+ for bucket in ('approved','pending',''):
+  m=root/'04_masks'/bucket/ep
+  val=_read_json(m/'mask_validation.json')
+  if not val or _int(val.get('frames')) is None:continue
+  out['masks']=val['frames']
+  tracks=((_read_json(m/'state.json') or {}).get('object_tracks') or {}).values()
+  seen=[t['nonempty_frames'] for t in tracks if isinstance(t,dict) and _int(t.get('nonempty_frames')) is not None]
+  if seen:out['object_frames']=min(seen)   # 물체 마스크가 비어 있지 않은 프레임(카메라 중 가장 적은 값)
+  break
+ return out
+
+def frames_db():
+ c=access.db()
+ c.execute('CREATE TABLE IF NOT EXISTS episode_frames (episode TEXT PRIMARY KEY,raw_episode TEXT,synced INTEGER,prepared INTEGER,masks INTEGER,object_frames INTEGER,at REAL)')
+ return c
+
+def episode_frame_rows(job_eps=()):
+ """이 PC 실행(출력 에피소드)별 단계 프레임 수. FRAME_SCAN_SECONDS마다 작업 폴더를 다시 읽어 DB를 갱신합니다."""
+ root=Path(WORK_DIR) if WORK_DIR else None
+ if root and root.is_dir() and time.monotonic()-_frame_scan[0]>=FRAME_SCAN_SECONDS:
+  _frame_scan[0]=time.monotonic()
+  with access.db() as c:runs=dict(c.execute('SELECT episode,raw_episode FROM execution_versions').fetchall())
+  for ep in set(job_eps):runs.setdefault(ep,None)
+  try:
+   for d in (root/'03_prepared').iterdir():runs.setdefault(d.name,None)   # 실행 기록보다 오래된 작업 폴더
+  except OSError:pass
+  with frames_db() as c:
+   for ep,raw in runs.items():
+    if not ep or not re.fullmatch(r'ep_[A-Za-z0-9_]+',ep):continue
+    f=stage_frames(root,ep)
+    if not f:continue
+    # 값이 없어진 단계(작업 폴더 정리)는 이전 기록을 유지합니다.
+    c.execute('INSERT INTO episode_frames VALUES(?,?,?,?,?,?,?) ON CONFLICT(episode) DO UPDATE SET raw_episode=COALESCE(excluded.raw_episode,raw_episode),'
+              'synced=COALESCE(excluded.synced,synced),prepared=COALESCE(excluded.prepared,prepared),masks=COALESCE(excluded.masks,masks),'
+              'object_frames=COALESCE(excluded.object_frames,object_frames),at=excluded.at',
+              (ep,raw,f.get('synced'),f.get('prepared'),f.get('masks'),f.get('object_frames'),time.time()))
+ with frames_db() as c:
+  return [dict(r) for r in c.execute('SELECT * FROM episode_frames')]
+
 def update_busy():
  """repro/update_stack.py가 서비스 재시작 전에 확인: 실행 중인 Airflow 태스크 수 · MANO 일괄 실행 여부."""
  try:
@@ -1686,6 +1746,8 @@ def fleet_snapshot():
  snap['assignments']=[{'episode':ep,'operator':op} for ep,op in access.assignments().items()]
  try:snap['jobs']=job_records({r['run_id']:r['operator'] for r in runs if r.get('operator')})
  except Exception as e:print('작업 시간 기록 읽기 실패:',e,flush=True)
+ try:snap['frames']=episode_frame_rows({j['episode'] for j in snap.get('jobs') or [] if j.get('episode')})
+ except Exception as e:print('단계별 프레임 수 읽기 실패:',e,flush=True)
  return snap
 
 def reconcile_raw_claims(snap):
@@ -1793,18 +1855,81 @@ def fleet_report(req:Request):
  else:
   snap=fleet_snapshot();pcs=[dict(snap,pc=fleet.PC_ID,online=True,age=0,local_only=True)]
  started=dict(fleet.raw_claims()) if fleet.available() else {}
- out={'me':fleet.PC_ID,'nas':fleet.available(),'days':JOB_LOG_DAYS,'pcs':[],'jobs':[],'published':[],'runs':[],'mano_waiting':[]}
+ out={'me':fleet.PC_ID,'nas':fleet.available(),'days':JOB_LOG_DAYS,'pcs':[],'jobs':[],'published':[],'runs':[],'mano_waiting':[],'frames':[]}
  for p in pcs:
   for e in p.get('raw_started') or []:started.setdefault(e,p['pc'])
   g=(p.get('gpu') or [None])[0]
   out['pcs'].append({'pc':p['pc'],'online':bool(p.get('online')),'missing':bool(p.get('missing')),'error':p.get('error'),'age':p.get('age'),
    'updated_at':(p.get('meta') or {}).get('updated_at'),'ui_url':(p.get('meta') or {}).get('ui_url'),'has_jobs':bool(p.get('has_jobs') or p.get('local_only')),
    'gpu':g,'assignments':len(p.get('assignments') or []),'idle':bool(p.get('idle')),'update':fleet.update_info(p['pc']) if fleet.available() else None})
-  for k in ('jobs','published','runs','mano_waiting'):
+  for k in ('jobs','published','runs','mano_waiting','frames'):
    out[k]+=[dict(r,pc=p['pc']) for r in p.get(k) or []]
  out['raw_free']=len(free_raws(started))
  out['stage_names']=JOB_STAGES+['adopt']
+ raws=raw_frames()
+ out['raws']=None if raws is None else [dict(r,pc=started.get(r['episode'])) for r in raws]  # None = NAS RAW 폴더를 아직 읽는 중
  return out
+
+# ---- RAW 프레임 수(관리자 통합 관리 'RAW 프레임' 탭): NAS RAW 폴더의 rgbd_episode.json(capture.frameCounts) ----
+RAW_FRAME_NAME=re.compile(r'ep_(\d{8})_(\d{6})')
+RAW_FRAME_RESCAN=60      # 초. NAS 폴더 목록은 이 간격으로만 다시 훑고, 바뀐 RAW 폴더만 다시 읽습니다.
+_raw_frames_cache=[0.0,None];_raw_frame_rows={}
+
+def _iso_epoch(v):
+ try:return datetime.fromisoformat(str(v).replace('Z','+00:00')).timestamp()
+ except (TypeError,ValueError):return None
+
+def raw_frame_info(d):
+ """RAW 하나의 카메라별 프레임 수. 촬영 앱 기록(rgbd_episode.json)에 없으면 cam_N_timestamps.csv 줄 수(머리글 제외)로 셉니다."""
+ meta={}
+ try:meta=json.loads((d/'rgbd_episode.json').read_text())
+ except (OSError,ValueError):pass
+ cap=meta.get('capture') or {};obj=meta.get('object') or {}
+ counts={str(k):int(v) for k,v in (cap.get('frameCounts') or {}).items() if isinstance(v,(int,float)) and not isinstance(v,bool)};source='meta'
+ if not counts:
+  source='csv'
+  for f in d.glob('cam_*_timestamps.csv'):
+   try:
+    with f.open('rb') as fh:counts[f.name[:-len('_timestamps.csv')]]=max(sum(1 for line in fh if line.strip())-1,0)
+   except OSError:pass
+ cams=[str(c) for c in cap.get('cameras') or []] or sorted(counts,key=lambda c:int(re.sub(r'\D','',c) or 0))
+ for c in counts:
+  if c not in cams:cams.append(c)
+ m=RAW_FRAME_NAME.fullmatch(d.name)
+ at=datetime.strptime(m.group(1)+m.group(2),'%Y%m%d%H%M%S').replace(tzinfo=timezone.utc).timestamp()  # 폴더 이름 시각은 UTC
+ start,stop=_iso_epoch(cap.get('startedAt')),_iso_epoch(cap.get('stoppedAt'))
+ return {'episode':d.name,'at':at,'object':obj.get('name') or obj.get('label') or obj.get('prompt') or (meta.get('task') or {}).get('taskName'),
+         'interaction':obj.get('interaction'),'cameras':cams,'frames':{c:counts.get(c) for c in cams},'failed':[str(x) for x in cap.get('failed') or []],
+         'duration':stop-start if start and stop and stop>=start else None,'source':source if counts else None}
+
+_raw_frames_lock=threading.Lock()
+
+def raw_frames():
+ """마지막으로 읽은 목록을 바로 돌려주고, 오래됐으면 뒤에서 다시 읽습니다(NFS 첫 읽기는 수십 초 걸릴 수 있음).
+ 아직 한 번도 못 읽었으면 None."""
+ if time.monotonic()-_raw_frames_cache[0]>=RAW_FRAME_RESCAN and _raw_frames_lock.acquire(blocking=False):
+  def run():
+   try:_raw_frames_scan()
+   except Exception as e:print('RAW 프레임 수 읽기 실패:',e,flush=True);_raw_frames_cache[0]=time.monotonic()
+   finally:_raw_frames_lock.release()
+  threading.Thread(target=run,name='kaist-raw-frames',daemon=True).start()
+ return _raw_frames_cache[1]
+
+def _raw_frames_scan():
+ root=Path(os.environ.get('KAIST_NAS_RAW_ROOT') or Path(os.environ.get('NAS_MOUNT','/mnt/kaist-data'))/'rgbd_raw')
+ rows=[]
+ try:dirs=[d for d in root.iterdir() if RAW_FRAME_NAME.fullmatch(d.name)] if root.is_dir() else []
+ except OSError:dirs=[]
+ for d in dirs:
+  try:
+   if not d.is_dir():continue
+   key=d.stat().st_mtime_ns
+  except OSError:continue
+  hit=_raw_frame_rows.get(d.name)
+  if not hit or hit[0]!=key:hit=_raw_frame_rows[d.name]=(key,raw_frame_info(d))
+  rows.append(hit[1])
+ rows.sort(key=lambda r:r['at'],reverse=True)
+ _raw_frames_cache[:]=[time.monotonic(),rows]
 
 class FleetUpdate(BaseModel):
  pcs:list[str]=Field(min_length=1,max_length=6)
