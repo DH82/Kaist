@@ -1081,6 +1081,16 @@ def exclude_raw_episode(data:RawExclusion,req:Request):
   access.exclude_raw(person['name'],data.worker_id,data.episode,data.excluded)
  return {'ok':True,'excluded':data.excluded}
 
+# 추적 결과가 지금 승인된 마스크와 맞지 않을 때(마스크를 고쳐 다시 승인했거나 아직 승인 전) 추적 검수에 나오는 사유.
+STALE_TRACKING_REASONS=('추적 입력이 현재 승인본과 다릅니다','승인된 마스크가 없습니다','승인 이후 초안이 바뀌었습니다')
+
+def tracking_input_stale(wid,ep):
+ """추적 검수 항목이 '마스크가 바뀌어 추적을 다시 해야 함'을 알리면 True."""
+ for x in all_review_items(wid):
+  if x.get('episode')==ep and x.get('stage')=='tracking' and not x.get('unavailable'):
+   return not x.get('ready',True) and any(r in str(x.get('reason','')) for r in STALE_TRACKING_REASONS)
+ return False
+
 class RetryJob(BaseModel):
  dag_id:str
  run_id:str=Field(min_length=1,max_length=250)
@@ -1112,8 +1122,13 @@ def retry_job(data:RetryJob,req:Request):
   tasks=local_api('GET',base+'/taskInstances')['task_instances']
   failed=sorted((t for t in tasks if t['state']=='failed'),key=lambda t:order.index(t['task_id']))
   if not failed or failed[0]['task_id']!=data.stage:raise HTTPException(409,'현재 실패 단계가 변경됐습니다. 새로고침하세요.')
-  targets=[t for t in tasks if order.index(t['task_id'])>=order.index(data.stage)]
-  if any(t['state'] in ('success','running','queued','up_for_reschedule') for t in targets):raise HTTPException(409,'후속 단계에 완료 또는 실행 중인 작업이 있어 재시도를 중단했습니다.')
+  start=data.stage
+  # 추적 뒤 단계(3D 복원 등)가 실패했는데 추적 입력이 예전 마스크 기준이면, 실패 단계만 다시 해도 같은 오류가 반복됩니다.
+  # 마스크 승인 확인 단계부터 다시 돌려 새 마스크로 추적·추적 검수·3D 복원을 이어서 진행합니다.
+  if order.index(data.stage)>order.index('track') and tracking_input_stale(wid,ep):start='mask_approved'
+  targets=[t for t in tasks if order.index(t['task_id'])>=order.index(start)]
+  rewound={t['task_id'] for t in targets if order.index(t['task_id'])<order.index(data.stage)}
+  if any(t['state'] in (('running','queued','up_for_reschedule') if t['task_id'] in rewound else ('success','running','queued','up_for_reschedule')) for t in targets):raise HTTPException(409,'후속 단계에 완료 또는 실행 중인 작업이 있어 재시도를 중단했습니다.')
   payload={'dag_run_id':data.run_id,'task_ids':[t['task_id'] for t in targets],'only_failed':False,'reset_dag_runs':True,'include_upstream':False,'include_downstream':False,'prevent_running_task':True,'note':'UI retry by '+access.user(req)['name']}
   local_api('POST',f'/api/v2/dags/{data.dag_id}/clearTaskInstances',json={**payload,'dry_run':True})
   from direct_worker import request_for
@@ -1122,16 +1137,22 @@ def retry_job(data:RetryJob,req:Request):
    # Airflow만 실패로 표시되고 워커 작업은 계속 돌거나 이미 끝난 경우(예: 센서 'state mismatch')에는
    # 워커 작업을 건드리지 않고 Airflow 태스크만 다시 연결합니다. 센서가 진행 중인 작업을 이어서 확인합니다.
    # 'waiting'(검수 승인 대기)도 실패가 아니므로 같습니다. 다시 연결된 센서가 승인 여부를 다시 확인합니다.
-   if call('POST','/worker/jobs/status',json=request,worker_id=wid,timeout=15).get('state') in ('running','queued','success','waiting'):continue
-   try:call('POST','/worker/jobs/retry',json=request,worker_id=wid)
+   state=call('POST','/worker/jobs/status',json=request,worker_id=wid,timeout=15).get('state')
+   if task['task_id'] in rewound:
+    # 앞 단계 다시 실행: 끝난 워커 작업(성공 포함)을 시작 전으로 되돌립니다. 승인 대기 중이면 그대로 다시 연결합니다.
+    if state in ('running','queued','waiting'):continue
+    action='rewind'
+   elif state in ('running','queued','success','waiting'):continue
+   else:action='retry'
+   try:call('POST','/worker/jobs/'+action,json=request,worker_id=wid)
    except httpx.HTTPStatusError as e:
     # 워커가 거부한 실제 사유를 보여 줍니다(일반 '서버 연결 실패' 문구 대신).
     try:detail=str(e.response.json().get('detail',''))
     except ValueError:detail=e.response.text
     raise HTTPException(409,f"{task['task_id']} 단계 재시도를 GPU PC가 거부했습니다: "+(detail.strip().splitlines()[-1][-300:] if detail.strip() else str(e.response.status_code))) from e
   local_api('POST',f'/api/v2/dags/{data.dag_id}/clearTaskInstances',json={**payload,'dry_run':False})
-  access.audit(req,'retry '+data.run_id+' '+data.stage)
-  return {'ok':True,'stage':data.stage}
+  access.audit(req,'retry '+data.run_id+' '+start)
+  return {'ok':True,'stage':start,'requested_stage':data.stage}
 
 
 # ---- 목록 항목 관리: NAS에 올리기 · 강제 종료 · 목록에서 삭제(숨김) ----

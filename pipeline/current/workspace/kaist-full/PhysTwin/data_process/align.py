@@ -134,6 +134,33 @@ def registration_scale(mesh_matching_points_cam, matching_points_cam):
     return optimal_scale
 
 
+def drop_zero_area_triangles(o3d_mesh):
+    # Remove triangles with a repeated vertex index or (numerically) zero area, then unused vertices.
+    triangle_count = len(o3d_mesh.triangles)
+    o3d_mesh = o3d_mesh.remove_degenerate_triangles()
+    vertices = np.asarray(o3d_mesh.vertices)
+    triangles = np.asarray(o3d_mesh.triangles)
+    if len(triangles):
+        double_area = np.linalg.norm(
+            np.cross(
+                vertices[triangles[:, 1]] - vertices[triangles[:, 0]],
+                vertices[triangles[:, 2]] - vertices[triangles[:, 0]],
+            ),
+            axis=1,
+        )
+        extent = np.ptp(vertices, axis=0).max() if len(vertices) else 0.0
+        zero_area = double_area <= 1e-12 * max(extent, 1e-12) ** 2
+        if zero_area.any():
+            o3d_mesh.remove_triangles_by_mask(zero_area.tolist())
+    o3d_mesh = o3d_mesh.remove_unreferenced_vertices()
+    removed = triangle_count - len(o3d_mesh.triangles)
+    if removed:
+        print(f"Removed {removed} zero-area triangles of {triangle_count} before ARAP")
+    if removed > max(10, triangle_count // 100):
+        print(f"WARNING: many zero-area triangles ({removed}); check the shape prior mesh")
+    return o3d_mesh
+
+
 def deform_ARAP(initial_mesh_world, mesh_matching_points_world, matching_points):
     # Do the ARAP deformation based on the matching keypoints
     mesh_vertices = np.asarray(initial_mesh_world.vertices)
@@ -495,6 +522,10 @@ if __name__ == "__main__":
     initial_mesh_world.triangles = o3d.utility.Vector3iVector(np.asarray(mesh.faces))
     # Need to remove the duplicated vertices to enable open3d, however, the duplicated points are important in trimesh for texture
     initial_mesh_world = initial_mesh_world.remove_duplicated_vertices()
+    # Merging the duplicated (UV-seam) vertices can collapse a few triangles onto a repeated vertex or a line.
+    # Zero-area triangles make the ARAP cotangent weights infinite and Open3D then fails with
+    # "Failed to build solver (factorize)". They carry no surface, so always drop them (no count threshold).
+    initial_mesh_world = drop_zero_area_triangles(initial_mesh_world)
     # Get the index from original vertices to the mesh vertices, mapping between trimesh and open3d
     kdtree = KDTree(initial_mesh_world.vertices)
     _, trimesh_indices = kdtree.query(np.asarray(mesh.vertices))

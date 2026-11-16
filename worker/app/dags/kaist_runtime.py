@@ -545,7 +545,8 @@ def execute(stage, episode, run_id, config_path, sam_prompt='', sam_scene='2d', 
     elif stage == 'reconstruct':
         paths = module(scripts / 'tracking_paths.py')
         # 10_reconstruct consumes approved tracking; it creates 06_reconstruction itself.
-        cli('10_reconstruct.py', paths.episode_root(project, episode), '--no-view')
+        # 마스크 재승인 → 재추적, 또는 코드 변경으로 기준이 바뀌면 기존 결과를 보관하고 새로 실행합니다(track과 동일).
+        cli('10_reconstruct.py', paths.episode_root(project, episode), '--no-view', '--auto-new-attempt')
     elif stage == 'hands':
         cli('18_fit_hands.py', recon, '--hand-side', 'right', '--no-view')
     elif stage == 'validate':

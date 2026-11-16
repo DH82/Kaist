@@ -398,7 +398,7 @@ def worker_gpu():
 @app.post('/worker/jobs/{action}')
 async def jobs(action:str,request:Request):
     # stop: 실행 강제 종료 · skip: 시작 전 단계 건너뜀 · sync/sync-status: 에피소드 작업 폴더를 NAS에 올리기 (모두 runner.py가 새 프로세스로 처리)
-    if action not in ('start','status','retry','stop','skip','sync','sync-status','sam-settings'):raise HTTPException(404)
+    if action not in ('start','status','retry','rewind','stop','skip','sync','sync-status','sam-settings'):raise HTTPException(404)
     raw=await request.body()
     if len(raw)>8192:raise HTTPException(413)
     r=subprocess.run(['/usr/bin/python3',str(WORKER_ROOT/'runner.py'),action],input=raw,capture_output=True,timeout=20)

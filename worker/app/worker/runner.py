@@ -67,6 +67,25 @@ def retry(req):
   write(p/'status.json',ready)
   return ready
 
+def rewind(req):
+ """앞 단계 다시 실행(UI 재시도가 마스크 재승인으로 바뀐 추적 입력을 감지한 경우): 끝난 작업(성공 포함)을 시작 전으로 되돌립니다.
+ 실행·대기 중인 작업은 건드리지 않고, 이전 기록은 retry와 같이 attempts/에 보관합니다."""
+ import shutil
+ p=folder(req)
+ if not p.exists():return {'state':'not_started'}
+ with (p/'launch.lock').open('a') as lock:
+  fcntl.flock(lock,fcntl.LOCK_EX)
+  if json.loads((p/'request.json').read_text())!=req:raise ValueError('Retry request differs from original')
+  st=status(p)
+  if st['state']=='not_started':return st
+  if st['state'] in ('queued','running'):raise ValueError('Running jobs cannot be rewound')
+  archive=p/'attempts'/uuid.uuid4().hex;archive.mkdir(parents=True)
+  for name in ('request.json','status.json','job.log','pid'):
+   if (p/name).exists():shutil.copy2(p/name,archive/name)
+  ready={'state':'not_started','stage':req['stage'],'retry_prepared':time.time(),'rewound_from':st['state'],'previous_attempt':str(archive),'log':str(p/'job.log')}
+  write(p/'status.json',ready)
+  return ready
+
 def run(p):
  req=json.loads((p/'request.json').read_text());initial=status(p)
  try:
@@ -264,4 +283,4 @@ if __name__=='__main__':
   elif action=='sam-settings':print(json.dumps(sam_settings(req),ensure_ascii=False))
   else:
    p=folder(req)
-   print(json.dumps(start(req) if action=='start' else retry(req) if action=='retry' else status(p)))
+   print(json.dumps(start(req) if action=='start' else retry(req) if action=='retry' else rewind(req) if action=='rewind' else status(p)))

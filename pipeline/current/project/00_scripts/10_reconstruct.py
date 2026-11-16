@@ -57,7 +57,7 @@ def logged(cmd,cwd,env,path,title,display):
    raise
  display.clear();print(title+' 완료',flush=True)
 
-def process(case,check=False,new=False,open_view=True):
+def process(case,check=False,new=False,open_view=True,auto_new=False):
  case=resolve(case);project,_=resolve_input(case)
  with lock(project):
   approval=require_approved(case);root,cwd,env=pipeline.runtime();python=str(root/'phystwin-env/bin/python')
@@ -71,6 +71,9 @@ def process(case,check=False,new=False,open_view=True):
    if not (prepared/item).exists():raise ValueError('3D 입력 누락: '+item)
   if check:print('3D 실행 환경과 승인 입력 확인 완료');return
   out=project/'06_reconstruction'/case.name
+  # auto_new: 추적(07_track)처럼, 승인·입력·코드가 기존 실행 기록과 다르면 기존 결과를 이력에 보관하고 새로 실행합니다.
+  if auto_new and not new and (out/'_resume/contract.json').exists() and json.loads((out/'_resume/contract.json').read_text())!=current_contract(approval,prepared,cwd):
+   print('3D 입력/승인/코드 변경 감지: 기존 결과를 이력에 보관하고 새로 실행합니다.',flush=True);new=True
   if new and out.exists():
    old_ref=json.loads((out/'tracking_approval.json').read_text());old_source=(out/old_ref['source']).resolve()
    target=project/'99_history/06_reconstruction'/case.name/pipeline.stamp();move(out,target)
@@ -120,9 +123,9 @@ def verify_outputs(out):
  return out
 
 def main():
- p=argparse.ArgumentParser(description=__doc__);p.add_argument('input',type=Path);p.add_argument('--check',action='store_true');p.add_argument('--new-attempt',action='store_true');p.add_argument('--no-view',action='store_true');a=p.parse_args()
+ p=argparse.ArgumentParser(description=__doc__);p.add_argument('input',type=Path);p.add_argument('--check',action='store_true');p.add_argument('--new-attempt',action='store_true');p.add_argument('--no-view',action='store_true');p.add_argument('--auto-new-attempt',action='store_true',help='기준이 바뀐 경우에만 --new-attempt처럼 동작');a=p.parse_args()
  if a.check and a.new_attempt:p.error('--check와 --new-attempt 동시 사용 불가')
- try:process(a.input,a.check,a.new_attempt,not a.no_view)
+ try:process(a.input,a.check,a.new_attempt,not a.no_view,a.auto_new_attempt)
  except KeyboardInterrupt:p.exit(130,'중단됨. 같은 명령으로 완료 단계를 재사용해 재개합니다.\n')
  except Exception as ex:p.exit(1,'중단: '+str(ex)+'\n')
 if __name__=='__main__':main()

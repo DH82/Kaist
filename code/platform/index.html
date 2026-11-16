@@ -379,7 +379,7 @@ $('retryCancel').onclick=()=>{if(!retryBusy)$('retryDialog').close()};
 $('retryDialog').addEventListener('cancel',e=>{if(retryBusy)e.preventDefault()});
 $('retryAccept').onclick=async()=>{
  if(retryBusy||!retryTarget)return;retryBusy=true;$('retryAccept').disabled=true;$('retryCancel').disabled=true;$('retryAccept').textContent='재시도 준비 중…';
- try{await api('/api/jobs/retry',{method:'POST',body:JSON.stringify(retryTarget)});$('retryDialog').close();notice('실패 단계의 재시도를 요청했습니다.');jobsSnapshot='';await loadJobs()}
+ try{const r=await api('/api/jobs/retry',{method:'POST',body:JSON.stringify(retryTarget)});$('retryDialog').close();notice(r&&r.stage&&r.requested_stage&&r.stage!==r.requested_stage?'마스크가 바뀌어 추적이 예전 마스크 기준입니다. 마스크 승인 확인 단계부터 다시 실행합니다(추적 → 추적 검수 → 3D 복원).':'실패 단계의 재시도를 요청했습니다.');jobsSnapshot='';await loadJobs()}
  catch(e){$('retryError').textContent=e.message}
  finally{retryBusy=false;$('retryAccept').disabled=false;$('retryCancel').disabled=false;$('retryAccept').textContent='다시 실행'}
 };
