@@ -213,7 +213,9 @@ const rawDateCal=createDateCalendar({toggle:$('rawDateToggle'),panel:$('rawCalen
  get:()=>rawDateFilter,set:v=>{if(v!==rawDateFilter){rawDateFilter=v;renderRawTable()}}});
 let rawTeam=null;
 function rawWho(e){
- const me=rawTeam&&rawTeam.me,name=e.operator||e.assigned_to;if(!name)return '<span class="help">미배정</span>';
+ const me=rawTeam&&rawTeam.me,name=e.operator||e.assigned_to;
+ if(!name&&e.elsewhere)return escape(e.elsewhere)+' <span class="help">(다른 PC · '+(e.elsewhere_started?'실행 시작':'배정·시작 전')+')</span>';
+ if(!name)return '<span class="help">미배정</span>';
  const label=escape(name)+(e.operator?'':' <span class="help">(배정·시작 전)</span>');
  return name===me?'<span class="rawMe">'+label+'</span>':label;
 }

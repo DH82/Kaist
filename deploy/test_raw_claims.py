@@ -47,8 +47,10 @@ class RawClaimTests(unittest.TestCase):
         self.assertEqual(len(mine), 3)
         self.assertEqual({ep for ep, pc in fleet.raw_claims().items() if pc == 'pc1'}, mine)
         d2 = self.raw_list('pc2', 'pc2.sqlite')
-        shown = {e['episode'] for e in d2['episodes']}
-        self.assertFalse(shown & mine)                      # PC1 배정분은 PC2 목록에 없음
+        others = {e['episode']: e for e in d2['episodes'] if e.get('elsewhere')}
+        self.assertEqual(set(others), mine)                 # PC1 배정분은 PC2에서 'PC1 담당' 조회 전용
+        for e in others.values():
+            self.assertEqual((e['elsewhere'], e['elsewhere_started'], e['can_run'], e['can_exclude'], e['assigned_to']), ('PC1', False, False, False, None))
         self.assertEqual({e['episode'] for e in d2['episodes'] if e.get('assigned_to') == 'PC2'}, set(EPS) - mine)
 
     def test_launch_refuses_raw_claimed_elsewhere(self):

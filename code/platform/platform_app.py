@@ -1022,7 +1022,7 @@ def raw_episodes(req:Request):
  for ep in others:
   pc=elsewhere[ep];ran=started_other.get(ep)==pc
   out.append({'episode':ep,'operator':None,'assigned_to':None,'can_run':False,'done':False,'excluded_from_mine':False,'can_exclude':False,
-              'elsewhere':pc.upper(),'elsewhere_started':ran,'progress':pc.upper()+(' 실행 시작' if ran else ' 배정 · 시작 전')})
+              'elsewhere':pc.upper(),'elsewhere_started':ran,'progress':'다른 PC에서 실행' if ran else '다른 PC 배정 · 실행 전'})
  return {'episodes':out,'team':{'total_users':team['total'],'operators':team['operators'],'admins':team['admins'],'target':team['target'],
          'load':team['load'],'me':user['name'],'role':user['role']}}
 
