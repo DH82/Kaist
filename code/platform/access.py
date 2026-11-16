@@ -1,5 +1,5 @@
 """Pilot name sessions and episode ownership. Names are not verified identities."""
-import secrets,time,json,threading,re
+import secrets,time,json,threading,re,os
 import intake
 from fastapi import HTTPException
 
@@ -34,6 +34,9 @@ def user(req):
  with db() as c:r=c.execute('SELECT name,role FROM ui_sessions WHERE token=? AND expires>?',(req.cookies.get('kaist_session',''),time.time())).fetchone()
  # PC1~PC6가 아닌 이름으로 만들어진 예전 세션은 다시 로그인해야 합니다.
  if not r or not pc_name(r['name']):raise HTTPException(401,'PC1~PC6 중 하나로 로그인하세요.')
+ # 이 화면은 PC_ID의 PC만 조작합니다. 다른 PC 이름 세션(예전 로그인)은 다시 로그인 → 그 PC 화면으로 넘어갑니다.
+ here=os.environ.get('PC_ID','').strip().lower()
+ if re.fullmatch(r'pc[1-6]',here) and r['name'].lower()!=here:raise HTTPException(401,f'이 화면은 {here.upper()}입니다. 다시 로그인하세요.')
  return dict(r)
 
 def admin(req):

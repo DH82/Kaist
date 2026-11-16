@@ -7,7 +7,7 @@ from datetime import datetime,timezone
 from urllib.parse import urlsplit,quote
 import httpx
 from fastapi import FastAPI,Request,HTTPException
-from fastapi.responses import HTMLResponse,Response,StreamingResponse,FileResponse
+from fastapi.responses import HTMLResponse,Response,StreamingResponse,FileResponse,RedirectResponse
 from starlette.background import BackgroundTask
 from pydantic import BaseModel,Field
 ROOT=Path(__file__).resolve().parents[1]
@@ -168,6 +168,12 @@ async def errors(req,call_next):
    username,password=base64.b64decode(encoded,validate=True).decode().split(':',1)
    valid=scheme.lower()=='basic' and secrets.compare_digest(username.encode(),expected_user.encode()) and secrets.compare_digest(password.encode(),Path(UI_PASSWORD_FILE).read_text().strip().encode())
   except (ValueError,UnicodeError):valid=False
+  # PC 연동: 다른 PC에서 로그인해 넘어온 1회용 토큰(/sso)과, 그렇게 만든 유효한 로그인 세션은 이 PC의
+  # 사이트 비밀번호를 다시 묻지 않습니다(세션은 비밀번호를 통과한 PC의 로그인으로만 생깁니다).
+  if not valid and req.url.path=='/sso':valid=True
+  if not valid and req.cookies.get('kaist_session'):
+   try:access.user(req);valid=True
+   except HTTPException:pass
   if not valid:return Response('로그인이 필요합니다.',status_code=401,headers={'WWW-Authenticate':'Basic realm="KAIST"'},media_type='text/plain')
  try:return await call_next(req)
  except Exception as e:
@@ -200,9 +206,30 @@ def login(data:Login,req:Request):
   users=json.loads(AIRFLOW_USERS.read_text())
   expected=users.get(os.environ.get('KAIST_AIRFLOW_USER','admin'),'')
   if not expected or not secrets.compare_digest(data.password.encode(),expected.encode()):raise HTTPException(403,'관리자 비밀번호가 일치하지 않습니다.')
+ # 로그인 이름 = 조작할 PC. 다른 PC 이름이면 그 PC의 UI로 넘겨줍니다(NAS 1회용 토큰, 다시 로그인 불필요).
+ if fleet.MACHINE_PC and name.lower()!=fleet.MACHINE_PC:
+  target=name.lower();st=fleet.read_pc(target) if fleet.available() else None
+  url=((st or {}).get('meta') or {}).get('ui_url')
+  if not st or not st.get('online') or not url:
+   raise HTTPException(409,f'{name} 화면에 연결할 수 없습니다. {name}의 UI가 켜져 있고 NAS에 연결되어 있는지 확인하세요. (이 화면은 {fleet.MACHINE_PC.upper()}입니다)')
+  token_value=fleet.handoff_create(target,name,data.role)
+  with access.db() as c:c.execute('INSERT INTO ui_audit VALUES(?,?,?)',(time.time(),name,'login-handoff '+fleet.MACHINE_PC+'->'+target))
+  return {'name':name,'role':data.role,'redirect':url.rstrip('/')+'/sso?t='+quote(token_value)}
  token=access.login(name,data.role)
  response=Response(json.dumps({'name':name,'role':data.role}),media_type='application/json')
  response.set_cookie('kaist_session',token,httponly=True,samesite='strict',secure=req.url.scheme=='https',max_age=43200)
+ return response
+
+@app.get('/sso')
+def sso(req:Request,t:str=''):
+ """다른 PC 화면에서 이 PC 이름으로 로그인했을 때 넘어오는 곳. 토큰은 한 번만, 60초 안에만 쓸 수 있습니다."""
+ guard(req)
+ h=fleet.handoff_take(t)
+ if not h:return HTMLResponse('<meta charset="utf-8"><p>로그인 연결이 만료되었거나 이미 사용되었습니다. <a href="/">다시 로그인</a>하세요.</p>',status_code=403)
+ token_value=access.login(h['name'],h['role'])
+ with access.db() as c:c.execute('INSERT INTO ui_audit VALUES(?,?,?)',(time.time(),h['name'],'login-sso from '+str(h.get('from'))))
+ response=RedirectResponse('/',status_code=303)
+ response.set_cookie('kaist_session',token_value,httponly=True,samesite='lax',secure=req.url.scheme=='https',max_age=43200)
  return response
 
 @app.post('/api/logout')
@@ -1462,7 +1489,7 @@ def published_rows():
  _published_cache[:]=[time.monotonic(),rows];return rows
 
 def fleet_snapshot():
- snap={'meta':{'host':os.uname().nodename,'label':worker(DEFAULT_WORKER).get('label'),'gpu_error':None}}
+ snap={'meta':{'host':os.uname().nodename,'label':worker(DEFAULT_WORKER).get('label'),'gpu_error':None,'ui_url':fleet.ui_url(ALLOWED_HOSTS)}}
  try:
   try:g=call('GET','/worker/gpu',worker_id=DEFAULT_WORKER)
   except (httpx.HTTPError,OSError,ValueError):g=local_gpu_status()

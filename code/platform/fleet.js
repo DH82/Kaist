@@ -16,7 +16,7 @@ function fleetCard(p){
  const mem=g&&g.total_mb?Math.round(100*g.used_mb/g.total_mb):0;
  const gpu=g?'<div class="help">'+escape(g.name||'GPU')+' · 사용률 '+(g.util??'—')+'%</div><div class="fleetBar" title="GPU 사용률"><span style="width:'+(g.util||0)+'%"></span></div><div class="help">메모리 '+fleetMB(g.used_mb)+' / '+fleetMB(g.total_mb)+' · 프로세스 '+(g.processes||0)+'개</div><div class="fleetBar" title="GPU 메모리"><span style="width:'+mem+'%"></span></div>':'<p class="help">GPU 정보 없음'+(p.meta?.gpu_error?' · '+escape(p.meta.gpu_error):'')+'</p>';
  const active=(p.active_runs||[]).map(r=>'<li>'+escape(r.episode||'')+' · '+escape(r.stage||r.state)+(r.operator?' · '+escape(r.operator):'')+'</li>').join('');
- return '<div class="fleetCard'+(p.online?'':' off')+'"><h3>'+name+badge+'</h3><div class="help">'+escape(p.meta?.host||'')+' · 갱신 '+fleetTime(p.meta?.updated_at)+'</div>'+gpu+
+ return '<div class="fleetCard'+(p.online?'':' off')+'"><h3>'+name+badge+'</h3><div class="help">'+escape(p.meta?.host||'')+' · 갱신 '+fleetTime(p.meta?.updated_at)+(p.meta?.ui_url?' · <a href="'+escape(p.meta.ui_url)+'" target="_blank" rel="noopener">화면 열기 ↗</a>':' · 화면 주소 없음')+'</div>'+gpu+
   '<dl><dt>진행 중</dt><dd>'+(s.running||0)+'개</dd><dt>최근 실행</dt><dd>성공 '+(s.success||0)+' · 실패 '+(s.failed||0)+' / '+(s.runs||0)+'</dd><dt>MANO 대기</dt><dd>'+(s.mano_waiting||0)+'개</dd><dt>NAS 최종 저장</dt><dd>'+(s.published||0)+'개 (오늘 '+(s.published_today||0)+')</dd></dl>'+(active?'<ul>'+active+'</ul>':'')+'</div>';
 }
 function renderFleet(){

@@ -105,7 +105,16 @@ services:
       KAIST_GPU_TEST_ENABLED: "false"
       KAIST_NAS_RAW_ROOT: /data/raw
       KAIST_INTAKE_DB: /var/lib/kaist/catalog.sqlite
+      # PC 연동(NAS control/): 이 PC 이름 · NAS 위치 · 다른 PC가 로그인 후 넘겨줄 이 UI 주소
+      PC_ID: ${PC_ID:-pc1}
+      NAS_MOUNT: ${NAS_MOUNT:-/mnt/kaist-data}
+      KAIST_UI_PUBLIC_URL: http://${HOST_IP:?run ./start.sh first}:${UI_PORT:-18083}
+    group_add: ["${NAS_GID:-65536}"]
     volumes:
+      - type: bind
+        source: ${NAS_MOUNT:-/mnt/kaist-data}
+        target: ${NAS_MOUNT:-/mnt/kaist-data}
+        bind: {propagation: rslave}
       - ${STACK_STATE_DIR:-.}/config:/opt/kaist-config:ro
       - ${STACK_STATE_DIR:-.}/state:/opt/airflow:ro
       - ${STACK_STATE_DIR:-.}/intake_state:/var/lib/kaist

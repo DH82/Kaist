@@ -136,3 +136,63 @@ def claim():
         except (OSError, ValueError):
             continue
     return out
+
+
+# ---- 로그인 기준 PC 연결: 어느 PC 화면에서든 PCn으로 로그인하면 PCn의 UI로 넘겨줍니다 ----
+# 이 UI가 돌아가는 PC. PC_ID 환경변수가 pc1~pc6일 때만 로그인 이름과 PC를 맞춥니다(미설정 = 단독 사용).
+MACHINE_PC = PC_ID if os.environ.get('PC_ID', '').strip().lower() in PCS else None
+HANDOFF_SECONDS = 60
+
+
+def ui_url(allowed_hosts):
+    """다른 PC가 이 UI로 보낼 주소. KAIST_UI_PUBLIC_URL, 없으면 허용 주소 중 LAN IP."""
+    url = os.environ.get('KAIST_UI_PUBLIC_URL', '').strip().rstrip('/')
+    if url:
+        return url
+    for host in sorted(allowed_hosts):
+        name = host.rsplit(':', 1)[0]
+        if re.fullmatch(r'\d+\.\d+\.\d+\.\d+', name) and not name.startswith('127.'):
+            return 'http://' + host
+    return None
+
+
+def _handoff_path(pc, token):
+    import hashlib
+    return CONTROL / 'handoff' / pc / (hashlib.sha256(token.encode()).hexdigest() + '.json')
+
+
+def handoff_create(pc, name, role):
+    """1회용 로그인 넘김 토큰(60초). NAS에는 토큰의 해시 이름으로만 저장합니다."""
+    if pc not in PCS:
+        raise ValueError('PC 이름이 잘못되었습니다.')
+    token = secrets.token_urlsafe(32)
+    path = _handoff_path(pc, token)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name('.' + path.name + '.tmp')
+    tmp.write_text(json.dumps({'pc': pc, 'name': name, 'role': role, 'from': PC_ID, 'expires': time.time() + HANDOFF_SECONDS}))
+    os.replace(tmp, path)
+    # 오래된 토큰 파일 정리
+    for old in path.parent.glob('*.json'):
+        try:
+            if old.stat().st_mtime < time.time() - 10 * HANDOFF_SECONDS:
+                old.unlink()
+        except OSError:
+            pass
+    return token
+
+
+def handoff_take(token):
+    """이 PC로 넘어온 토큰을 한 번만 사용합니다(rename으로 가져가고 바로 지움)."""
+    if not MACHINE_PC or not re.fullmatch(r'[A-Za-z0-9_-]{20,100}', token or ''):
+        return None
+    path = _handoff_path(MACHINE_PC, token)
+    taken = path.with_name(path.name + '.taken.' + secrets.token_hex(4))
+    try:
+        os.rename(path, taken)
+        data = json.loads(taken.read_text())
+        taken.unlink()
+    except (OSError, ValueError):
+        return None
+    if data.get('pc') != MACHINE_PC or float(data.get('expires') or 0) < time.time():
+        return None
+    return data

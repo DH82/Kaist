@@ -18,5 +18,5 @@ async function applySession(user){
 async function restoreSession(){try{const user=await api('/api/session');if(user.name){await applySession(user);return}}catch(e){$('loginError').textContent=e.message}$('loginDialog').showModal()}
 $('loginDialog').addEventListener('cancel',e=>e.preventDefault());
 $('loginRole').onchange=()=>{$('adminPasswordBox').classList.toggle('hidden',$('loginRole').value!=='admin')};
-$('loginForm').onsubmit=async e=>{e.preventDefault();$('loginError').textContent='';try{const user=await api('/api/login',{method:'POST',body:JSON.stringify({name:$('loginName').value,role:$('loginRole').value,password:$('adminPassword').value})});$('adminPassword').value='';await applySession(user)}catch(err){$('loginError').textContent=err.message}};
+$('loginForm').onsubmit=async e=>{e.preventDefault();$('loginError').textContent='';try{const user=await api('/api/login',{method:'POST',body:JSON.stringify({name:$('loginName').value,role:$('loginRole').value,password:$('adminPassword').value})});if(user.redirect){$('loginError').textContent=user.name+' 화면으로 이동합니다…';location.href=user.redirect;return}$('adminPassword').value='';await applySession(user)}catch(err){$('loginError').textContent=err.message}};
 $('logout').onclick=async()=>{try{await api('/api/logout',{method:'POST'});location.reload()}catch(e){notice(e.message,true)}};
