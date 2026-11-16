@@ -29,6 +29,8 @@ CREATE TABLE published (sam_target TEXT, episode TEXT, run_key TEXT, at REAL);
 CREATE TABLE commands (id TEXT PRIMARY KEY, type TEXT, episode TEXT, run_id TEXT, source_pc TEXT, target_pc TEXT, state TEXT,
                        step TEXT, message TEXT, requested_by TEXT, created REAL, updated REAL);
 CREATE TABLE assignments (episode TEXT PRIMARY KEY, operator TEXT);
+CREATE TABLE jobs (run_id TEXT, episode TEXT, stage TEXT, state TEXT, operator TEXT, sam_prompt TEXT,
+                   created REAL, started REAL, finished REAL, attempt INTEGER);
 """
 
 
@@ -54,7 +56,7 @@ def publish_status(snapshot):
         c.executescript(SCHEMA)
         meta = dict(snapshot.get('meta', {}), pc=PC_ID, updated_at=time.time())
         c.executemany('INSERT INTO meta VALUES(?,?)', [(k, json.dumps(v, ensure_ascii=False)) for k, v in meta.items()])
-        for table in ('gpu', 'runs', 'mano_waiting', 'published', 'commands', 'assignments'):
+        for table in ('gpu', 'runs', 'mano_waiting', 'published', 'commands', 'assignments', 'jobs'):
             rows = snapshot.get(table) or []
             if rows:
                 cols = list(rows[0])
@@ -75,9 +77,10 @@ def read_pc(pc):
         out = {'pc': pc, 'meta': {r['key']: json.loads(r['value']) for r in c.execute('SELECT * FROM meta')}}
         tables = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         # 이전 버전 PC의 상태 파일에는 없는 표가 있을 수 있습니다(예: assignments) → 빈 목록.
-        for table in ('gpu', 'runs', 'mano_waiting', 'published', 'commands', 'assignments'):
+        for table in ('gpu', 'runs', 'mano_waiting', 'published', 'commands', 'assignments', 'jobs'):
             out[table] = [dict(r) for r in c.execute(f'SELECT * FROM {table}')] if table in tables else []
         out['raw_started'] = [r[0] for r in c.execute('SELECT raw_episode FROM raw_started')]
+        out['has_jobs'] = 'jobs' in tables      # 단계별 작업 시간 기록을 올리는 버전인지
         c.close()
     except (sqlite3.Error, ValueError) as e:
         return {'pc': pc, 'error': str(e)}

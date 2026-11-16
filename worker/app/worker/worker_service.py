@@ -217,21 +217,25 @@ class Wand:
             self._stop();raise HTTPException(500,'SAM3 마법봉을 시작하지 못했습니다. worker/sam_wand.log를 확인하세요.')
     def segment(self,cfg,request):
         return self.call(cfg,request)
-    def call(self,cfg,request):
+    def call(self,cfg,request,fresh=False,stop_after=False):
         with self.lock:
-            if self.proc and self.proc.poll() is not None:self._stop()
-            if not self.proc:self._start(cfg)
-            self.last=time.monotonic()
-            try:
-                self.proc.stdin.write(json.dumps(request)+'\n');self.proc.stdin.flush()
-                line=self.proc.stdout.readline()
-            except (BrokenPipeError,OSError):line=''
-            self.last=time.monotonic()
-            if not line:
-                self._stop();raise HTTPException(500,'SAM3 마법봉이 종료됐습니다. 다시 시도하세요. (worker/sam_wand.log)')
-            result=json.loads(line)
-            if not result.get('ok'):raise HTTPException(409,result.get('error','분할하지 못했습니다.'))
-            return result
+            try:return self._call(cfg,request,fresh)
+            finally:
+                if stop_after:self._stop()
+    def _call(self,cfg,request,fresh):
+        if self.proc and (fresh or self.proc.poll() is not None):self._stop()
+        if not self.proc:self._start(cfg)
+        self.last=time.monotonic()
+        try:
+            self.proc.stdin.write(json.dumps(request)+'\n');self.proc.stdin.flush()
+            line=self.proc.stdout.readline()
+        except (BrokenPipeError,OSError):line=''
+        self.last=time.monotonic()
+        if not line:
+            self._stop();raise HTTPException(500,'SAM3 마법봉이 종료됐습니다. 다시 시도하세요. (worker/sam_wand.log)')
+        result=json.loads(line)
+        if not result.get('ok'):raise HTTPException(409,result.get('error','분할하지 못했습니다.'))
+        return result
     def status(self):
         return {'loaded':bool(self.proc and self.proc.poll() is None),'idle_seconds':WAND_IDLE}
     def _reaper(self):
@@ -270,7 +274,8 @@ TRACK_JOBS={}
 _track_lock=threading.Lock()
 def _track_run(job,dag_id,episode,cfg,req,apply):
     try:
-        res=wand.call(cfg,req)
+        # GPU 초기화: 마법봉 프로세스를 새로 띄워(이전 세션·캐시 메모리 해제) 추적하고, 끝나면 바로 내려 메모리를 돌려줍니다.
+        res=wand.call(cfg,req,fresh=True,stop_after=True)
         job.update(state='applying',track=res)
         out=edit_backend(dag_id,episode,'apply_track',data=apply,timeout=900)
         job.update(state='done',result=out,finished=time.time())
@@ -393,7 +398,7 @@ def worker_gpu():
 @app.post('/worker/jobs/{action}')
 async def jobs(action:str,request:Request):
     # stop: 실행 강제 종료 · skip: 시작 전 단계 건너뜀 · sync/sync-status: 에피소드 작업 폴더를 NAS에 올리기 (모두 runner.py가 새 프로세스로 처리)
-    if action not in ('start','status','retry','stop','skip','sync','sync-status'):raise HTTPException(404)
+    if action not in ('start','status','retry','stop','skip','sync','sync-status','sam-settings'):raise HTTPException(404)
     raw=await request.body()
     if len(raw)>8192:raise HTTPException(413)
     r=subprocess.run(['/usr/bin/python3',str(WORKER_ROOT/'runner.py'),action],input=raw,capture_output=True,timeout=20)

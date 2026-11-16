@@ -233,11 +233,11 @@ function renderRawTable(){
  rawEpisodes.forEach((e,i)=>{const d=rawCaptureDate(e.episode);if(e.excluded_from_mine&&!$('rawShowExcluded').checked)return;if(!isMine(e)&&(e.excluded_from_mine||!filter||filter===d))(groups[d]=groups[d]||[]).push(i)});
  renderRawTeam();
  const dates=Object.keys(groups).sort((a,b)=>a==='—'?1:b==='—'?-1:b.localeCompare(a));
- const row=i=>{const e=rawEpisodes[i];return '<tr data-raw-index="'+i+'" class="'+($('episode').value===e.episode?'rawSelected':'')+'"><td>'+(e.can_run?'<input type="radio" name="rawSelection" aria-label="'+escape(e.episode)+' 선택" '+($('episode').value===e.episode?'checked':'')+'>':'<span class="help">조회만</span>')+'</td><td>'+rawCaptureDate(e.episode)+'</td><td>'+escape(e.episode)+'</td><td>'+rawWho(e)+'</td><td>'+stageLabel(e.progress|| '단계 확인 중')+(e.excluded_from_mine?' <span class="help">· 내 작업에서 제외</span>':'')+'</td><td><button class="smallbtn" data-raw-preview="'+i+'">미리보기</button>'+((e.can_exclude||e.excluded_from_mine)?' <button type="button" class="smallbtn" data-raw-exclude="'+i+'"'+(rawExcludeBusy.has(e.episode)?' disabled':'')+'>'+(e.excluded_from_mine?'제외 취소':'내 작업에서 제외')+'</button>':'')+'</td></tr>'};
+ const row=i=>{const e=rawEpisodes[i];return '<tr data-raw-index="'+i+'" class="'+($('episode').value===e.episode?'rawSelected':'')+'"><td>'+(e.can_run?'<input type="radio" name="rawSelection" aria-label="'+escape(e.episode)+' 선택" '+($('episode').value===e.episode?'checked':'')+'>'+(rawBatchable(e)?'<input type="checkbox" class="rawPick" data-raw-pick="'+escape(e.episode)+'" title="RAW 전처리 일괄 실행에 포함" aria-label="'+escape(e.episode)+' 일괄 실행에 포함" '+(rawBatchPicked.has(e.episode)?'checked':'')+'>':''):'<span class="help">조회만</span>')+'</td><td>'+rawCaptureDate(e.episode)+'</td><td>'+escape(e.episode)+'</td><td>'+rawWho(e)+'</td><td>'+stageLabel(e.progress|| '단계 확인 중')+(e.excluded_from_mine?' <span class="help">· 내 작업에서 제외</span>':'')+'</td><td><button class="smallbtn" data-raw-preview="'+i+'">미리보기</button>'+((e.can_exclude||e.excluded_from_mine)?' <button type="button" class="smallbtn" data-raw-exclude="'+i+'"'+(rawExcludeBusy.has(e.episode)?' disabled':'')+'>'+(e.excluded_from_mine?'제외 취소':'내 작업에서 제외')+'</button>':'')+'</td></tr>'};
  const mineHtml=mine.length?'<tr class="rawDateGroup rawMineGroup"><td colspan="6">👤 내 작업 · '+mine.length+' / '+rawTeam.target+'개 (날짜 필터와 무관)</td></tr>'+mine.map(i=>row(i).replace('<tr ','<tr data-mine="1" ')).join(''):'';
  $('rawRows').innerHTML=mineHtml+(dates.map(d=>'<tr class="rawDateGroup"><td colspan="6">📅 '+(d==='—'?'날짜 미상':escape(d))+' · '+groups[d].length+'개</td></tr>'+groups[d].map(row).join('')).join('')||('<tr><td colspan="6">'+(filter&&rawEpisodes.length?escape(filter)+' 촬영 RAW 에피소드가 없습니다. 📅에서 다른 날짜나 전체 보기를 선택하세요.':'RAW 에피소드가 없습니다.')+'</td></tr>'));
  $('rawRows').querySelectorAll('tr[data-mine]').forEach(r=>r.classList.add('rawMine'));
- $('rawRows').querySelectorAll('[data-raw-index]').forEach(row=>row.onclick=event=>{if(event.target.closest('[data-raw-exclude]'))return;const e=rawEpisodes[+row.dataset.rawIndex];$('episode').value=e.episode;$('episode').dispatchEvent(new Event('change'));renderRawTable();if(event.target.closest('[data-raw-preview]'))revealSamPreview()});
+ rawBatchControls();$('rawRows').querySelectorAll('[data-raw-index]').forEach(row=>row.onclick=event=>{if(event.target.closest('[data-raw-exclude],[data-raw-pick]'))return;const e=rawEpisodes[+row.dataset.rawIndex];$('episode').value=e.episode;$('episode').dispatchEvent(new Event('change'));renderRawTable();if(event.target.closest('[data-raw-preview]'))revealSamPreview()});
 }
 async function refreshRawBoard(force=false){
  if((rawBoardBusy&&!force)||!currentUser)return;rawBoardBusy=true;const generation=++rawBoardGeneration;
@@ -264,3 +264,62 @@ $('rawRows').addEventListener('click',async event=>{
 setInterval(()=>{if(currentUser&&page==='run')refreshRawBoard()},15000);
 
 $('outputWorker').onchange=()=>{outputSeq++;outputPath='';outputRoot='project';outputRootsReady=false;openOutputExplorer()};
+
+// ---- RAW 전처리 일괄 실행: 고른 RAW마다 RAW 전처리만 하고 'SAM3 설정 대기'에서 멈춥니다 ----
+const rawBatchPicked=new Set();let rawBatchBusy=false;
+function rawBatchable(e){return e.can_run&&!e.operator&&!e.elsewhere}  // 아직 실행하지 않은, 내가 시작할 수 있는 RAW
+function rawBatchControls(){
+ const ok=new Set(rawEpisodes.filter(rawBatchable).map(e=>e.episode));
+ for(const ep of [...rawBatchPicked])if(!ok.has(ep))rawBatchPicked.delete(ep);
+ $('rawBatchPrep').disabled=rawBatchBusy||!rawBatchPicked.size;
+ $('rawBatchPrep').textContent='선택한 RAW 전처리 일괄 실행'+(rawBatchPicked.size?' ('+rawBatchPicked.size+'개)':'');
+ $('rawPickMine').disabled=!ok.size;
+}
+$('rawRows').addEventListener('change',e=>{const b=e.target.closest('[data-raw-pick]');if(!b)return;b.checked?rawBatchPicked.add(b.dataset.rawPick):rawBatchPicked.delete(b.dataset.rawPick);rawBatchControls()});
+$('rawPickMine').onclick=()=>{const me=rawTeam&&rawTeam.me;rawEpisodes.filter(e=>rawBatchable(e)&&(!me||e.assigned_to===me||rawTeam.role==='admin')).forEach(e=>rawBatchPicked.add(e.episode));renderRawTable()};
+$('rawBatchPrep').onclick=async()=>{
+ if(rawBatchBusy||!rawBatchPicked.size)return;
+ const eps=[...rawBatchPicked].sort();
+ if(!confirm('RAW '+eps.length+'개를 전처리 일괄 실행합니다.\n\n'+eps.join('\n')+'\n\n· 각 RAW마다 복사·QC·준비까지 실행하고 \'SAM3 설정 대기\'에서 멈춥니다.\n· 분할 대상은 아래 \'SAM3 설정 대기\'에서 에피소드별로 입력하면 SAM3부터 이어집니다.\n· GPU 작업은 PC의 GPU 슬롯 순서대로 진행됩니다. 진행할까요?'))return;
+ rawBatchBusy=true;rawBatchControls();$('rawBatchInfo').textContent='시작하는 중…';
+ try{
+  const r=await api('/api/run/batch-prep',{method:'POST',body:JSON.stringify({worker_id:selectedWorker(),episodes:eps,defer_mano:selectedWorker()==='gpu_4090_a'&&$('deferMano').checked})});
+  r.started.forEach(x=>rawBatchPicked.delete(x.raw));
+  $('rawBatchInfo').textContent='시작 '+r.started.length+'개'+(r.failed.length?' · 실패 '+r.failed.length+'개':'');
+  notice('RAW 전처리 일괄 실행: '+r.started.length+'개 시작'+(r.failed.length?' · 실패: '+r.failed.map(x=>x.episode+' ('+x.error+')').join(', '):''),r.failed.length>0);
+  refreshRawBoard(true);loadSamWaiting();jobsSnapshot='';if(typeof loadJobs==='function')loadJobs();
+ }catch(err){notice(err.message,true);$('rawBatchInfo').textContent=''}
+ finally{rawBatchBusy=false;rawBatchControls()}
+};
+
+// ---- SAM3 설정 대기: 분할 대상을 입력하면 같은 실행이 SAM3부터 이어서 진행 ----
+let samWaitBusy=false,samWaitSnap='';
+async function loadSamWaiting(){
+ if(samWaitBusy||!currentUser)return;samWaitBusy=true;
+ try{
+  const d=await api('/api/run/sam-waiting?worker_id='+encodeURIComponent(selectedWorker()));
+  // 입력 중인 칸은 지우지 않도록, 목록이 바뀌었을 때만 다시 그립니다.
+  const snap=JSON.stringify(d.runs.map(r=>[r.run_id,r.prepared]));if(snap===samWaitSnap)return;samWaitSnap=snap;
+  const typed={};$('samWaitRows').querySelectorAll('[data-sam-input]').forEach(i=>typed[i.dataset.samInput]=i.value);
+  $('samWaitRows').innerHTML=d.runs.length?d.runs.map(r=>'<div class="samWaitRow" data-run="'+escape(r.run_id)+'"><strong>'+escape(r.episode)+'</strong>'+(r.prepared?'':'<span class="help">전처리 중…</span>')+
+   '<button type="button" class="smallbtn" data-sam-preview="'+escape(r.raw_episode)+'">미리보기</button><input type="text" maxlength="200" placeholder="SAM3 분할 대상 (예: towel)" data-sam-input="'+escape(r.run_id)+'" value="'+escape(typed[r.run_id]||'')+'"'+(r.prepared?'':' disabled')+'>'+
+   '<button type="button" class="primary" data-sam-go="'+escape(r.run_id)+'" data-dag="'+escape(r.dag_id)+'" data-ep="'+escape(r.episode)+'"'+(r.prepared?'':' disabled')+'>SAM3 시작</button></div>').join(''):'<p class="help">SAM3 설정을 기다리는 실행이 없습니다.</p>';
+ }catch(e){$('samWaitRows').innerHTML='<p class="help">'+escape(e.message)+'</p>';samWaitSnap=''}
+ finally{samWaitBusy=false}
+}
+$('samWaitRefresh').onclick=()=>{samWaitSnap='';loadSamWaiting()};
+$('samWaitRows').addEventListener('keydown',e=>{if(e.key==='Enter'&&e.target.matches('[data-sam-input]')){const b=$('samWaitRows').querySelector('[data-sam-go="'+CSS.escape(e.target.dataset.samInput)+'"]');if(b)b.click()}});
+$('samWaitRows').addEventListener('click',async e=>{
+ const pv=e.target.closest('[data-sam-preview]');
+ if(pv){const ep=pv.dataset.samPreview;if([...$('episode').options].some(o=>o.value===ep)){$('episode').value=ep;$('episode').dispatchEvent(new Event('change'))}else notice('이 RAW는 실행 목록에 없어 미리보기를 열 수 없습니다.',true);return}
+ const b=e.target.closest('[data-sam-go]');if(!b)return;
+ const input=$('samWaitRows').querySelector('[data-sam-input="'+CSS.escape(b.dataset.samGo)+'"]'),prompt=input.value.trim();
+ if(!prompt){notice('SAM3 분할 대상을 입력하세요.',true);input.focus();return}
+ if(!confirm(b.dataset.ep+'\nSAM3 분할 대상: '+prompt+'\n\n이 설정으로 SAM3부터 이어서 실행할까요? (같은 실행에서는 나중에 바꿀 수 없습니다)'))return;
+ b.disabled=true;
+ try{await api('/api/run/sam-settings',{method:'POST',body:JSON.stringify({dag_id:b.dataset.dag,run_id:b.dataset.samGo,sam_prompt:prompt})});
+  notice(b.dataset.ep+' · SAM3 분할 대상 "'+prompt+'" 저장 · SAM3를 이어서 시작합니다.');samWaitSnap='';setTimeout(loadSamWaiting,1500);jobsSnapshot='';if(typeof loadJobs==='function')loadJobs()}
+ catch(err){notice(err.message,true);b.disabled=false}
+});
+setInterval(()=>{if(page==='run'&&!document.hidden)loadSamWaiting()},15000);
+setTimeout(loadSamWaiting,2500);

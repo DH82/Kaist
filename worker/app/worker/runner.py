@@ -237,6 +237,21 @@ def sync_run(episode):
   traceback.print_exc()
   write(d/'status.json',{'state':'failed','episode':episode,'started':started,'pid':os.getpid(),'finished':time.time(),'error':str(e)[-600:]})
 
+# ---- SAM3 분할 대상 저장 (UI 'SAM3 설정 대기' → 이어서 실행) ----
+# RAW 전처리만 하고 sam_settings_ready에서 기다리는 실행에, 파이프라인의 sam_local_setup.approve_only로
+# 03_prepared/<ep>/sam3_settings.json 을 저장합니다. 다음 확인 때 sam_settings_ready가 통과하고 SAM3가 시작됩니다.
+def sam_settings(req):
+ ep=req.get('episode','');prompt=str(req.get('prompt') or '').strip()
+ if not re.fullmatch('ep_[A-Za-z0-9_]+',ep):raise ValueError('Invalid episode')
+ if not 1<=len(prompt)<=200:raise ValueError('SAM3 분할 대상을 1~200자로 입력하세요.')
+ cfg=json.loads(CONFIG.read_text());scripts=Path(cfg['scripts_dir'])
+ if not (Path(cfg['project_dir'])/'03_prepared'/ep).is_dir():raise ValueError('RAW 전처리가 아직 끝나지 않았습니다: '+ep)
+ sys.path.insert(0,str(scripts))
+ import importlib.util
+ spec=importlib.util.spec_from_file_location('sam_local_setup',scripts/'sam_local_setup.py');mod=importlib.util.module_from_spec(spec);spec.loader.exec_module(mod)
+ settings=mod.approve_only(Path(cfg['project_dir']),ep,prompt,'2d')
+ return {'ok':True,'episode':ep,'settings':settings}
+
 if __name__=='__main__':
  if sys.argv[1]=='run':run(Path(sys.argv[2]))
  elif sys.argv[1]=='sync-run':sync_run(sys.argv[2])
@@ -246,6 +261,7 @@ if __name__=='__main__':
   elif action=='skip':print(json.dumps(skip(req)))
   elif action=='sync':print(json.dumps(sync_start(req)))
   elif action=='sync-status':print(json.dumps(sync_status(req)))
+  elif action=='sam-settings':print(json.dumps(sam_settings(req),ensure_ascii=False))
   else:
    p=folder(req)
    print(json.dumps(start(req) if action=='start' else retry(req) if action=='retry' else status(p)))

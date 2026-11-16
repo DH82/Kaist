@@ -58,6 +58,21 @@ def session_for(path):
     return sid
 
 
+def free_gpu(close_sessions=False):
+    """GPU 캐시 메모리 정리. close_sessions=True면 마법봉 이미지 세션도 모두 닫습니다."""
+    import gc
+    if close_sessions:
+        for sid in list(SESSIONS.values()):
+            try:
+                PREDICTOR.handle_request(request=dict(type='close_session', session_id=sid))
+            except Exception:
+                pass
+        SESSIONS.clear()
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def reset(sid):
     PREDICTOR.handle_request(request=dict(type='reset_session', session_id=sid))
 
@@ -162,6 +177,10 @@ def track(req):
             json.dump({'done': done, 'total': n, 'phase': phase}, f)
         os.replace(tmp, os.path.join(out, 'progress.json'))
     progress(0, 'seed')
+    # GPU 초기화: 마법봉 이미지 세션(최근 몇 개 캐시)을 모두 닫고 캐시 메모리를 비운 뒤 시작합니다.
+    free_gpu(close_sessions=True)
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
     seed, info = seed_mask(dict(req, image=os.path.join(color, f'{s}.png')))
     H, W = seed.shape
     # 구간만 무손실 mp4로 만듭니다(원본 PNG는 바꾸지 않음). 영상 안 프레임 번호 = 원래 번호 - a
@@ -178,12 +197,18 @@ def track(req):
         init = torch.from_numpy(seed.astype(np.float32) * 2 - 1).to(model.device)[None]
         # 정방향(start→to), 역방향(start→from). 방향마다 시드에서 새 추적을 시작합니다.
         for reverse, frames in ((False, range(s - a, n)), (True, range(s - a, -1, -1))):
-            model._prepare_backbone_feats(state, s - a, False)
+            # 방향마다 프레임 특징 캐시를 비우고 시작합니다(정방향에서 남은 특징이 역방향에 쌓이지 않게).
+            for k in [k for k in state['feature_cache'] if isinstance(k, int)]:
+                state['feature_cache'].pop(k, None)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            model._prepare_backbone_feats(state, s - a, reverse)
             trackers = model._tracker_add_new_objects(
                 frame_idx=s - a, num_frames=n, new_obj_ids=[0], new_obj_masks=init, tracker_states_local=[],
                 orig_vid_height=H, orig_vid_width=W, feature_cache=state['feature_cache'])
             for f in frames:
-                model._prepare_backbone_feats(state, f, False)
+                # reverse를 정확히 넘겨야 SAM3가 지난 프레임 특징을 지웁니다(틀리면 역방향에서 GPU 메모리가 계속 늘어남).
+                model._prepare_backbone_feats(state, f, reverse)
                 ids, low, _ = model._propogate_tracker_one_frame_local_gpu(
                     trackers, frame_idx=f, reverse=reverse, run_mem_encoder=True)
                 if reverse and f == s - a:
@@ -210,7 +235,9 @@ def track(req):
         if os.path.exists(video):
             os.unlink(video)
     progress(n, 'done')
-    return {'ok': True, 'frames': [a, b], 'start': s, 'nonempty': nonempty, 'empty': sorted(empty),
+    peak = int(torch.cuda.max_memory_allocated() / 2**20) if torch.cuda.is_available() else None
+    free_gpu()
+    return {'ok': True, 'peak_mb': peak, 'frames': [a, b], 'start': s, 'nonempty': nonempty, 'empty': sorted(empty),
             'seed_area': int(seed.sum()), 'method': info['method'], 'message': info['message']}
 
 

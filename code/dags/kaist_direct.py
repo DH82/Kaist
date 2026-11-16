@@ -4,7 +4,7 @@ from pathlib import Path
 from datetime import datetime,timezone
 sys.path.insert(0,str(Path(__file__).parent))
 from direct_worker import poll, poll_mano_batch
-from workers import dag_entries,worker,DEFAULT_WORKER,BATCH_DAG,MAX_PARALLEL_RUNS
+from workers import dag_entries,worker,DEFAULT_WORKER,BATCH_DAG,MAX_PARALLEL_RUNS,MAX_OPEN_RUNS,POOL_SLOTS
 from airflow.sdk import DAG,Param
 from airflow.providers.standard.sensors.python import PythonSensor
 
@@ -19,7 +19,8 @@ for worker_id,mode,dag_id in dag_entries():
     # 특정 촬영 에피소드를 기본값으로 고정하지 않고 실행할 때 반드시 받습니다.
     params={'episode_id':Param(type='string',pattern='^ep_[A-Za-z0-9_]+$')}
     if not raw:
-        params.update(sam_prompt=Param(type='string',minLength=1,maxLength=200),
+        # 빈 sam_prompt = RAW 전처리만 하고 sam_settings_ready에서 분할 대상 저장을 기다립니다(UI 'SAM3 설정 대기').
+        params.update(sam_prompt=Param(type='string',minLength=0,maxLength=200),
                       sam_scene=Param('2d',enum=['2d']),sam_settings_confirmed=Param(False,type='boolean'),
                       # text: 기존 텍스트 분할 / bbox_track: 첫 프레임 bbox+텍스트 단일 물체 추적(테스트 옵션)
                       # point_track: 첫 프레임 포인트(포함/제외)+텍스트 단일 물체 추적(테스트 옵션)
@@ -27,7 +28,7 @@ for worker_id,mode,dag_id in dag_entries():
                       sam_object_bboxes=Param(None,type=['null','object']),
                       sam_object_points=Param(None,type=['null','object']))
     with DAG(dag_id,schedule=None,catchup=False,start_date=datetime(2026,1,1,tzinfo=timezone.utc),
-             max_active_runs=MAX_PARALLEL_RUNS,max_active_tasks=MAX_PARALLEL_RUNS,is_paused_upon_creation=True,
+             max_active_runs=MAX_OPEN_RUNS,max_active_tasks=POOL_SLOTS,is_paused_upon_creation=True,
              params=params,tags=['kaist',worker_id,'연결됨' if pc['enabled'] else '미연결'],
              default_args={'pool':pc['pool'],'retries':0}) as dag:
         previous=None

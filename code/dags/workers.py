@@ -4,6 +4,10 @@ from pathlib import Path
 DEFAULT_WORKER='gpu_4090_a'
 # PC 한 대에서 동시에 진행할 수 있는 에피소드 실행 수 (Airflow 실행 수·풀 슬롯·UI 검사 공통)
 MAX_PARALLEL_RUNS=2
+# Airflow에 동시에 열려 있을 수 있는 실행 수(설정·검수 승인 대기 포함). 실제 계산 동시 수는 위 MAX_PARALLEL_RUNS(UI 검사)와
+# GPU PC의 GPU 슬롯이 제한합니다. 대기 중인 실행이 새 실행을 막지 않게 넉넉히 둡니다.
+MAX_OPEN_RUNS=16
+POOL_SLOTS=6
 REGISTRY=Path(os.environ.get('KAIST_WORKERS_FILE',str(Path(__file__).with_name('workers.json'))))
 def workers():
     rows=json.loads(REGISTRY.read_text())['workers']

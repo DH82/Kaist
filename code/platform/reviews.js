@@ -308,6 +308,7 @@ function hcAlertShow({key,title,episode,meta,kind,stage}){
  box.prepend(el);while(box.children.length>HC_ALERT_MAX)box.lastElementChild.remove();
 }
 async function hcAlertPoll(){
+ if(currentUser&&currentUser.role==='admin'){$('hcAlerts').innerHTML='';return}
  if(hcAlertBusy||!currentUser||document.hidden)return;
  hcAlertBusy=true;
  try{
@@ -315,7 +316,7 @@ async function hcAlertPoll(){
    hcAlertUser=currentUser.name+'/'+currentUser.role;$('hcAlerts').innerHTML='';
    try{hcAlertSeen=new Set(JSON.parse(sessionStorage.getItem('kaistAlertSeen:'+hcAlertUser)||'null')||[])}catch(e){hcAlertSeen=null}
   }
-  const d=await hcRequest(HC_BASE+'/queue');if(!currentUser)return;
+  const d=await hcRequest(HC_BASE+'/queue');if(!currentUser||currentUser.role==='admin')return;
   const pending=(d.reviews||[]).filter(x=>x.status!=='approved'&&(x.stage==='mask'||x.stage==='tracking'));
   const keys=new Set(pending.map(hcAlertKey));
   // 검수가 끝나 대기 목록에서 빠진 항목의 알림은 닫습니다.

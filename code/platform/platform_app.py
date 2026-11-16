@@ -15,7 +15,7 @@ sys.path.insert(0,str(Path(__file__).parent))
 import intake,access,re,fleet
 sys.path.insert(0,str(ROOT/'dags'))
 from direct_worker import call,token,request_for,MANO_STAGES,mano_cutoff,MANO_CUTOFF_HOUR
-from workers import workers,worker,dag_entries,dag_worker,DEFAULT_WORKER,DAY_DAG,BATCH_DAG,MAX_PARALLEL_RUNS
+from workers import workers,worker,dag_entries,dag_worker,DEFAULT_WORKER,DAY_DAG,BATCH_DAG,MAX_PARALLEL_RUNS,POOL_SLOTS
 DIRECT_DAGS={"test":"kaist_mac_to_4090_test","pipeline":"kaist_direct_pipeline_4090","raw":"kaist_direct_raw_4090"}
 if os.environ.get('KAIST_GPU_TEST_ENABLED','true').lower()=='false':DIRECT_DAGS.pop('test')
 @asynccontextmanager
@@ -127,15 +127,15 @@ def ensure_worker_pool(pc):
  try:
   current=local_api('GET',path)
   # 예전 1슬롯 풀을 동시 실행 수에 맞춰 늘립니다.
-  if current.get('slots',0)<MAX_PARALLEL_RUNS:
+  if current.get('slots',0)<POOL_SLOTS:
    # 실패해도 실행은 막지 않습니다(슬롯 1개로 순서 대기). Airflow 화면 Admin→Pools에서 직접 늘릴 수 있습니다.
-   try:local_api('PATCH',path,params={'update_mask':'slots'},json={'name':pc['pool'],'slots':MAX_PARALLEL_RUNS,'include_deferred':current.get('include_deferred',False)})
+   try:local_api('PATCH',path,params={'update_mask':'slots'},json={'name':pc['pool'],'slots':POOL_SLOTS,'include_deferred':current.get('include_deferred',False)})
    except httpx.HTTPError as exc:print('GPU 풀 슬롯 변경 실패:',pc['pool'],exc,flush=True)
   return
  except httpx.HTTPStatusError as exc:
   if exc.response.status_code!=404:raise
  try:
-  local_api('POST','/api/v2/pools',json={'name':pc['pool'],'slots':MAX_PARALLEL_RUNS,'description':pc['label']})
+  local_api('POST','/api/v2/pools',json={'name':pc['pool'],'slots':POOL_SLOTS,'description':pc['label']})
  except httpx.HTTPStatusError as exc:
   if exc.response.status_code!=409:raise
   local_api('GET',path)
@@ -186,7 +186,7 @@ def home(req:Request):
  return HTMLResponse((Path(__file__).parent/'index.html').read_text().replace('__CSRF__',CSRF),headers={'Cache-Control':'no-store','Content-Security-Policy':"default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; frame-src 'self'; img-src 'self' data: blob:; frame-ancestors 'none'"})
 
 class Login(BaseModel):
- name:str=Field(min_length=1,max_length=80)
+ name:str=Field(default='',max_length=80)
  role:str='operator'
  password:str=''
 
@@ -199,13 +199,19 @@ def session(req:Request):
 @app.post('/api/login')
 def login(data:Login,req:Request):
  guard(req)
- name=access.pc_name(data.name)
- if not name:raise HTTPException(403,'PC1 ~ PC6 중 하나의 이름으로만 로그인할 수 있습니다.')
  if data.role not in ('operator','admin'):raise HTTPException(400,'이름과 역할을 확인하세요.')
  if data.role=='admin':
+  # 관리자: PC 선택 없이 비밀번호만 확인하고 이 화면에서 바로 관리합니다(다른 PC로 넘기지 않음).
   users=json.loads(AIRFLOW_USERS.read_text())
   expected=users.get(os.environ.get('KAIST_AIRFLOW_USER','admin'),'')
   if not expected or not secrets.compare_digest(data.password.encode(),expected.encode()):raise HTTPException(403,'관리자 비밀번호가 일치하지 않습니다.')
+  token=access.login(access.ADMIN_NAME,'admin')
+  with access.db() as c:c.execute('INSERT INTO ui_audit VALUES(?,?,?)',(time.time(),access.ADMIN_NAME,'login-admin on '+access.here_pc()))
+  response=Response(json.dumps({'name':access.here_pc(),'role':'admin','label':access.ADMIN_NAME,'admin_login':True},ensure_ascii=False),media_type='application/json')
+  response.set_cookie('kaist_session',token,httponly=True,samesite='strict',secure=req.url.scheme=='https',max_age=43200)
+  return response
+ name=access.pc_name(data.name)
+ if not name:raise HTTPException(403,'PC1 ~ PC6 중 하나의 이름으로만 로그인할 수 있습니다.')
  # 로그인 이름 = 조작할 PC. 다른 PC 이름이면 그 PC의 UI로 넘겨줍니다(NAS 1회용 토큰, 다시 로그인 불필요).
  if fleet.MACHINE_PC and name.lower()!=fleet.MACHINE_PC:
   target=name.lower();st=fleet.read_pc(target) if fleet.available() else None
@@ -303,6 +309,7 @@ class Launch(BaseModel):
  sam_object_mode:str='text'
  sam_object_bboxes:dict|None=None
  sam_object_points:dict|None=None
+ prep:bool=False  # True: RAW 전처리만 하고 'SAM3 설정 대기'에서 멈춤(분할 대상은 나중에 입력)
 
 gpu_cache={}
 def local_gpu_status():
@@ -353,6 +360,24 @@ def object_points(value):
   result[cam]=clean
  return result
 
+# 사람의 입력을 기다리는 단계. 실행이 이 단계에 있으면 GPU를 쓰지 않으므로 PC당 동시 실행 한도에서 뺍니다.
+WAIT_STAGES=('sam_settings_ready','mask_approved','tracking_approved')
+PIPELINE_ORDER=['prepare_raw','sam_settings_ready','sam3','mask_approved','preflight','track','tracking_approved','prepare_reconstruction','reconstruct','hands','validate','publish']
+
+def current_stage(dag,run_id):
+ """실행의 현재 단계(순서상 첫 미완료 단계)와 그 태스크 상태"""
+ tasks={t['task_id']:t for t in run_tasks(dag,run_id)}
+ for stage in PIPELINE_ORDER:
+  t=tasks.get(stage)
+  if t and t['state'] not in ('success','skipped'):return stage,t['state']
+ return None,None
+
+def run_waiting(dag,run):
+ """설정·검수 승인을 기다리는 실행인지(실패한 단계가 아니라 대기 중일 때만)"""
+ try:stage,state=current_stage(dag,run['dag_run_id'])
+ except Exception:return False
+ return stage in WAIT_STAGES and state in ('up_for_reschedule','scheduled','queued','running',None)
+
 @app.post('/api/run')
 def launch(data:Launch,req:Request):
  guard(req)
@@ -387,9 +412,11 @@ def launch(data:Launch,req:Request):
     if row['state'] not in ('queued','running'):continue
     # 같은 RAW를 같은 PC에서 동시에 두 번 돌리지 않습니다.
     if data.mode in ('pipeline','raw') and (conf.get('raw_episode_id') or conf.get('episode_id'))==data.episode_id:raise HTTPException(409,'이 RAW는 선택한 PC에서 이미 실행 중입니다.')
-    running_here+=1
+    # 설정·검수 승인을 기다리는 실행은 GPU를 쓰지 않으므로 세지 않습니다.
+    if not run_waiting(other_dag,row):running_here+=1
   # PC 한 대에서 최대 MAX_PARALLEL_RUNS개까지 동시에 진행합니다.
-  if running_here>=MAX_PARALLEL_RUNS:raise HTTPException(409,f'선택한 PC에서 이미 {running_here}개 작업이 실행 중입니다. (최대 {MAX_PARALLEL_RUNS}개 동시 실행)')
+  # RAW 전처리 일괄 실행(prep)은 한도와 무관하게 시작합니다. 실제 GPU 동시 계산은 GPU PC의 GPU 슬롯이 2개로 제한합니다.
+  if running_here>=MAX_PARALLEL_RUNS and not data.prep:raise HTTPException(409,f'선택한 PC에서 이미 {running_here}개 작업이 실행 중입니다. (최대 {MAX_PARALLEL_RUNS}개 동시 실행)')
   if data.mode=='pipeline':
    for other_wid,_,other_dag in active_dags():
     if other_wid==data.worker_id:continue
@@ -397,8 +424,9 @@ def launch(data:Launch,req:Request):
     if any(r['state'] in ('queued','running') and (r.get('conf',{}).get('raw_episode_id') or r.get('conf',{}).get('episode_id'))==data.episode_id for r in rows):raise HTTPException(409,'이 RAW가 다른 PC에서 실행 중입니다.')
   conf={}
   if data.mode in ('raw','pipeline'):
-   if data.mode=='pipeline' and data.preview_episode!=data.episode_id:raise HTTPException(400,'선택한 에피소드 이미지를 먼저 확인하세요.')
-   if data.mode=='pipeline' and (not data.episode_id or not data.sam_prompt.strip() or not data.confirmed):raise HTTPException(400,'에피소드와 SAM3 대상을 입력하고 설정을 확인하세요.')
+   if data.prep and (data.mode!='pipeline' or data.sam_object_mode!='text'):raise HTTPException(400,'RAW 전처리 일괄 실행은 기본 분할 방식만 지원합니다.')
+   if data.mode=='pipeline' and not data.prep and data.preview_episode!=data.episode_id:raise HTTPException(400,'선택한 에피소드 이미지를 먼저 확인하세요.')
+   if data.mode=='pipeline' and not data.prep and (not data.episode_id or not data.sam_prompt.strip() or not data.confirmed):raise HTTPException(400,'에피소드와 SAM3 대상을 입력하고 설정을 확인하세요.')
    if data.sam_object_mode not in ('text','bbox_track','point_track'):raise HTTPException(400,'물체 분할 방식을 확인하세요.')
    bboxes=object_bboxes(data.sam_object_bboxes) if data.mode=='pipeline' and data.sam_object_mode=='bbox_track' else None
    points=object_points(data.sam_object_points) if data.mode=='pipeline' and data.sam_object_mode=='point_track' else None
@@ -418,7 +446,8 @@ def launch(data:Launch,req:Request):
      actual=call('GET','/worker/intake/fingerprint',params={'episode':data.episode_id},worker_id=data.worker_id,timeout=600)['fingerprint']
     if actual!=expected:raise HTTPException(409,'GPU PC가 같은 NAS 에피소드를 읽는지 확인되지 않았습니다. Worker 업데이트와 NAS 마운트를 확인하세요.')
    conf={'episode_id':data.episode_id,'operator_id':access.user(req)['name'],'worker_id':data.worker_id}
-   if data.mode=='pipeline':conf.update(sam_prompt=data.sam_prompt.strip(),sam_scene='2d',sam_settings_confirmed=True)
+   if data.mode=='pipeline' and data.prep:conf.update(sam_prompt='',sam_scene='2d',sam_settings_confirmed=False)
+   elif data.mode=='pipeline':conf.update(sam_prompt=data.sam_prompt.strip(),sam_scene='2d',sam_settings_confirmed=True)
    if bboxes:conf.update(sam_object_mode='bbox_track',sam_object_bboxes=bboxes)
    if points:conf.update(sam_object_mode='point_track',sam_object_points=points)
   ensure_worker_pool(pc)
@@ -1075,6 +1104,7 @@ def retry_job(data:RetryJob,req:Request):
    for other in recent:
     if other['dag_run_id']==data.run_id and dag==data.dag_id:continue
     if other_wid==wid and other['state'] in ('running','queued'):
+     if run_waiting(dag,other):continue  # 설정·승인 대기는 세지 않음
      running_here+=1
      if other.get('conf',{}).get('episode_id')==ep:raise HTTPException(409,'같은 에피소드가 실행 중입니다. 완료 후 재시도하세요.')
      if running_here>=MAX_PARALLEL_RUNS:raise HTTPException(409,f'이 PC에서 이미 {MAX_PARALLEL_RUNS}개 작업이 실행 중입니다. 하나가 끝난 뒤 재시도하세요.')
@@ -1531,6 +1561,40 @@ def published_rows():
  except OSError:pass
  _published_cache[:]=[time.monotonic(),rows];return rows
 
+# ---- 단계별 작업 시간 기록: 이 PC Worker의 jobs/<id>/{request,status}.json (재시도 이전 시도는 attempts/) ----
+JOB_LOG_DAYS=int(os.environ.get('KAIST_JOB_LOG_DAYS','14'))
+_job_cache=[0,[]]
+
+def worker_jobs_dir():
+ d=os.environ.get('KAIST_WORKER_JOBS_DIR')
+ if d:return Path(d)
+ tf=worker(DEFAULT_WORKER).get('token_file')
+ return Path(tf).with_name('jobs') if tf else None
+
+def job_records(operators=None):
+ """[{run_id,episode,stage,state,operator,sam_prompt,created,started,finished,attempt}] 최근 JOB_LOG_DAYS일.
+ attempt=0 현재(마지막) 시도, 1 이상 = 재시도로 보관된 이전 시도."""
+ if time.monotonic()-_job_cache[0]<30:rows=_job_cache[1]
+ else:
+  rows=[];root=worker_jobs_dir();since=time.time()-JOB_LOG_DAYS*86400
+  try:dirs=[d for d in root.iterdir() if d.is_dir() and not d.name.startswith('_')] if root and root.is_dir() else []
+  except OSError:dirs=[]
+  for d in dirs:
+   try:
+    if (d/'status.json').stat().st_mtime<since:continue
+    req=json.loads((d/'request.json').read_text())
+    tries=[json.loads((d/'status.json').read_text())]
+    if (d/'attempts').is_dir():
+     tries+=sorted((json.loads((a/'status.json').read_text()) for a in (d/'attempts').iterdir() if (a/'status.json').is_file()),key=lambda x:x.get('started') or 0,reverse=True)
+   except (OSError,ValueError):continue
+   for i,st in enumerate(tries):
+    if not st.get('started'):continue
+    rows.append({'run_id':req.get('run_id'),'episode':req.get('episode'),'stage':req.get('stage'),'state':st.get('state'),'operator':None,
+                 'sam_prompt':req.get('sam_prompt'),'created':st.get('created'),'started':st.get('started'),'finished':st.get('finished'),'attempt':i})
+  _job_cache[:]=[time.monotonic(),rows]
+ owners=access.owners();operators=operators or {}
+ return [dict(r,operator=owners.get(r['episode']) or operators.get(r['run_id'])) for r in rows]
+
 def fleet_snapshot():
  snap={'meta':{'host':os.uname().nodename,'label':worker(DEFAULT_WORKER).get('label'),'gpu_error':None,'ui_url':fleet.ui_url(ALLOWED_HOSTS)}}
  try:
@@ -1565,6 +1629,8 @@ def fleet_snapshot():
                'target_pc':p.get('target_pc') or fleet.PC_ID,'state':t['state'],'step':t['step'],'message':t['message'],'requested_by':p.get('requested_by'),'created':t['created'],'updated':t['updated']})
  snap['commands']=cmds
  snap['assignments']=[{'episode':ep,'operator':op} for ep,op in access.assignments().items()]
+ try:snap['jobs']=job_records({r['run_id']:r['operator'] for r in runs if r.get('operator')})
+ except Exception as e:print('작업 시간 기록 읽기 실패:',e,flush=True)
  return snap
 
 def reconcile_raw_claims(snap):
@@ -1615,8 +1681,15 @@ def fleet_view(pc):
   'success':sum(r['state']=='success' for r in runs),'mano_waiting':len(st.get('mano_waiting') or []),
   'published':len(st.get('published') or []),'published_today':sum(datetime.fromtimestamp(p['at']).strftime('%Y-%m-%d')==today for p in st.get('published') or [])}
  st['active_runs']=[r for r in runs if r['state'] in ('queued','running')]
- st.pop('runs',None);st.pop('raw_started',None)
+ st.pop('runs',None);st.pop('raw_started',None);st.pop('jobs',None)
  return st
+
+def free_raws(started):
+ """어느 PC에서도 선점·시작하지 않은 RAW(촬영일 RAW_QUEUE_START 이후)."""
+ try:raws=call('GET','/worker/info',worker_id=DEFAULT_WORKER)['episodes']
+ except Exception:raws=[]
+ own=access.owners()
+ return [e for e in raws if re.match(r'ep_(\d{8})_',e) and re.match(r'ep_(\d{8})_',e).group(1)>=RAW_QUEUE_START and e not in started and not own.get(e)]
 
 @app.get('/api/fleet')
 def fleet_status(req:Request):
@@ -1625,15 +1698,58 @@ def fleet_status(req:Request):
  pcs=fleet.read_all();started=dict(fleet.raw_claims())
  for p in pcs:
   for e in p.get('raw_started') or []:started.setdefault(e,p['pc'])
- try:raws=call('GET','/worker/info',worker_id=DEFAULT_WORKER)['episodes']
- except Exception:raws=[]
- own=access.owners()
- raw_free=[e for e in raws if re.match(r'ep_(\d{8})_',e) and re.match(r'ep_(\d{8})_',e).group(1)>=RAW_QUEUE_START and e not in started and not own.get(e)]
+ raw_free=free_raws(started)
  mano=[dict(m,pc=p['pc']) for p in pcs for m in p.get('mano_waiting') or []]
  commands=sorted((c for p in pcs for c in p.get('commands') or []),key=lambda c:-(c.get('updated') or 0))[:60]
  overlaps=fleet.overlaps(pcs)
  return {'me':fleet.PC_ID,'control':str(fleet.CONTROL),'overlaps':overlaps,'pcs':[fleet_view(p) for p in pcs],'raw_free':raw_free,'mano_waiting':mano,'commands':commands,
          'idle_rule':{'util_below':fleet.IDLE_UTIL,'free_mb_at_least':fleet.IDLE_FREE_MB,'stale_seconds':fleet.STALE_SECONDS}}
+
+@app.get('/api/fleet/pcs')
+def fleet_pcs(req:Request):
+ """관리자 PC 전환 메뉴용: PC별 연결 여부만 가볍게."""
+ guard(req);access.admin(req)
+ here=fleet.MACHINE_PC or fleet.PC_ID
+ if not fleet.available():return {'me':here,'pcs':[{'pc':here,'online':True}]}
+ return {'me':here,'pcs':[{'pc':p['pc'],'online':bool(p.get('online')) or p['pc']==here} for p in fleet.read_all()]}
+
+@app.get('/api/fleet/open')
+def fleet_open(req:Request,pc:str=''):
+ """관리자 원격 관리: 다른 PC 화면을 관리자로 바로 엽니다(그 PC의 사이트 비밀번호·로그인 없이).
+ NAS 1회용 넘김 토큰(60초)을 만들어 대상 PC의 /sso로 보냅니다. 이전 버전 PC도 받을 수 있게 세션 이름은 대상 PC 이름입니다."""
+ guard(req);admin=access.admin(req)
+ pc=pc.strip().lower()
+ if pc not in fleet.PCS:raise HTTPException(400,'PC 이름이 잘못되었습니다.')
+ if pc==fleet.MACHINE_PC or not fleet.MACHINE_PC and pc==fleet.PC_ID:return RedirectResponse('/#dashboard',status_code=303)
+ if not fleet.available():raise HTTPException(503,'NAS 관제 폴더를 사용할 수 없어 다른 PC로 연결할 수 없습니다.')
+ st=fleet.read_pc(pc);url=((st or {}).get('meta') or {}).get('ui_url')
+ if not st or not st.get('online') or not url:
+  return HTMLResponse(f'<meta charset="utf-8"><p>{pc.upper()} 화면에 연결할 수 없습니다. {pc.upper()}의 UI가 켜져 있고 NAS에 연결되어 있는지 확인하세요.</p>',status_code=409)
+ token_value=fleet.handoff_create(pc,pc.upper(),'admin')
+ with access.db() as c:c.execute('INSERT INTO ui_audit VALUES(?,?,?)',(time.time(),admin.get('label') or admin['name'],'admin-open '+fleet.PC_ID+'->'+pc))
+ return RedirectResponse(url.rstrip('/')+'/sso?t='+quote(token_value),status_code=303)
+
+@app.get('/api/fleet/report')
+def fleet_report(req:Request):
+ """관리자 통합 관리: PC1~PC6 상태 파일을 모아 단계별 작업 시간 기록·결과 저장·진행 상황을 한 번에 돌려줍니다.
+ 날짜별 집계는 화면(브라우저 시간대)에서 합니다. NAS를 못 쓰면 이 PC 기록만 보여줍니다."""
+ guard(req);access.admin(req)
+ if fleet.available():pcs=fleet.read_all()
+ else:
+  snap=fleet_snapshot();pcs=[dict(snap,pc=fleet.PC_ID,online=True,age=0,local_only=True)]
+ started=dict(fleet.raw_claims()) if fleet.available() else {}
+ out={'me':fleet.PC_ID,'nas':fleet.available(),'days':JOB_LOG_DAYS,'pcs':[],'jobs':[],'published':[],'runs':[],'mano_waiting':[]}
+ for p in pcs:
+  for e in p.get('raw_started') or []:started.setdefault(e,p['pc'])
+  g=(p.get('gpu') or [None])[0]
+  out['pcs'].append({'pc':p['pc'],'online':bool(p.get('online')),'missing':bool(p.get('missing')),'error':p.get('error'),'age':p.get('age'),
+   'updated_at':(p.get('meta') or {}).get('updated_at'),'ui_url':(p.get('meta') or {}).get('ui_url'),'has_jobs':bool(p.get('has_jobs') or p.get('local_only')),
+   'gpu':g,'assignments':len(p.get('assignments') or []),'idle':bool(p.get('idle'))})
+  for k in ('jobs','published','runs','mano_waiting'):
+   out[k]+=[dict(r,pc=p['pc']) for r in p.get(k) or []]
+ out['raw_free']=len(free_raws(started))
+ out['stage_names']=JOB_STAGES+['adopt']
+ return out
 
 class FleetDispatch(BaseModel):
  type:str=Field(pattern=r'^(run_raw|mano_transfer|mano_release|queue_reset|resolve_overlaps)$')
@@ -1688,7 +1804,77 @@ def fleet_dispatch(data:FleetDispatch,req:Request):
  with access.db() as c:c.execute('INSERT INTO ui_audit VALUES(?,?,?)',(time.time(),admin['name'],f"fleet {data.type} {data.episode} {data.source_pc}->{data.target_pc} {cmd['id']}"))
  return {'id':cmd['id'],'sent_to':data.target_pc if data.type=='run_raw' else data.source_pc}
 
+@app.get('/assets/dashboard.js')
+def dashboard_script(req:Request):
+ guard(req)
+ return FileResponse(Path(__file__).parent/'dashboard.js',media_type='application/javascript',headers={'Cache-Control':'no-store'})
+
 @app.get('/assets/fleet.js')
 def fleet_script(req:Request):
  guard(req)
  return FileResponse(Path(__file__).parent/'fleet.js',media_type='application/javascript',headers={'Cache-Control':'no-store'})
+
+
+# ================= RAW 전처리 일괄 실행 → SAM3 설정 대기 → 분할 대상 입력 후 이어서 실행 =================
+class BatchPrep(BaseModel):
+ worker_id:str=DEFAULT_WORKER
+ episodes:list[str]=Field(min_length=1,max_length=30)
+ defer_mano:bool=False
+
+@app.post('/api/run/batch-prep')
+def batch_prep(data:BatchPrep,req:Request):
+ """선택한 RAW마다 실행을 시작하되 분할 대상 없이 시작해, RAW 전처리 후 'SAM3 설정 대기'에서 멈추게 합니다."""
+ guard(req)
+ started=[];failed=[]
+ for ep in dict.fromkeys(data.episodes):
+  if not re.fullmatch(r'ep_[A-Za-z0-9_]+',ep):failed.append({'episode':ep,'error':'에피소드 이름이 잘못되었습니다.'});continue
+  try:
+   r=launch(Launch(worker_id=data.worker_id,mode='pipeline',episode_id=ep,prep=True,defer_mano=data.defer_mano),req)
+   started.append({'raw':ep,'episode':r['episode'],'run_id':r['run_id'],'dag_id':r['dag_id']})
+  except HTTPException as e:failed.append({'episode':ep,'error':str(e.detail)})
+ access.audit(req,'batch-prep '+','.join(x['raw'] for x in started))
+ return {'started':started,'failed':failed}
+
+@app.get('/api/run/sam-waiting')
+def sam_waiting(req:Request,worker_id:str=DEFAULT_WORKER):
+ """내 실행 중 RAW 전처리가 끝나 'SAM3 설정 대기'인 것"""
+ guard(req);out=[]
+ for wid,mode,dag in active_dags():
+  if wid!=worker_id or mode=='raw':continue
+  for r in local_api('GET',f'/api/v2/dags/{dag}/dagRuns',params={'limit':100,'order_by':'-logical_date','state':['running','queued']})['dag_runs']:
+   conf=r.get('conf') or {};ep=conf.get('episode_id','')
+   if conf.get('sam_settings_confirmed') or not access.allowed(req,ep):continue
+   try:stage,state=current_stage(dag,r['dag_run_id'])
+   except Exception:continue
+   if stage!='sam_settings_ready':continue
+   prepared=None
+   try:prepared=call('POST','/worker/jobs/status',json=request_for('prepare_raw',r['dag_run_id'],conf),worker_id=wid,timeout=15).get('state')=='success'
+   except Exception:pass
+   out.append({'dag_id':dag,'run_id':r['dag_run_id'],'episode':ep,'raw_episode':conf.get('raw_episode_id') or ep,
+               'operator':conf.get('operator_id'),'state':state,'prepared':prepared,'queued_at':r.get('queued_at')})
+ return {'runs':out}
+
+class SamSettings(BaseModel):
+ dag_id:str
+ run_id:str=Field(min_length=1,max_length=250)
+ sam_prompt:str=Field(min_length=1,max_length=200)
+
+@app.post('/api/run/sam-settings')
+def save_sam_settings(data:SamSettings,req:Request):
+ """'SAM3 설정 대기' 실행에 분할 대상을 저장하고 바로 다음 확인을 깨워 SAM3를 이어서 시작합니다."""
+ guard(req)
+ wid=dag_worker(data.dag_id)
+ if data.dag_id not in [d for w,m,d in active_dags()]:raise HTTPException(400,'실행을 확인하세요.')
+ run=local_api('GET',f'/api/v2/dags/{data.dag_id}/dagRuns/'+quote(data.run_id,safe=''));conf=run.get('conf') or {};ep=conf.get('episode_id','')
+ owner=access.owners().get(ep) or conf.get('operator_id')
+ if access.user(req)['role']!='admin' and owner!=access.user(req)['name']:raise HTTPException(403,'본인 실행만 설정할 수 있습니다.')
+ if run['state'] not in ('running','queued'):raise HTTPException(409,'진행 중인 실행이 아닙니다.')
+ stage,_=current_stage(data.dag_id,data.run_id)
+ if stage!='sam_settings_ready':raise HTTPException(409,'SAM3 설정 대기 단계가 아닙니다. 새로고침하세요.')
+ if call('POST','/worker/jobs/status',json=request_for('prepare_raw',data.run_id,conf),worker_id=wid,timeout=15).get('state')!='success':
+  raise HTTPException(409,'RAW 전처리가 아직 끝나지 않았습니다. 끝난 뒤 입력하세요.')
+ res=worker_action('sam-settings',{'episode':ep,'prompt':data.sam_prompt.strip()},wid)
+ try:nudge_gate(wid,ep,'sam_settings_ready')
+ except Exception as e:print('SAM3 설정 대기 깨우기 실패:',e,flush=True)
+ access.audit(req,'sam-settings '+ep+' '+data.sam_prompt.strip())
+ return {'ok':True,'episode':ep,'settings':res.get('settings')}

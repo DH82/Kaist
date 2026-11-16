@@ -25,6 +25,14 @@ def pc_name(name):
  n=re.sub(r'[\s_-]+','',str(name or '')).upper()
  return n if n in PC_NAMES else None
 
+# 관리자는 PC를 고르지 않고 이 이름으로 로그인합니다. 어느 PC 화면에서든 그 화면에서 바로 관리합니다.
+# 실행·담당 기록에는 이 화면의 PC 이름(PC_ID)이 들어가므로 결과 폴더(results/pcN) 규칙은 그대로입니다.
+ADMIN_NAME='관리자'
+
+def here_pc():
+ here=os.environ.get('PC_ID','').strip().lower()
+ return here.upper() if re.fullmatch(r'pc[1-6]',here) else 'PC1'
+
 def login(name,role):
  token=secrets.token_urlsafe(32)
  with db() as c:c.execute('INSERT INTO ui_sessions VALUES(?,?,?,?)',(token,name,role,time.time()+12*3600))
@@ -32,6 +40,8 @@ def login(name,role):
 
 def user(req):
  with db() as c:r=c.execute('SELECT name,role FROM ui_sessions WHERE token=? AND expires>?',(req.cookies.get('kaist_session',''),time.time())).fetchone()
+ if r and r['role']=='admin' and r['name']==ADMIN_NAME:
+  return {'name':here_pc(),'role':'admin','label':ADMIN_NAME,'admin_login':True}
  # PC1~PC6가 아닌 이름으로 만들어진 예전 세션은 다시 로그인해야 합니다.
  if not r or not pc_name(r['name']):raise HTTPException(401,'PC1~PC6 중 하나로 로그인하세요.')
  # 이 화면은 PC_ID의 PC만 조작합니다. 다른 PC 이름 세션(예전 로그인)은 다시 로그인 → 그 PC 화면으로 넘어갑니다.
@@ -80,7 +90,7 @@ _assign_lock=threading.Lock()
 def logged_in():
  """지금 세션이 유효한 사용자. 같은 이름이 작업자로도 로그인했으면 작업자로 셉니다."""
  with db() as c:rows=c.execute("SELECT name,MAX(role='operator') op FROM ui_sessions WHERE expires>? GROUP BY name",(time.time(),)).fetchall()
- rows=[r for r in rows if pc_name(r['name'])]  # 예전 이름 세션은 무효 → 배정 대상에서 제외
+ rows=[r for r in rows if pc_name(r['name']) or (r['name']==ADMIN_NAME and not r['op'])]  # 예전 이름 세션은 무효 → 배정 대상에서 제외
  ops=sorted(r['name'] for r in rows if r['op'])
  return {'total':len(rows),'operators':ops,'admins':len(rows)-len(ops)}
 
