@@ -1103,6 +1103,17 @@ def tracking_input_stale(wid,ep):
    return not x.get('ready',True) and any(r in str(x.get('reason','')) for r in STALE_TRACKING_REASONS)
  return False
 
+# 10_reconstruct.verify_outputs: 3D 결과를 만든 뒤 kaist-full 코드(align.py 등)·입력·설정이 바뀌면 MANO 이후 단계가 이 문구로 멈춥니다.
+STALE_3D_REASON='3D 입력/코드/설정 계약 변경'
+AFTER_3D_STAGES=('hands','validate','publish')
+
+def reconstruction_stale(wid,stage,run_id,conf):
+ """실패한 MANO·검사·저장 단계의 마지막 시도 로그가 '3D 계약 변경'이면 True(3D 복원부터 다시 해야 함)."""
+ from direct_worker import request_for
+ try:log=call('POST','/worker/log',json=request_for(stage,run_id,conf),worker_id=wid,timeout=15).get('log','')
+ except Exception:return False
+ return STALE_3D_REASON in log.rsplit('WORKER stage=',1)[-1]
+
 class RetryJob(BaseModel):
  dag_id:str
  run_id:str=Field(min_length=1,max_length=250)
@@ -1138,6 +1149,9 @@ def retry_job(data:RetryJob,req:Request):
   # 추적 뒤 단계(3D 복원 등)가 실패했는데 추적 입력이 예전 마스크 기준이면, 실패 단계만 다시 해도 같은 오류가 반복됩니다.
   # 마스크 승인 확인 단계부터 다시 돌려 새 마스크로 추적·추적 검수·3D 복원을 이어서 진행합니다.
   if order.index(data.stage)>order.index('track') and tracking_input_stale(wid,ep):start='mask_approved'
+  # 3D 결과 뒤 단계가 '3D 계약 변경'(파이프라인 업데이트로 kaist-full 코드가 바뀜 등)으로 실패했으면 같은 오류가 반복되므로
+  # 3D 복원부터 다시 돌립니다. 3D 복원은 --auto-new-attempt로 기존 결과를 99_history에 보관하고 새로 만듭니다.
+  elif data.stage in AFTER_3D_STAGES and reconstruction_stale(wid,data.stage,data.run_id,conf):start='reconstruct'
   targets=[t for t in tasks if order.index(t['task_id'])>=order.index(start)]
   rewound={t['task_id'] for t in targets if order.index(t['task_id'])<order.index(data.stage)}
   if any(t['state'] in (('running','queued','up_for_reschedule') if t['task_id'] in rewound else ('success','running','queued','up_for_reschedule')) for t in targets):raise HTTPException(409,'후속 단계에 완료 또는 실행 중인 작업이 있어 재시도를 중단했습니다.')
