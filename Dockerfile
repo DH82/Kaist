@@ -89,6 +89,17 @@ RUN "${DEP_ROOT}/python/cpython-3.10.22-linux-x86_64-gnu/bin/python3.10" -m venv
       -r /opt/kaist/requirements-worker.txt \
  && mkdir -p ${WORKER_ROOT}/config ${WORKER_ROOT}/worker/jobs \
  && chown -R ${HOST_UID} ${WORKER_ROOT}
+# [RTX 5090 대응] xformers 0.0.30은 FA3(Hopper sm_90a 전용 커널)를 CC>=9.0이면 고르기 때문에
+# RTX 5090(sm_120)에서 TRELLIS shape_prior가 "no kernel image is available"로 실패합니다.
+# CC>=10.0(Blackwell)에서는 FA3를 건너뛰고 FA2/cutlass를 쓰게 합니다. 4090(8.9)에는 영향 없음.
+RUN python3 - "${DEP_ROOT}/phystwin-env/lib/python3.10/site-packages/xformers/ops/fmha/dispatch.py" <<'EOF'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = "    return _USE_FLASH_ATTENTION_3\n"
+new = "    return _USE_FLASH_ATTENTION_3 and torch.cuda.get_device_capability() < (10, 0)\n"
+assert s.count(old) == 1, 'xformers dispatch.py changed; review FA3 patch'
+open(p, 'w').write(s.replace(old, new))
+EOF
 # worker/ 폴더는 실행 시 호스트 상태 폴더(gpu_state/worker: secret, jobs, 등록 폴더, GPU lock)를
 # 마운트하는 자리입니다. 코드는 /opt/kaist/worker-code에 두고 entrypoint가 매번 덮어씁니다.
 COPY --chown=${HOST_UID} worker/app/worker  /opt/kaist/worker-code
