@@ -12,7 +12,7 @@
 - 실행 중 잠금 파일(*.lock)은 올리지 않습니다
 - 올린 뒤 크기·시간 기준으로 다시 비교해 차이가 없을 때만 성공 기록(99_history/nas_sync/<ep>.json)을 남깁니다
 """
-import argparse, datetime, json, shutil, subprocess, sys
+import argparse, datetime, json, re, shutil, subprocess, sys
 from pathlib import Path
 
 # 에피소드 폴더가 놓이는 단계 폴더들 (pipeline/mask_paths 구조와 동일)
@@ -106,6 +106,42 @@ def sync_episode(cfg, ep, log=print):
     out.write_text(json.dumps(record, ensure_ascii=False, indent=2))
     log(f'NAS 작업 폴더 업로드 완료: {ep} → {nas} ({len(copied)}개 경로, {total/1e9:.2f} GB, 검증 통과)')
     return record
+
+
+def import_episode(cfg, source_pc, ep, log=print, allow_existing=False):
+    """MANO 이관: 다른 PC가 NAS work/<source_pc>에 검증 업로드한 에피소드 작업 폴더를 이 PC 작업 폴더로 가져옵니다.
+
+    - 원본 PC의 업로드 기록(99_history/nas_sync/<ep>.json)에 있는 경로만 가져옵니다.
+    - 이 PC에 같은 에피소드 폴더가 이미 있으면(다른 실행과 충돌) 거부합니다. allow_existing은 같은 이관의 재시도용.
+    - 가져온 뒤 rsync로 다시 비교해 차이가 0건이어야 성공입니다."""
+    if not re.fullmatch(r'pc[1-6]', source_pc or ''):
+        raise ValueError('원본 PC 이름이 잘못되었습니다: ' + str(source_pc))
+    if not Path(cfg['nas_mount']).is_mount():
+        raise RuntimeError('NAS가 마운트되어 있지 않습니다: ' + cfg['nas_mount'])
+    project = Path(cfg['project_dir'])
+    src_root = Path(cfg['nas_mount']) / 'work' / source_pc
+    record = json.loads((src_root / '99_history/nas_sync' / f'{ep}.json').read_text())
+    paths = record.get('paths') or []
+    if not any(p.startswith('06_reconstruction/') for p in paths):
+        raise RuntimeError('원본 PC의 NAS 업로드에 3D 복원 결과가 없습니다: ' + ep)
+    for rel in paths:
+        if Path(rel).name not in (ep, ep + '.json') or '..' in Path(rel).parts:
+            raise RuntimeError('업로드 기록의 경로가 에피소드 경로가 아닙니다: ' + rel)
+        if not allow_existing and (project / rel).exists():
+            raise RuntimeError('이 PC에 같은 에피소드 작업 폴더가 이미 있습니다: ' + rel)
+    total = 0
+    for rel in paths:
+        src = src_root / rel
+        if not src.exists():
+            raise RuntimeError('NAS 원본이 없습니다: ' + str(src))
+        rsync(src, project / rel); total += size(src)
+    diff = []
+    for rel in paths:
+        diff += rsync(src_root / rel, project / rel, dry=True)
+    if diff:
+        raise RuntimeError(f'가져온 사본 검증 실패 ({len(diff)}건): ' + '; '.join(diff[:5]))
+    log(f'NAS → 이 PC 가져오기 완료: {ep} ← {src_root} ({len(paths)}개 경로, {total/1e9:.2f} GB, 검증 통과)')
+    return {'paths': paths, 'bytes': total, 'source': str(src_root), 'source_record': record}
 
 
 def published_to_nas(project, ep):

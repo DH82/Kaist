@@ -201,10 +201,13 @@ $('folderRegister').onclick=async()=>{
  }catch(e){folderStatus(e.message,true)}finally{folderBusy=false;$('folderRegister').disabled=!chosenFolder}
 };
 
-let rawBoardBusy=false;
+let rawBoardBusy=false,rawBoardGeneration=0;
+const rawExcludeBusy=new Set();
 function rawCaptureDate(ep){const m=ep.match(/^ep_(\d{4})(\d{2})(\d{2})_/);return m?m[1]+'-'+m[2]+'-'+m[3]:'—'}
 // 기본값은 전날 기록(오늘 11/13 → 11/12). 📅에서 다른 날짜나 '전체 보기'로 바꿀 수 있습니다.
-let rawDateFilter=(()=>{const d=new Date();d.setDate(d.getDate()-1);return localDateKey(d)})();
+// 기본 RAW 날짜: 어제. 오늘이 월요일이면 지난 금요일(주말 촬영 없음).
+// 예외: RAW 대기열 첫날(2026-11-16)에는 전날이 아니라 당일이 기본입니다.
+let rawDateFilter=(()=>{const d=new Date();if(localDateKey(d)==='2026-11-16')return '2026-11-16';d.setDate(d.getDate()-(d.getDay()===1?3:1));return localDateKey(d)})();
 const rawDateCal=createDateCalendar({toggle:$('rawDateToggle'),panel:$('rawCalendar'),keepEmpty:true,
  counts:()=>{const c={};rawEpisodes.forEach(e=>{const d=rawCaptureDate(e.episode);c[d]=(c[d]||0)+1});return c},
  get:()=>rawDateFilter,set:v=>{if(v!==rawDateFilter){rawDateFilter=v;renderRawTable()}}});
@@ -223,23 +226,39 @@ function renderRawTable(){
  rawDateCal.refresh();
  const filter=rawDateFilter,groups={},me=rawTeam&&rawTeam.me;
  // 내 작업(시작 전 배정 + 3D 복원이 끝나지 않은 내 담당)은 날짜 필터와 상관없이 맨 위에 고정합니다.
- const isMine=e=>rawTeam&&rawTeam.role!=='admin'&&(e.assigned_to===me||(e.operator===me&&!e.done));
+ const isMine=e=>!e.excluded_from_mine&&rawTeam&&rawTeam.role!=='admin'&&(e.assigned_to===me||(e.operator===me&&!e.done));
  const mine=[];rawEpisodes.forEach((e,i)=>{if(isMine(e))mine.push(i)});
- rawEpisodes.forEach((e,i)=>{const d=rawCaptureDate(e.episode);if(!isMine(e)&&(!filter||filter===d))(groups[d]=groups[d]||[]).push(i)});
+ rawEpisodes.forEach((e,i)=>{const d=rawCaptureDate(e.episode);if(e.excluded_from_mine&&!$('rawShowExcluded').checked)return;if(!isMine(e)&&(e.excluded_from_mine||!filter||filter===d))(groups[d]=groups[d]||[]).push(i)});
  renderRawTeam();
  const dates=Object.keys(groups).sort((a,b)=>a==='—'?1:b==='—'?-1:b.localeCompare(a));
- const row=i=>{const e=rawEpisodes[i];return '<tr data-raw-index="'+i+'" class="'+($('episode').value===e.episode?'rawSelected':'')+'"><td>'+(e.can_run?'<input type="radio" name="rawSelection" aria-label="'+escape(e.episode)+' 선택" '+($('episode').value===e.episode?'checked':'')+'>':'<span class="help">조회만</span>')+'</td><td>'+rawCaptureDate(e.episode)+'</td><td>'+escape(e.episode)+'</td><td>'+rawWho(e)+'</td><td>'+stageLabel(e.progress|| '단계 확인 중')+'</td><td><button class="smallbtn" data-raw-preview="'+i+'">미리보기</button></td></tr>'};
+ const row=i=>{const e=rawEpisodes[i];return '<tr data-raw-index="'+i+'" class="'+($('episode').value===e.episode?'rawSelected':'')+'"><td>'+(e.can_run?'<input type="radio" name="rawSelection" aria-label="'+escape(e.episode)+' 선택" '+($('episode').value===e.episode?'checked':'')+'>':'<span class="help">조회만</span>')+'</td><td>'+rawCaptureDate(e.episode)+'</td><td>'+escape(e.episode)+'</td><td>'+rawWho(e)+'</td><td>'+stageLabel(e.progress|| '단계 확인 중')+(e.excluded_from_mine?' <span class="help">· 내 작업에서 제외</span>':'')+'</td><td><button class="smallbtn" data-raw-preview="'+i+'">미리보기</button>'+((e.can_exclude||e.excluded_from_mine)?' <button type="button" class="smallbtn" data-raw-exclude="'+i+'"'+(rawExcludeBusy.has(e.episode)?' disabled':'')+'>'+(e.excluded_from_mine?'제외 취소':'내 작업에서 제외')+'</button>':'')+'</td></tr>'};
  const mineHtml=mine.length?'<tr class="rawDateGroup rawMineGroup"><td colspan="6">👤 내 작업 · '+mine.length+' / '+rawTeam.target+'개 (날짜 필터와 무관)</td></tr>'+mine.map(i=>row(i).replace('<tr ','<tr data-mine="1" ')).join(''):'';
  $('rawRows').innerHTML=mineHtml+(dates.map(d=>'<tr class="rawDateGroup"><td colspan="6">📅 '+(d==='—'?'날짜 미상':escape(d))+' · '+groups[d].length+'개</td></tr>'+groups[d].map(row).join('')).join('')||('<tr><td colspan="6">'+(filter&&rawEpisodes.length?escape(filter)+' 촬영 RAW 에피소드가 없습니다. 📅에서 다른 날짜나 전체 보기를 선택하세요.':'RAW 에피소드가 없습니다.')+'</td></tr>'));
  $('rawRows').querySelectorAll('tr[data-mine]').forEach(r=>r.classList.add('rawMine'));
- $('rawRows').querySelectorAll('[data-raw-index]').forEach(row=>row.onclick=event=>{const e=rawEpisodes[+row.dataset.rawIndex];$('episode').value=e.episode;$('episode').dispatchEvent(new Event('change'));renderRawTable();if(event.target.closest('[data-raw-preview]'))revealSamPreview()});
+ $('rawRows').querySelectorAll('[data-raw-index]').forEach(row=>row.onclick=event=>{if(event.target.closest('[data-raw-exclude]'))return;const e=rawEpisodes[+row.dataset.rawIndex];$('episode').value=e.episode;$('episode').dispatchEvent(new Event('change'));renderRawTable();if(event.target.closest('[data-raw-preview]'))revealSamPreview()});
 }
-async function refreshRawBoard(){
- if(rawBoardBusy||!currentUser)return;rawBoardBusy=true;
- const wid=selectedWorker();try{const d=await api('/api/raw-episodes?worker_id='+encodeURIComponent(selectedWorker()));if(wid!==selectedWorker())return;rawEpisodes=d.episodes;rawTeam=d.team||null;const selected=$('episode').value;$('episode').innerHTML=rawEpisodes.map(e=>'<option value="'+escape(e.episode)+'">'+escape(e.episode)+'</option>').join('');$('episode').value=rawEpisodes.some(e=>e.episode===selected)?selected:'';renderRawTable();updateLaunch()}
- catch(e){notice(e.message,true)}finally{rawBoardBusy=false}
+async function refreshRawBoard(force=false){
+ if((rawBoardBusy&&!force)||!currentUser)return;rawBoardBusy=true;const generation=++rawBoardGeneration;
+ const wid=selectedWorker();try{const d=await api('/api/raw-episodes?worker_id='+encodeURIComponent(selectedWorker()));if(generation!==rawBoardGeneration||wid!==selectedWorker())return;rawEpisodes=d.episodes;rawTeam=d.team||null;const selected=$('episode').value;$('episode').innerHTML=rawEpisodes.map(e=>'<option value="'+escape(e.episode)+'">'+escape(e.episode)+'</option>').join('');$('episode').value=rawEpisodes.some(e=>e.episode===selected)?selected:'';renderRawTable();updateLaunch()}
+ catch(e){if(generation===rawBoardGeneration)notice(e.message,true)}finally{if(generation===rawBoardGeneration)rawBoardBusy=false}
 }
-$('refreshRaw').onclick=refreshRawBoard;
+$('refreshRaw').onclick=()=>refreshRawBoard();
+$('rawShowExcluded').onchange=renderRawTable;
+$('rawRows').addEventListener('click',async event=>{
+ const button=event.target.closest('[data-raw-exclude]');if(!button)return;
+ event.stopPropagation();const row=rawEpisodes[+button.dataset.rawExclude];if(!row||rawExcludeBusy.has(row.episode))return;
+ const excluded=!row.excluded_from_mine,wid=selectedWorker();
+ if(excluded&&!confirm(row.episode+'\n\n내 작업에서 제외할까요?\n이 RAW는 나에게 다시 자동 배정되지 않습니다. 다른 작업자에게는 배정될 수 있습니다.\n원본 파일과 실행 기록은 유지되며, 다른 RAW가 있으면 빈자리를 채웁니다.'))return;
+ rawExcludeBusy.add(row.episode);button.disabled=true;
+ try{
+  await api('/api/raw-episodes/exclude',{method:'POST',body:JSON.stringify({episode:row.episode,worker_id:wid,excluded})});
+  if(wid!==selectedWorker())return;
+  if(excluded&&$('episode').value===row.episode){$('episode').value='';$('episode').dispatchEvent(new Event('change'))}
+  notice(excluded?'내 작업에서 제외했습니다. 제외한 항목 보기에서 취소할 수 있습니다.':'제외를 취소했습니다. 자동 배정 조건에 따라 다시 배정됩니다.');
+  await refreshRawBoard(true);
+ }catch(error){notice(error.message,true)}
+ finally{rawExcludeBusy.delete(row.episode);renderRawTable()}
+});
 setInterval(()=>{if(currentUser&&page==='run')refreshRawBoard()},15000);
 
 $('outputWorker').onchange=()=>{outputSeq++;outputPath='';outputRoot='project';outputRootsReady=false;openOutputExplorer()};

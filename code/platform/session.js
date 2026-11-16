@@ -10,7 +10,7 @@ async function applySession(user){
  // 새로고침해도 보던 화면에 그대로 남습니다: #jobs, #outputs, #review, #review/<에피소드>/<mask|tracking>
  let saved='';try{saved=sessionStorage.getItem('kaistPage')||''}catch(e){}
  const [want,ep,stage]=decodeURIComponent(location.hash.slice(1)||saved).split('/');
- const pages=['run','jobs','review','outputs'].concat(admin?['intake','mywork']:[]);
+ const pages=['run','jobs','review','outputs'].concat(admin?['intake','mywork','fleet']:[]);
  const start=pages.includes(want)?want:'run';
  show(start==='review'&&ep?'run':start);await init();
  if(start==='review'&&ep&&/^ep_[A-Za-z0-9_]+$/.test(ep))openReview(ep,stage==='tracking'?'tracking':'mask');

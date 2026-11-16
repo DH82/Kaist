@@ -5,7 +5,7 @@ ROOT=Path(__file__).resolve().parent
 JOBS=ROOT/'jobs'
 CONFIG=ROOT.parent/'config/gpu_4090_a.json'
 ADAPTER=ROOT.parent/'dags/kaist_runtime.py'
-STAGES={'prepare_raw','sam_settings_ready','sam3','mask_approved','preflight','track','tracking_approved','prepare_reconstruction','reconstruct','hands','validate','publish'}
+STAGES={'adopt','prepare_raw','sam_settings_ready','sam3','mask_approved','preflight','track','tracking_approved','prepare_reconstruction','reconstruct','hands','validate','publish'}
 def write(path,data):
  tmp=path.with_name(path.name+'.'+uuid.uuid4().hex+'.tmp');tmp.write_text(json.dumps(data,indent=2));os.replace(tmp,path)
 def folder(req):
@@ -17,6 +17,10 @@ def folder(req):
  # bbox_track은 sam_object_bboxes, point_track은 sam_object_points만 함께 와야 합니다.
  mode=req.get('sam_object_mode');need={'bbox_track':'sam_object_bboxes','point_track':'sam_object_points'}
  if ('sam_object_mode' in req and mode not in need) or any((k in req)!=(mode==m) for m,k in need.items()):raise ValueError('Invalid SAM object mode')
+ # adopt(MANO 이관 받기)만 transfer_from(pc1~6)·transfer_key(원본 실행 키)를 함께 받습니다.
+ if (req['stage']=='adopt')!=('transfer_from' in req) or ('transfer_from' in req)!=('transfer_key' in req):raise ValueError('Invalid transfer request')
+ if 'transfer_from' in req and (not re.fullmatch('pc[1-6]',str(req['transfer_from'])) or not re.fullmatch('[0-9a-f]{24}',str(req['transfer_key']))):raise ValueError('Invalid transfer source')
+ if 'result_pc' in req and (req['stage']!='publish' or not re.fullmatch('pc[1-6]',str(req['result_pc']))):raise ValueError('Invalid result PC')
  if 'sam_object_bboxes' in req and len(json.dumps(req['sam_object_bboxes']))>1000:raise ValueError('Invalid SAM object bbox')
  if 'sam_object_points' in req and len(json.dumps(req['sam_object_points']))>6000:raise ValueError('Invalid SAM object points')
  return JOBS/hashlib.sha256((req['run_id']+'\0'+req['episode']+'\0'+req['stage']).encode()).hexdigest()[:32]
@@ -73,6 +77,8 @@ def run(p):
    write(p/'status.json',{**initial,'state':'running','started':time.time(),'pid':os.getpid(),'gpu_slot':slot})
    cmd=['/usr/bin/python3',str(ADAPTER),req['stage'],req['episode'],req['run_id'],'--config',str(CONFIG),'--sam-prompt',req.get('sam_prompt',''),'--sam-scene',req.get('sam_scene','2d')]
    if req.get('raw_episode'):cmd.extend(['--raw-episode',req['raw_episode']])
+   if req.get('result_pc'):cmd.extend(['--result-pc',req['result_pc']])
+   if req.get('transfer_from'):cmd.extend(['--transfer-from',req['transfer_from'],'--transfer-key',req['transfer_key']])
    if req.get('sam_confirmed',False):cmd.append('--sam-confirmed')
    if req.get('sam_object_mode')=='point_track':cmd.extend(['--object-mode','point_track','--object-points',json.dumps(req['sam_object_points'])])
    elif req.get('sam_object_mode'):cmd.extend(['--object-mode',req['sam_object_mode'],'--object-bboxes',json.dumps(req['sam_object_bboxes'])])

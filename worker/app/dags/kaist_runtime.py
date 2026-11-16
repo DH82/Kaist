@@ -87,10 +87,66 @@ def check_project_mount(cfg):
     return mounted
 
 
-def publish_result(source, cfg, episode, key, identity, receipt):
+def target_folder(text):
+    """SAM3 분할 대상(프롬프트) → NAS 폴더 이름. 경로 구분자·제어 문자만 바꾸고 나머지는 입력 그대로 둡니다."""
+    name = re.sub(r'[\x00-\x1f\x7f/\\]+', '_', str(text or ''))
+    name = re.sub(r'\s+', ' ', name).strip().strip('.').strip()
+    return name[:120] or '미지정'
+
+
+def sam_target(project, scripts, episode, prompt):
+    """이번 실행의 SAM3 분할 대상. 실행 요청에 없으면 저장된 분할 설정(_resume/contract.json)을 씁니다."""
+    if str(prompt or '').strip():
+        return prompt.strip()
+    try:
+        dest = module(Path(scripts) / 'mask_paths.py').episode_root(Path(project), episode)
+        return str(read(dest / '_resume/contract.json')['settings'].get('prompt') or '').strip()
+    except (OSError, KeyError, ValueError, AttributeError):
+        return ''
+
+
+def code_by_role(code, cfg):
+    """실행 고정(identity)의 코드 해시를 PC마다 다른 절대 경로 대신 파이프라인 안의 상대 경로로 바꿉니다."""
+    bases = {'scripts/': Path(cfg['scripts_dir']),
+             'data_process/': Path(cfg['pipeline_root']) / 'kaist-full/PhysTwin/Mono/data_process'}
+    out = {}
+    for path, sha in code.items():
+        path = Path(path)
+        for tag, base in bases.items():
+            if path.is_relative_to(base):
+                out[tag + str(path.relative_to(base))] = sha
+                break
+        else:
+            out[str(path)] = sha
+    return out
+
+
+def adopt_transfer(cfg, project, episode, source_pc, source_key, identity, receipt):
+    """MANO 이관 받기: 원본 PC 작업 폴더를 NAS에서 가져오고, 같은 파이프라인 코드인지 확인한 뒤 이 PC의 새 실행으로 고정합니다."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import sync_work
+    nas_work = Path(cfg['nas_mount']) / 'work' / source_pc
+    source_identity = read(nas_work / '_airflow' / episode / source_key / 'identity.json')
+    mine, theirs = code_by_role(identity['code'], cfg), code_by_role(source_identity['code'], source_identity['config'])
+    changed = sorted(k for k in set(mine) | set(theirs) if mine.get(k) != theirs.get(k))
+    if changed:
+        raise RuntimeError(f'원본 PC와 파이프라인 코드가 다릅니다 ({len(changed)}개 파일, 예: {", ".join(changed[:3])}). '
+                           '두 PC의 파이프라인 버전을 맞춘 뒤 다시 이관하세요.')
+    marker = receipt / 'transfer.json'
+    record = sync_work.import_episode(cfg, source_pc, episode, lambda m: print(m, flush=True),
+                                      allow_existing=marker.exists())
+    marker.write_text(json.dumps({'from': source_pc, 'source_key': source_key, 'source_run_id': source_identity.get('run_id'),
+                                  'source_identity_sha256': hashlib.sha256(json.dumps(source_identity, sort_keys=True).encode()).hexdigest(),
+                                  'paths': record['paths'], 'bytes': record['bytes']}, ensure_ascii=False, indent=2))
+    print(f'MANO 이관 받기 완료: {episode} ← {source_pc} (코드 {len(mine)}개 파일 일치)', flush=True)
+
+
+def publish_result(source, cfg, episode, key, identity, receipt, result_pc=None, target=''):
     nas = Path(cfg['nas_mount'])
     nas_ready = check_project_mount(cfg)
-    root = nas / cfg['nas_results_subdir'] if nas_ready else Path(cfg['project_dir']) / '07_deliverables' / 'local_results'
+    # NAS: results/<pc1~pc6>/<SAM3 분할 대상>/<에피소드>/<실행 키>. PC는 실행한 사용자(PC1~PC6), 없으면 이 PC 설정.
+    sub = 'results/' + result_pc if result_pc else cfg['nas_results_subdir']
+    root = (nas / sub if nas_ready else Path(cfg['project_dir']) / '07_deliverables' / 'local_results') / target_folder(target)
     destination = root / episode / key
     result = publish(source, destination, cfg['artifacts'], identity)
     record = {'destination': result, 'storage': 'nas' if nas_ready else 'local',
@@ -335,7 +391,14 @@ def copy_versioned_raw(pipeline, project, source, episode):
 
 
 def execute(stage, episode, run_id, config_path, sam_prompt='', sam_scene='2d', sam_confirmed=False, raw_episode=None,
-            object_mode='text', object_bboxes=None, object_points=None):
+            object_mode='text', object_bboxes=None, object_points=None, result_pc=None,
+            transfer_from=None, transfer_key=None):
+    if result_pc is not None and not re.fullmatch(r'pc[1-6]', result_pc):
+        raise ValueError('Invalid result PC')
+    if (stage == 'adopt') != bool(transfer_from) or bool(transfer_from) != bool(transfer_key):
+        raise ValueError('adopt stage needs transfer_from and transfer_key (and only adopt uses them)')
+    if transfer_from and (not re.fullmatch(r'pc[1-6]', transfer_from) or not re.fullmatch(r'[0-9a-f]{24}', transfer_key)):
+        raise ValueError('Invalid transfer source')
     if object_mode not in OBJECT_MODES:
         raise ValueError('Unknown object mode')
     bboxes = parse_object_bboxes(object_bboxes) if object_mode == 'bbox_track' else None
@@ -377,6 +440,13 @@ def execute(stage, episode, run_id, config_path, sam_prompt='', sam_scene='2d', 
     if raw_episode:
         identity['raw_episode'] = raw_episode
     pinned = receipt / 'identity.json'
+    if stage == 'adopt':
+        # 이관 받은 실행: 가져오기·코드 확인이 끝난 뒤에만 이 PC의 실행으로 고정합니다(MANO 단계만 이어서 실행).
+        if pinned.exists() and read(pinned) == identity and (receipt / 'transfer.json').exists():
+            return True
+        adopt_transfer(cfg, project, episode, transfer_from, transfer_key, identity, receipt)
+        pinned.write_text(json.dumps(identity, indent=2))
+        return True
     if raw_episode and not pinned.exists():
         for stage_dir in ('01_raw','02_qc','03_prepared','04_masks/pending','04_masks/approved','05_tracking/pending','05_tracking/approved','06_reconstruction'):
             if (project / stage_dir / episode).exists():
@@ -481,7 +551,8 @@ def execute(stage, episode, run_id, config_path, sam_prompt='', sam_scene='2d', 
     elif stage == 'validate':
         module(scripts / '18_fit_hands.py').verify(recon / 'hands')
     elif stage == 'publish':
-        result = publish_result(recon, cfg, episode, key, identity, receipt)
+        result = publish_result(recon, cfg, episode, key, identity, receipt, result_pc,
+                                sam_target(project, scripts, episode, sam_prompt))
         if check_project_mount(cfg):
             # 예전(NAS 작업 폴더) 방식과 같게: 이 에피소드의 단계별 작업 폴더 전체를 NAS work/<pc>에 미러링
             sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -504,6 +575,9 @@ if __name__ == '__main__':
     p.add_argument('stage'); p.add_argument('episode'); p.add_argument('run_id')
     p.add_argument('--config', required=True)
     p.add_argument('--raw-episode')
+    p.add_argument('--result-pc', default=None, help='NAS results/<pc1~pc6> (실행한 사용자)')
+    p.add_argument('--transfer-from', default=None, help='adopt: 원본 PC (pc1~pc6)')
+    p.add_argument('--transfer-key', default=None, help='adopt: 원본 실행 키')
     p.add_argument('--sam-prompt', default='')
     p.add_argument('--sam-scene', choices=['2d'], default='2d')
     p.add_argument('--sam-confirmed', action='store_true')
@@ -512,7 +586,7 @@ if __name__ == '__main__':
     p.add_argument('--object-points', default=None, help='JSON {"0".."3": [[x,y,label],...]} normalized')
     a = p.parse_args()
     result = execute(a.stage, a.episode, a.run_id, a.config, a.sam_prompt, a.sam_scene, a.sam_confirmed, a.raw_episode,
-                     a.object_mode, a.object_bboxes, a.object_points)
+                     a.object_mode, a.object_bboxes, a.object_points, a.result_pc, a.transfer_from, a.transfer_key)
     print(json.dumps(result))
     if result is False:
         sys.exit(75)

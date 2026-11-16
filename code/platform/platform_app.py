@@ -12,7 +12,7 @@ from starlette.background import BackgroundTask
 from pydantic import BaseModel,Field
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(Path(__file__).parent))
-import intake,access,re
+import intake,access,re,fleet
 sys.path.insert(0,str(ROOT/'dags'))
 from direct_worker import call,token,request_for,MANO_STAGES,mano_cutoff,MANO_CUTOFF_HOUR
 from workers import workers,worker,dag_entries,dag_worker,DEFAULT_WORKER,DAY_DAG,BATCH_DAG,MAX_PARALLEL_RUNS
@@ -193,8 +193,9 @@ def session(req:Request):
 @app.post('/api/login')
 def login(data:Login,req:Request):
  guard(req)
- name=data.name.strip()
- if not name or data.role not in ('operator','admin'):raise HTTPException(400,'이름과 역할을 확인하세요.')
+ name=access.pc_name(data.name)
+ if not name:raise HTTPException(403,'PC1 ~ PC6 중 하나의 이름으로만 로그인할 수 있습니다.')
+ if data.role not in ('operator','admin'):raise HTTPException(400,'이름과 역할을 확인하세요.')
  if data.role=='admin':
   users=json.loads(AIRFLOW_USERS.read_text())
   expected=users.get(os.environ.get('KAIST_AIRFLOW_USER','admin'),'')
@@ -234,6 +235,14 @@ def operator_assign(data:dict,req:Request):
  access.audit(req,'assign '+ep+' '+name)
  return {'ok':True}
 
+# RAW 대기열 시작일: 이 날짜(촬영일) 이전 RAW는 새로 배정·표시하지 않습니다.
+# 이미 담당자나 실행 기록이 있는 RAW는 진행 중 작업이므로 그대로 보여 줍니다.
+RAW_QUEUE_START='20261116'
+
+def raw_in_queue(ep,owners,started=()):
+ m=re.match(r'ep_(\d{8})_',ep)
+ return bool(m and m.group(1)>=RAW_QUEUE_START) or bool(owners.get(ep)) or ep in started
+
 def raw_row(ep,owner,user):
  can_run=not owner or owner==user['name']
  visible=can_run or user['role']=='admin'
@@ -249,6 +258,7 @@ def info(req:Request):
  d['airflow_public_url']=AIRFLOW_PUBLIC
  d['gpu_test_enabled']='test' in DIRECT_DAGS and access.user(req)['role']=='admin'
  owners=access.owners();user=access.user(req)
+ d['episodes']=[ep for ep in d['episodes'] if raw_in_queue(ep,owners)]
  d['raw_episodes']=[raw_row(ep,owners.get(ep),user) for ep in d['episodes']]
  d['episodes']=[ep for ep in d['episodes'] if access.selectable(req,ep)]
  return d
@@ -319,7 +329,7 @@ def launch(data:Launch,req:Request):
  guard(req)
  if data.mode=='test':access.admin(req)
  elif access.owners().get(data.episode_id) not in (None,access.user(req)['name']):raise HTTPException(403,'다른 작업자가 선택한 에피소드입니다.')
- elif not access.selectable(req,data.episode_id):raise HTTPException(403,'본인에게 배정된 RAW만 시작할 수 있습니다. RAW 목록의 내 배정을 확인하세요.')
+ elif not access.selectable(req,data.episode_id,data.worker_id):raise HTTPException(403,'본인에게 배정된 RAW만 시작할 수 있습니다. RAW 목록의 내 배정을 확인하세요.')
  if data.mode not in DIRECT_DAGS:raise HTTPException(400,'실행 모드를 선택하세요.')
  try:pc=worker(data.worker_id)
  except ValueError as e:raise HTTPException(400,str(e))
@@ -330,6 +340,8 @@ def launch(data:Launch,req:Request):
   if data.worker_id!=DEFAULT_WORKER or data.mode!='pipeline':raise HTTPException(400,'PC1 전체 파이프라인에서만 선택할 수 있습니다.')
   dag=DAY_DAG
  with lock:
+  if data.mode in ('raw','pipeline') and not access.selectable(req,data.episode_id,data.worker_id):
+   raise HTTPException(403,'배정이 변경되었거나 내 작업에서 제외한 RAW입니다. 목록을 새로고침하세요.')
   active=local_api('GET',f'/api/v2/dags/{dag}/dagRuns',params={'limit':100,'order_by':'-logical_date'})
   # MANO 대기(3D 복원 완료)와 MANO 일괄 실행은 동시 실행 수에 넣지 않습니다(퇴근 후 일괄 실행용).
   # 실제 GPU 동시 연산은 Worker의 GPU 슬롯(gpu_slots.py)이 제한하므로, 겹치면 GPU 작업이 잠시 queued로 기다립니다.
@@ -418,12 +430,26 @@ def check_batch_idle():
  if any(r['state'] in ('running','queued') for r in airflow_runs(BATCH_DAG)):
   raise HTTPException(409,'PC1 MANO 일괄 실행이 진행 중입니다.')
 
+BATCH_OF={}  # run_id → 그 실행이 들어 있는 가장 최근 MANO 일괄 실행 ID (batch_history가 갱신)
+
 def batch_history():
- history={}
+ history={};batch_of={}
  for batch in airflow_runs(BATCH_DAG):
   for source in batch['conf'].get('sources',[]):
-   history.setdefault(source['run_id'],batch['state'])
+   history.setdefault(source['run_id'],batch['state']);batch_of.setdefault(source['run_id'],batch['dag_run_id'])
+ BATCH_OF.clear();BATCH_OF.update(batch_of)
  return history
+
+# ---- MANO 일괄 실행 대기열에서 에피소드 하나 제거 ----
+def mano_removed_db():
+ c=access.db()
+ c.execute('CREATE TABLE IF NOT EXISTS mano_removed (batch_run_id TEXT NOT NULL,run_id TEXT NOT NULL,episode TEXT,name TEXT,at REAL,PRIMARY KEY(batch_run_id,run_id))')
+ return c
+
+def mano_removed(batch_run_id=None):
+ with mano_removed_db() as c:
+  rows=c.execute('SELECT batch_run_id,run_id FROM mano_removed'+(' WHERE batch_run_id=?' if batch_run_id else ''),(batch_run_id,) if batch_run_id else ()).fetchall()
+ return {(r[0],r[1]) for r in rows}
 
 MANO_DONE=set()  # publish까지 끝난 실행(run_id)은 다시 묻지 않습니다.
 
@@ -431,6 +457,8 @@ def mano_progress(run,history):
  run_id=run['dag_run_id']
  state=history.get(run_id)
  if not state:return 'MANO 대기',True
+ if BATCH_OF.get(run_id) and (BATCH_OF[run_id],run_id) in mano_removed(BATCH_OF[run_id]):
+  return 'MANO 대기 · 일괄 실행에서 제거됨',True
  if run_id in MANO_DONE:return '전체 완료',False
  in_batch=state in ('running','queued')
  for stage,label in zip(reversed(MANO_STAGES),('최종 저장','결과 검사','MANO 피팅')):
@@ -572,11 +600,11 @@ def jobs(req:Request):
        if st.get('progress'):entry['progress']=st['progress']
        item.setdefault('tasks',[]).append(entry)
    item['review_required']=next((t['review_stage'] for t in item.get('tasks',[]) if t.get('review_required')),None)
-   item['can_retry']=bool(r['state']=='failed' and (r.get('conf',{}).get('operator_id') or owners.get(item['episode']))==user['name'] and any(t.get('state')=='failed' for t in item.get('tasks',[])))
+   item['can_retry']=bool(r['state']=='failed' and (owners.get(item['episode']) or r.get('conf',{}).get('operator_id'))==user['name'] and any(t.get('state')=='failed' for t in item.get('tasks',[])))
    if mode!='test' and summary and not detailed:
     item['tasks']=[t for t in item['tasks'] if t['state'] not in ('success','skipped')]
     item['summary_only']=True
-   item['operator']=r.get('conf',{}).get('operator_id') or '—';out.append(item)
+   item['operator']=owners.get(item['episode']) or r.get('conf',{}).get('operator_id') or '—';out.append(item)
  legacy=ROOT/'legacy_jobs.json'
  if legacy.exists():
   for item in json.loads(legacy.read_text()):
@@ -634,7 +662,7 @@ def job_log(req:Request,dag_id:str,run_id:str,stage:str):
  run=local_api('GET',f'/api/v2/dags/{dag_id}/dagRuns/'+quote(run_id,safe=''))
  conf=run.get('conf',{});ep=conf.get('episode_id','')
  user=access.user(req)
- if user['role']!='admin' and (conf.get('operator_id') or access.owners().get(ep))!=user['name']:raise HTTPException(403,'본인 작업의 로그만 볼 수 있습니다.')
+ if user['role']!='admin' and (access.owners().get(ep) or conf.get('operator_id'))!=user['name']:raise HTTPException(403,'본인 작업의 로그만 볼 수 있습니다.')
  return stage_log(dag_worker(dag_id),stage,run_id,conf)
 
 def stage_log(wid,stage,run_id,conf):
@@ -922,13 +950,20 @@ def raw_episodes(req:Request):
  labels={'prepare_raw':'RAW 전처리','sam_settings_ready':'분할 설정 확인','sam3':'SAM3','mask_approved':'마스크 검수','preflight':'추적 사전 검사','track':'추적','tracking_approved':'추적 검수','prepare_reconstruction':'복원 준비','reconstruct':'3D 복원','hands':'MANO 피팅','validate':'결과 검사','publish':'최종 저장'}
  # 3D 복원까지 끝난 RAW(낮 실행 성공 → MANO 대기/완료, 또는 전체 파이프라인 성공)는 배정 부하에서 빠집니다.
  done={ep for ep,(_,_,r,mode) in latest.items() if r['state']=='success' and mode!='raw'}
+ # 다른 PC(NAS 관제 기록)에서 이미 시작한 RAW는 이 PC에서 배정·표시하지 않습니다(이 PC에 담당·실행 기록이 있으면 유지).
+ try:elsewhere=fleet.started_elsewhere() if fleet.available() else {}
+ except Exception:elsewhere={}
+ episodes=[ep for ep in episodes if raw_in_queue(ep,owners,latest) and (ep not in elsewhere or owners.get(ep) or ep in latest)]
  assigned,team=access.rebalance(selected_worker(req),episodes,done,set(latest))
+ excluded=access.excluded_raw(user['name'],selected_worker(req))
  out=[]
  for ep in episodes:
   owner=owners.get(ep);row=raw_row(ep,owner,user)
   # 다른 작업자의 담당·진행 단계도 모두 보여 줍니다(실행·수정은 본인 것만).
   row.update(operator=owner,assigned_to=None if owner else assigned.get(ep),done=ep in done)
-  if user['role']!='admin':row['can_run']=owner==user['name'] or (not owner and assigned.get(ep)==user['name'])
+  row['excluded_from_mine']=user['role']!='admin' and ep in excluded
+  row['can_exclude']=user['role']=='operator' and ep not in excluded and ((owner==user['name'] and ep not in done) or (not owner and assigned.get(ep)==user['name']))
+  if user['role']!='admin':row['can_run']=ep not in excluded and (owner==user['name'] or (not owner and assigned.get(ep)==user['name']))
   progress='실행 전' if not owner else '실행 기록 확인 필요'
   if not owner and ep not in latest:progress=('배정됨 · 실행 전' if assigned.get(ep) else '미배정 · 대기')
   if ep in latest:
@@ -946,6 +981,32 @@ def raw_episodes(req:Request):
  return {'episodes':out,'team':{'total_users':team['total'],'operators':team['operators'],'admins':team['admins'],'target':team['target'],
          'load':team['load'],'me':user['name'],'role':user['role']}}
 
+class RawExclusion(BaseModel):
+ episode:str=Field(pattern=r'^ep_[A-Za-z0-9_]+$')
+ worker_id:str=DEFAULT_WORKER
+ excluded:bool=True
+
+@app.post('/api/raw-episodes/exclude')
+def exclude_raw_episode(data:RawExclusion,req:Request):
+ guard(req)
+ person=access.user(req)
+ if person['role']!='operator':raise HTTPException(403,'작업자 본인의 내 작업에서 사용할 수 있습니다.')
+ worker(data.worker_id)
+ with lock:
+  if data.excluded:
+   owner=access.owners().get(data.episode)
+   with access.db() as c:
+    assigned=c.execute('SELECT operator,worker_id FROM raw_assignments WHERE episode=?',(data.episode,)).fetchone()
+    versions={r['episode'] for r in c.execute('SELECT episode FROM execution_versions WHERE raw_episode=?',(data.episode,))}
+   if owner!=person['name'] and not (not owner and assigned and assigned['operator']==person['name'] and assigned['worker_id']==data.worker_id):
+    if data.episode not in access.excluded_raw(person['name'],data.worker_id):raise HTTPException(403,'본인의 내 작업 항목만 제외할 수 있습니다.')
+   def matches(conf):
+    return (conf.get('raw_episode_id') or conf.get('episode_id'))==data.episode or conf.get('episode_id') in versions
+   if any(matches(r.get('conf') or {}) for _,_,r in active_runs()) or any(matches(s.get('conf') or {}) for _,s in active_batch_sources()):
+    raise HTTPException(409,'대기·실행 중인 작업이 있습니다. 내 작업 현황에서 먼저 강제 종료한 뒤 제외하세요.')
+  access.exclude_raw(person['name'],data.worker_id,data.episode,data.excluded)
+ return {'ok':True,'excluded':data.excluded}
+
 class RetryJob(BaseModel):
  dag_id:str
  run_id:str=Field(min_length=1,max_length=250)
@@ -960,7 +1021,7 @@ def retry_job(data:RetryJob,req:Request):
  with lock:
   base=f'/api/v2/dags/{data.dag_id}/dagRuns/'+quote(data.run_id,safe='')
   run=local_api('GET',base);conf=run.get('conf',{});ep=conf.get('episode_id','')
-  owner=conf.get('operator_id') or access.owners().get(ep)
+  owner=access.owners().get(ep) or conf.get('operator_id')
   if not owner or owner!=access.user(req)['name']:raise HTTPException(403,'이 에피소드를 실행한 작업자만 재시도할 수 있습니다.')
   if run['state']!='failed':raise HTTPException(409,'실패한 실행만 재시도할 수 있습니다.')
   running_here=0  # MANO 일괄 실행은 세지 않습니다.
@@ -1016,7 +1077,8 @@ def worker_action(action,payload,wid):
  return json.loads(r.stdout)
 
 def owner_of(conf):
- return conf.get('operator_id') or access.owners().get(conf.get('episode_id',''))
+ # 담당자 DB(이전된 담당자 포함)를 Airflow 실행 기록보다 먼저 봅니다.
+ return access.owners().get(conf.get('episode_id','')) or conf.get('operator_id')
 
 def require_owner(req,conf):
  user=access.user(req)
@@ -1184,12 +1246,17 @@ def mano_status(req:Request,run_id:str=''):
  pick=next(((b,srcs) for b,srcs in batches if b['dag_run_id']==run_id),batches[0] if batches else None)
  if not pick:return out
  b,sources=pick;lines=[];current=None;total=len(b['conf'].get('sources',[]))
+ removed={r for _,r in mano_removed(b['dag_run_id'])};queue=[]
  for n,src in enumerate(b['conf'].get('sources',[]),1):
   if src not in sources:continue
+  if src['run_id'] in removed:
+   lines.append(f'[{n}/{total}] {src["conf"].get("episode_id")}  ⊘ 대기열에서 제거됨 (MANO 대기로 돌아감)');continue
   try:states=mano_source_state(src)
   except (httpx.HTTPError,OSError,ValueError):lines.append(f'[{n}/{total}] {src["conf"].get("episode_id")}  ? GPU PC 연결 확인 필요');continue
   active=b['state'] in ('queued','running')
   lines.append(mano_line(n,total,src['conf'].get('episode_id'),states,'대기' if active else f'대기 · 시작 안 함 (평일 오전 {MANO_CUTOFF_HOUR}시 이후 또는 중단) → 목록에서 다시 선택'))
+  if active and states['publish']['state']!='success':queue.append({'n':n,'episode':src['conf'].get('episode_id'),'run_id':src['run_id'],
+   'running':any(states[x]['state'] in ('running','queued') for x in MANO_STAGES)})
   for stage in MANO_STAGES:
    s=states[stage]['state']
    if s in ('running','queued') or (current is None and s in ('failed','interrupted')):
@@ -1200,7 +1267,7 @@ def mano_status(req:Request,run_id:str=''):
  days='월화수목금토일'
  head=[f"MANO 일괄 실행 {b['dag_run_id']} · {state_label}",f"시작 {when(b.get('start_date') or b.get('queued_at'))}"+(f" · 종료 {when(b.get('end_date'))}" if b.get('end_date') else ''),
        f"새 에피소드 시작 마감: {cut:%m-%d}({days[cut.weekday()]}) {cut:%H:%M} · 이후에는 진행 중인 에피소드까지만 끝내고 나머지는 대기",'']
- sel={'run_id':b['dag_run_id'],'state':b['state'],'summary':head+lines,'current':None,
+ sel={'run_id':b['dag_run_id'],'state':b['state'],'summary':head+lines,'current':None,'queue':queue,
       'can_stop':b['state'] in ('queued','running') and (access.user(req)['role']=='admin' or len(sources)==total)}
  if current:
   src,stage,n=current
@@ -1209,6 +1276,36 @@ def mano_status(req:Request,run_id:str=''):
   sel['current']={'episode':src['conf'].get('episode_id'),'stage':stage,'label':MANO_LABELS[stage],'index':n,**log}
  out['selected']=sel
  return out
+
+class ManoRemove(BaseModel):
+ run_id:str=Field(min_length=1,max_length=250)        # MANO 일괄 실행
+ source_run_id:str=Field(min_length=1,max_length=250) # 제거할 에피소드의 실행
+
+@app.post('/api/pc1/mano/remove')
+def mano_remove(data:ManoRemove,req:Request):
+ """일괄 실행 대기열에서 에피소드 하나를 바로 뺍니다. 진행 중인 MANO 단계는 종료하고, 시작 전 단계는 건너뜀으로
+ 기록해 일괄 실행이 다음 에피소드로 넘어가게 합니다. 이 에피소드는 곧바로 'MANO 대기'로 돌아갑니다(다시 선택·이관 가능)."""
+ guard(req)
+ with lock:
+  b=local_api('GET',f'/api/v2/dags/{BATCH_DAG}/dagRuns/'+quote(data.run_id,safe=''))
+  if b['state'] not in ('queued','running'):raise HTTPException(409,'이미 끝난 일괄 실행입니다.')
+  src=next((x for x in b['conf'].get('sources',[]) if x['run_id']==data.source_run_id),None)
+  if not src:raise HTTPException(404,'이 일괄 실행에 없는 에피소드입니다.')
+  ep=src['conf'].get('episode_id','');access.require(req,ep)
+  if (data.run_id,data.source_run_id) in mano_removed(data.run_id):return {'ok':True,'episode':ep,'stopped':[],'already':True}
+  states=mano_source_state(src)
+  if states['publish']['state']=='success':raise HTTPException(409,'이미 MANO까지 끝난 에피소드입니다.')
+  res=worker_action('stop',{'episode':ep,'run_id':src['run_id'],'stages':list(MANO_STAGES)},DEFAULT_WORKER)
+  # 아직 시작 전인 다음 MANO 단계는 '사용자 강제 종료'로 기록 → 일괄 실행이 이 에피소드를 건너뜁니다.
+  if not res.get('stopped'):
+   for stage in MANO_STAGES:
+    st=call('POST','/worker/jobs/status',json=request_for(stage,src['run_id'],src['conf']))
+    if st['state']=='success':continue
+    if st['state']=='not_started':worker_action('skip',request_for(stage,src['run_id'],src['conf']),DEFAULT_WORKER)
+    break
+  with mano_removed_db() as c:c.execute('INSERT OR REPLACE INTO mano_removed VALUES(?,?,?,?,?)',(data.run_id,data.source_run_id,ep,access.user(req)['name'],time.time()))
+  access.audit(req,'mano-remove '+ep+' from '+data.run_id)
+  return {'ok':True,'episode':ep,'stopped':res.get('stopped',[])}
 
 class ManoStop(BaseModel):
  run_id:str=Field(min_length=1,max_length=250)
@@ -1228,3 +1325,257 @@ def mano_stop(data:ManoStop,req:Request):
    stopped+=[src['conf']['episode_id']+' '+s for s in res.get('stopped',[])]
   access.audit(req,'force-stop mano '+data.run_id)
   return {'ok':True,'stopped':stopped}
+
+
+# ================= NAS 관제 · 원격 실행 (관리자) =================
+# 각 PC의 UI가 20초마다 자기 상태를 NAS control/status/<pc>.sqlite 에 쓰고, 자기 수신함(control/inbox/<pc>)의
+# 원격 명령을 처리합니다. 관리자는 어느 PC의 UI에서든 전체 PC를 보고 명령을 보냅니다(관리자 확인 후 실행).
+#  - run_raw     : 대상 PC가 새 RAW를 자기 PC에서 처음부터 실행 (실행자 = 대상 PC 이름 → NAS results/<대상 pc>)
+#  - mano_export : 원본 PC가 'MANO 대기' 에피소드를 NAS work/<원본 pc>에 검증 업로드 → 대상 PC에 mano_import 전달
+#  - mano_import : 대상 PC가 NAS에서 가져와(adopt) MANO 피팅 · 결과 검사 · 최종 저장(results/<대상 pc>)까지 실행
+#  - mano_release: 원본 PC의 이관 표시를 풀어 다시 'MANO 대기'로 (대상 PC에서 실패했을 때)
+import fleet
+from starlette.requests import Request as _StarletteRequest
+FLEET_INTERVAL=20
+TRANSFER_STAGES=('adopt','hands','validate','publish')
+_fleet_stop=threading.Event()
+_fleet_lock=threading.Lock()
+_published_cache=[0,[]]
+
+def fleet_db():
+ c=access.db()
+ c.execute('CREATE TABLE IF NOT EXISTS fleet_tasks (id TEXT PRIMARY KEY,type TEXT,payload TEXT,state TEXT,step TEXT,message TEXT,created REAL,updated REAL)')
+ # 다른 PC로 이관한(또는 이관 중인) MANO 대기 실행. 여기에 있으면 이 PC의 MANO 대기·일괄 실행에서 빠집니다.
+ c.execute('CREATE TABLE IF NOT EXISTS mano_transfers (run_id TEXT PRIMARY KEY,episode TEXT,target TEXT,state TEXT,task_id TEXT,at REAL)')
+ return c
+
+def mano_transfer_of(run_id):
+ with fleet_db() as c:r=c.execute('SELECT target,state FROM mano_transfers WHERE run_id=?',(run_id,)).fetchone()
+ return dict(r) if r else None
+
+_mano_progress_base=mano_progress
+def mano_progress(run,history):
+ t=mano_transfer_of(run['dag_run_id'])
+ if t:return ('다른 PC로 이관 중 → '+t['target'] if t['state']=='exporting' else '이관됨 → '+t['target']+' (MANO는 그 PC에서 실행)'),False
+ return _mano_progress_base(run,history)
+
+def task_update(task_id,**fields):
+ fields['updated']=time.time()
+ with fleet_db() as c:c.execute('UPDATE fleet_tasks SET '+','.join(k+'=?' for k in fields)+' WHERE id=?',(*fields.values(),task_id))
+
+def internal_request(token_value):
+ host=sorted(ALLOWED_HOSTS)[0]
+ return _StarletteRequest({'type':'http','method':'POST','path':'/api/run','query_string':b'','scheme':'http','server':('127.0.0.1',0),
+  'headers':[(b'host',host.encode()),(b'origin',('http://'+host).encode()),(b'x-platform-csrf',CSRF.encode()),(b'cookie',('kaist_session='+token_value).encode())]})
+
+def fleet_run_raw(task,p):
+ ep=p['episode']
+ where=fleet.started_elsewhere().get(ep)
+ if where:raise RuntimeError(f'이 RAW는 이미 {where}에서 시작했습니다.')
+ # 이 PC 이름(PC1~PC6)의 관리자 세션으로 일반 실행과 같은 검사를 거쳐 시작합니다. 결과는 results/<이 pc>.
+ tok=access.login(fleet.PC_ID.upper(),'admin')
+ try:
+  res=launch(Launch(mode='pipeline',worker_id=DEFAULT_WORKER,episode_id=ep,sam_prompt=p['sam_prompt'],confirmed=True,preview_episode=ep),internal_request(tok))
+ finally:
+  with access.db() as c:c.execute('DELETE FROM ui_sessions WHERE token=?',(tok,))
+ task_update(task['id'],state='done',message=f"실행 시작: {res['episode']} ({res['run_id']}) · 분할 대상 {p['sam_prompt']}")
+
+def fleet_mano_export(task,p):
+ run_id,ep,target=p['run_id'],p['episode'],p['target_pc']
+ if not task['step']:
+  run=local_api('GET',f'/api/v2/dags/{DAY_DAG}/dagRuns/'+quote(run_id,safe=''))
+  if run['conf'].get('episode_id')!=ep or run['state']!='success':raise RuntimeError('복원이 끝난 실행이 아닙니다.')
+  label,ready=mano_progress(run,batch_history())
+  if not ready:raise RuntimeError('MANO 대기 상태가 아닙니다: '+label)
+  with fleet_db() as c:c.execute('INSERT INTO mano_transfers VALUES(?,?,?,?,?,?)',(run_id,ep,target,'exporting',task['id'],time.time()))
+  worker_action('sync',{'episode':ep},DEFAULT_WORKER)
+  task_update(task['id'],state='running',step='syncing',message='NAS work/'+fleet.PC_ID+' 에 작업 폴더 업로드 중')
+  return
+ st=worker_action('sync-status',{'episode':ep},DEFAULT_WORKER)
+ if st['state']=='running':return
+ if st['state']!='success':
+  with fleet_db() as c:c.execute('DELETE FROM mano_transfers WHERE run_id=?',(run_id,))
+  raise RuntimeError('NAS 업로드 실패: '+str(st.get('error') or st['state']))
+ run=local_api('GET',f'/api/v2/dags/{DAY_DAG}/dagRuns/'+quote(run_id,safe=''))
+ conf=run['conf']
+ fleet.send(target,{'type':'mano_import','episode':ep,'source_pc':fleet.PC_ID,'source_run_id':run_id,
+  'source_key':hashlib.sha256(run_id.encode()).hexdigest()[:24],'sam_prompt':conf.get('sam_prompt',''),
+  'raw_episode':conf.get('raw_episode_id'),'requested_by':p.get('requested_by'),'target_pc':target})
+ with fleet_db() as c:c.execute("UPDATE mano_transfers SET state='sent' WHERE run_id=?",(run_id,))
+ task_update(task['id'],state='done',step='sent',message=f'NAS 업로드 완료 → {target}에 MANO 실행 요청')
+
+def transfer_request(p,stage):
+ req={'stage':stage,'episode':p['episode'],'run_id':'transfer__'+p['source_pc']+'__'+p['source_run_id'],
+      'sam_prompt':p.get('sam_prompt',''),'sam_scene':'2d','sam_confirmed':False}
+ if stage=='adopt':req.update(transfer_from=p['source_pc'],transfer_key=p['source_key'])
+ if stage=='publish':req['result_pc']=fleet.PC_ID
+ return req
+
+def fleet_mano_import(task,p):
+ labels={'adopt':'NAS에서 가져오기','hands':'MANO 피팅','validate':'결과 검사','publish':'최종 저장'}
+ i=int(task['step'] or 0)
+ if i==0 and task['state']=='received':
+  with access.db() as c:c.execute('INSERT OR IGNORE INTO episode_owners VALUES(?,?)',(p['episode'],fleet.PC_ID.upper()))
+ stage=TRANSFER_STAGES[i];req=transfer_request(p,stage)
+ st=worker_action('status',req,DEFAULT_WORKER)
+ if st['state']=='not_started':
+  st=worker_action('start',req,DEFAULT_WORKER)
+ if st['state'] in ('queued','running','not_started'):
+  task_update(task['id'],state='running',step=str(i),message=f'{labels[stage]} 진행 중 ({i+1}/{len(TRANSFER_STAGES)})');return
+ if st['state']=='success':
+  if i+1<len(TRANSFER_STAGES):
+   task_update(task['id'],state='running',step=str(i+1),message=f'{labels[stage]} 완료');return
+  task_update(task['id'],state='done',step=str(i),message=f"전체 완료 · NAS results/{fleet.PC_ID}/{p.get('sam_prompt') or '미지정'}/{p['episode']}");return
+ try:log=call('POST','/worker/log',json=req)['log'][-800:]
+ except Exception:log=''
+ raise RuntimeError(f'{labels[stage]} 실패 ({st["state"]}). '+log.strip().splitlines()[-1][-300:] if log.strip() else f'{labels[stage]} 실패 ({st["state"]})')
+
+def fleet_mano_release(task,p):
+ with fleet_db() as c:n=c.execute('DELETE FROM mano_transfers WHERE run_id=?',(p['run_id'],)).rowcount
+ task_update(task['id'],state='done',message='이관 표시 해제 · 다시 MANO 대기' if n else '이관 기록이 없습니다.')
+
+FLEET_HANDLERS={'run_raw':fleet_run_raw,'mano_export':fleet_mano_export,'mano_import':fleet_mano_import,'mano_release':fleet_mano_release}
+
+def fleet_process():
+ for cmd in fleet.claim():
+  if cmd.get('type') not in FLEET_HANDLERS or not re.fullmatch(r'[A-Za-z0-9_]+',str(cmd.get('id',''))):continue
+  with fleet_db() as c:c.execute('INSERT OR IGNORE INTO fleet_tasks VALUES(?,?,?,?,?,?,?,?)',(cmd['id'],cmd['type'],json.dumps(cmd,ensure_ascii=False),'received','','수신',time.time(),time.time()))
+ with fleet_db() as c:tasks=[dict(r) for r in c.execute("SELECT * FROM fleet_tasks WHERE state IN ('received','running') ORDER BY created")]
+ for task in tasks:
+  p=json.loads(task['payload'])
+  try:FLEET_HANDLERS[task['type']](task,p)  # run_raw의 launch()는 실행 잠금(lock)을 스스로 잡습니다.
+  except HTTPException as e:task_update(task['id'],state='failed',message=str(e.detail)[-400:])
+  except Exception as e:task_update(task['id'],state='failed',message=str(e)[-400:])
+
+def published_rows():
+ if time.monotonic()-_published_cache[0]<300:return _published_cache[1]
+ rows=[];base=Path(os.environ.get('NAS_MOUNT','/mnt/kaist-data'))/'results'/fleet.PC_ID
+ try:
+  for d in base.iterdir() if base.is_dir() else []:
+   if not d.is_dir() or d.name.startswith('.'):continue
+   if d.name.startswith('ep_'):eps=[('(이전 형식)',d)]
+   else:eps=[(d.name,e) for e in d.iterdir() if e.is_dir() and e.name.startswith('ep_')]
+   for target,e in eps:
+    for k in e.iterdir():
+     if k.is_dir() and not k.name.startswith('.'):rows.append({'sam_target':target,'episode':e.name,'run_key':k.name,'at':k.stat().st_mtime})
+ except OSError:pass
+ _published_cache[:]=[time.monotonic(),rows];return rows
+
+def fleet_snapshot():
+ snap={'meta':{'host':os.uname().nodename,'label':worker(DEFAULT_WORKER).get('label'),'gpu_error':None}}
+ try:
+  try:g=call('GET','/worker/gpu',worker_id=DEFAULT_WORKER)
+  except (httpx.HTTPError,OSError,ValueError):g=local_gpu_status()
+  snap['gpu']=[{'idx':x.get('index'),'name':x.get('name'),'uuid':x.get('uuid'),'used_mb':x.get('used_mb'),'total_mb':x.get('total_mb'),'util':x.get('util'),'processes':len(x.get('processes') or [])} for x in g['gpus'] if not g.get('worker_gpu_uuid') or x.get('uuid')==g['worker_gpu_uuid']]
+ except Exception as e:snap['meta']['gpu_error']=str(e)[-200:]
+ runs=[];started=set(access.owners())
+ for wid,mode,dag in active_dags():
+  if wid!=DEFAULT_WORKER:continue
+  for r in local_api('GET',f'/api/v2/dags/{dag}/dagRuns',params={'limit':100,'order_by':'-logical_date'})['dag_runs']:
+   conf=r.get('conf') or {};raw=conf.get('raw_episode_id') or conf.get('episode_id')
+   if raw:started.add(raw)
+   stage=None
+   if r['state'] in ('queued','running'):
+    try:stage=next((t['task_id'] for t in run_tasks(dag,r['dag_run_id']) if t['state'] in ('running','up_for_reschedule','up_for_retry','failed')),None)
+    except Exception:pass
+   runs.append({'run_id':r['dag_run_id'],'dag':dag,'mode':mode,'episode':conf.get('episode_id'),'raw_episode':raw,'operator':conf.get('operator_id'),
+                'sam_prompt':conf.get('sam_prompt'),'state':r['state'],'stage':stage,'started':r.get('start_date') or r.get('queued_at'),'ended':r.get('end_date')})
+ snap['runs']=runs;snap['raw_started']=sorted(e for e in started if e and re.fullmatch(r'ep_\d{8}_\d{6}',e))
+ history=batch_history();waiting=[]
+ for r in airflow_runs(DAY_DAG,state='success'):
+  label,ready=mano_progress(r,history);conf=r['conf']
+  if ready:waiting.append({'run_id':r['dag_run_id'],'episode':conf['episode_id'],'raw_episode':conf.get('raw_episode_id'),'operator':conf.get('operator_id'),'sam_prompt':conf.get('sam_prompt'),'status':label})
+ snap['mano_waiting']=waiting
+ snap['published']=published_rows()
+ with fleet_db() as c:tasks=[dict(r) for r in c.execute('SELECT * FROM fleet_tasks ORDER BY updated DESC LIMIT 100')]
+ cmds=[]
+ for t in tasks:
+  p=json.loads(t['payload'])
+  cmds.append({'id':t['id'],'type':t['type'],'episode':p.get('episode'),'run_id':p.get('source_run_id') or p.get('run_id'),'source_pc':p.get('source_pc') or (fleet.PC_ID if t['type'] in ('mano_export','mano_release') else None),
+               'target_pc':p.get('target_pc') or fleet.PC_ID,'state':t['state'],'step':t['step'],'message':t['message'],'requested_by':p.get('requested_by'),'created':t['created'],'updated':t['updated']})
+ snap['commands']=cmds
+ return snap
+
+def fleet_tick():
+ with _fleet_lock:
+  fleet_process()
+  fleet.publish_status(fleet_snapshot())
+
+def fleet_loop():
+ import logging
+ log=logging.getLogger('kaist.fleet');wait=2
+ while not _fleet_stop.wait(wait):
+  wait=FLEET_INTERVAL
+  try:fleet_tick()
+  except Exception as e:log.warning('NAS 관제 갱신 실패: %s',e)
+
+if os.environ.get('KAIST_AIRFLOW_API_URL') and os.environ.get('KAIST_FLEET','on')!='off' and re.fullmatch(r'pc[1-6]',fleet.PC_ID):
+ _base_lifespan=lifespan
+ @asynccontextmanager
+ async def _fleet_lifespan(app):
+  th=threading.Thread(target=fleet_loop,name='kaist-fleet',daemon=True);th.start()
+  try:
+   async with _base_lifespan(app):yield
+  finally:_fleet_stop.set()
+ app.router.lifespan_context=_fleet_lifespan
+
+def fleet_view(pc):
+ st=dict(pc)
+ runs=st.get('runs') or [];today=datetime.now().strftime('%Y-%m-%d')
+ st['stats']={'runs':len(runs),'running':st.get('busy_runs',0),'failed':sum(r['state']=='failed' for r in runs),
+  'success':sum(r['state']=='success' for r in runs),'mano_waiting':len(st.get('mano_waiting') or []),
+  'published':len(st.get('published') or []),'published_today':sum(datetime.fromtimestamp(p['at']).strftime('%Y-%m-%d')==today for p in st.get('published') or [])}
+ st['active_runs']=[r for r in runs if r['state'] in ('queued','running')]
+ st.pop('runs',None);st.pop('raw_started',None)
+ return st
+
+@app.get('/api/fleet')
+def fleet_status(req:Request):
+ guard(req);access.admin(req)
+ if not fleet.available():raise HTTPException(503,'NAS 관제 폴더를 사용할 수 없습니다: '+str(fleet.CONTROL))
+ pcs=fleet.read_all();started={}
+ for p in pcs:
+  for e in p.get('raw_started') or []:started.setdefault(e,p['pc'])
+ try:raws=call('GET','/worker/info',worker_id=DEFAULT_WORKER)['episodes']
+ except Exception:raws=[]
+ own=access.owners()
+ raw_free=[e for e in raws if re.match(r'ep_(\d{8})_',e) and re.match(r'ep_(\d{8})_',e).group(1)>=RAW_QUEUE_START and e not in started and not own.get(e)]
+ mano=[dict(m,pc=p['pc']) for p in pcs for m in p.get('mano_waiting') or []]
+ commands=sorted((c for p in pcs for c in p.get('commands') or []),key=lambda c:-(c.get('updated') or 0))[:60]
+ return {'me':fleet.PC_ID,'control':str(fleet.CONTROL),'pcs':[fleet_view(p) for p in pcs],'raw_free':raw_free,'mano_waiting':mano,'commands':commands,
+         'idle_rule':{'util_below':fleet.IDLE_UTIL,'free_mb_at_least':fleet.IDLE_FREE_MB,'stale_seconds':fleet.STALE_SECONDS}}
+
+class FleetDispatch(BaseModel):
+ type:str=Field(pattern=r'^(run_raw|mano_transfer|mano_release)$')
+ target_pc:str=Field(default='',pattern=r'^(pc[1-6])?$')
+ source_pc:str=Field(default='',pattern=r'^(pc[1-6])?$')
+ episode:str=Field(pattern=r'^ep_[A-Za-z0-9_]+$')
+ run_id:str=Field(default='',max_length=250)
+ sam_prompt:str=Field(default='',max_length=200)
+
+@app.post('/api/fleet/dispatch')
+def fleet_dispatch(data:FleetDispatch,req:Request):
+ guard(req);admin=access.admin(req)
+ pcs={p['pc']:p for p in fleet.read_all()}
+ by=admin['name']+'@'+fleet.PC_ID
+ if data.type=='run_raw':
+  if not data.target_pc or not data.sam_prompt.strip():raise HTTPException(400,'대상 PC와 SAM3 분할 대상을 입력하세요.')
+  if not pcs[data.target_pc].get('online'):raise HTTPException(409,data.target_pc+'가 연결되어 있지 않습니다.')
+  where=next((p for p,s in pcs.items() if data.episode in (s.get('raw_started') or [])),None)
+  if where:raise HTTPException(409,f'이 RAW는 이미 {where}에서 시작했습니다.')
+  cmd=fleet.send(data.target_pc,{'type':'run_raw','episode':data.episode,'sam_prompt':data.sam_prompt.strip(),'target_pc':data.target_pc,'requested_by':by})
+ elif data.type=='mano_transfer':
+  if not data.source_pc or not data.target_pc or data.source_pc==data.target_pc:raise HTTPException(400,'원본 PC와 대상 PC를 다르게 고르세요.')
+  if not pcs[data.target_pc].get('online') or not pcs[data.source_pc].get('online'):raise HTTPException(409,'원본·대상 PC가 모두 연결되어 있어야 합니다.')
+  if not any(m['run_id']==data.run_id and m['episode']==data.episode for m in pcs[data.source_pc].get('mano_waiting') or []):raise HTTPException(409,'원본 PC의 MANO 대기 목록에 없습니다. 새로고침하세요.')
+  cmd=fleet.send(data.source_pc,{'type':'mano_export','episode':data.episode,'run_id':data.run_id,'source_pc':data.source_pc,'target_pc':data.target_pc,'requested_by':by})
+ else:
+  if not data.source_pc or not data.run_id:raise HTTPException(400,'원본 PC와 실행을 확인하세요.')
+  cmd=fleet.send(data.source_pc,{'type':'mano_release','episode':data.episode,'run_id':data.run_id,'source_pc':data.source_pc,'requested_by':by})
+ with access.db() as c:c.execute('INSERT INTO ui_audit VALUES(?,?,?)',(time.time(),admin['name'],f"fleet {data.type} {data.episode} {data.source_pc}->{data.target_pc} {cmd['id']}"))
+ return {'id':cmd['id'],'sent_to':data.target_pc if data.type=='run_raw' else data.source_pc}
+
+@app.get('/assets/fleet.js')
+def fleet_script(req:Request):
+ guard(req)
+ return FileResponse(Path(__file__).parent/'fleet.js',media_type='application/javascript',headers={'Cache-Control':'no-store'})

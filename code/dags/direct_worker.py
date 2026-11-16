@@ -1,5 +1,5 @@
 """Central Airflow worker client; SSH tunnel to GPU PC, no remote Airflow API."""
-import json,os,subprocess,threading,time
+import json,os,re,subprocess,threading,time
 from pathlib import Path
 import httpx
 import sys
@@ -30,6 +30,9 @@ def request_for(stage,run_id,params):
  req={'stage':stage,'episode':params['episode_id'],'run_id':run_id,'sam_prompt':params.get('sam_prompt',''),
          'sam_scene':params.get('sam_scene','2d'),'sam_confirmed':params.get('sam_settings_confirmed',False)}
  if params.get('raw_episode_id') and params['raw_episode_id']!=params['episode_id']:req['raw_episode']=params['raw_episode_id']
+ # NAS 결과 폴더(results/pc1~pc6): 실행한 사용자(PC1~PC6)의 폴더. publish 단계에만 넣어 다른 단계의 작업 요청은 그대로 둡니다.
+ pc=re.sub(r'[\s_-]+','',str(params.get('operator_id') or '')).lower()
+ if stage=='publish' and re.fullmatch(r'pc[1-6]',pc):req['result_pc']=pc
  # Optional SAM3 object mode. Default text mode adds no keys, so existing job requests are unchanged.
  if params.get('sam_object_mode','text')=='point_track':
   req.update(sam_object_mode='point_track',sam_object_points=params.get('sam_object_points'))
