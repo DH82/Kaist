@@ -72,6 +72,14 @@ COPY --from=envs --chown=${HOST_UID} ${DEP_ROOT} ${DEP_ROOT}
 # weight 마운트 자리와 쓰기 가능한 실행 캐시(warp·matplotlib 등, gpu-cache 볼륨)
 RUN mkdir -p "${DEP_ROOT}/hf-cache/hub" "${DEP_ROOT}/runtime-cache" \
  && chown -R ${HOST_UID} "${DEP_ROOT}/hf-cache" "${DEP_ROOT}/runtime-cache"
+# Triton(HaMBA VMamba CrossScan 등)은 첫 실행 때 C 컴파일러로 런처를 빌드합니다. kaist-full/config.env의
+# CC/CXX는 원래 PC의 conda 컴파일러(toolchain/compiler/bin/x86_64-conda-linux-gnu-*)를 가리키므로,
+# 시스템 gcc를 설치하고 같은 경로에 연결합니다. 없으면 MANO 단계(18 · HaMBA 손 복원)가 FileNotFoundError로 실패합니다.
+RUN apt-get update && apt-get install -y --no-install-recommends gcc g++ libc6-dev \
+ && rm -rf /var/lib/apt/lists/* \
+ && mkdir -p "${DEP_ROOT}/toolchain/compiler/bin" \
+ && ln -s /usr/bin/gcc "${DEP_ROOT}/toolchain/compiler/bin/x86_64-conda-linux-gnu-gcc" \
+ && ln -s /usr/bin/g++ "${DEP_ROOT}/toolchain/compiler/bin/x86_64-conda-linux-gnu-g++"
 
 # ---- 파이프라인 코드 (02_current: workspace 코드 + 00_scripts) ----
 COPY --chown=${HOST_UID} ["pipeline/current/workspace", "${REV_ROOT}/workspace"]
