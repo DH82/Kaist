@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'code/platform'))
 import access
+import fleet
 import platform_app as ui
 from fastapi.testclient import TestClient
 
@@ -20,6 +21,9 @@ class RawExclusionTests(unittest.TestCase):
         self.env.start()
         self.addCleanup(self.env.stop)
         self.episodes = [f'ep_20261116_{i:06}' for i in range(1, 7)]
+        # 실제 NAS(control/) 대신 임시 폴더
+        _ctl = tempfile.TemporaryDirectory(); self.addCleanup(_ctl.cleanup)
+        _p = patch.object(fleet, 'CONTROL', Path(_ctl.name) / 'control'); _p.start(); self.addCleanup(_p.stop)
         for name, value in [('UI_PASSWORD_FILE', ''), ('ALLOWED_HOSTS', {'testserver'})]:
             p = patch.object(ui, name, value)
             p.start(); self.addCleanup(p.stop)

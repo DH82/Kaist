@@ -1,10 +1,11 @@
 """MANO 일괄 실행 대기열에서 에피소드 하나 제거. 격리된 DB와 가짜 Airflow/Worker만 사용합니다."""
-import os, sys, tempfile, unittest
+import os, tempfile, sys, tempfile, unittest
 from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'code/platform'))
 import access
+import fleet
 import platform_app as ui
 from fastapi.testclient import TestClient
 
@@ -25,6 +26,9 @@ class ManoRemoveTests(unittest.TestCase):
         def action(name, payload, wid):
             self.actions.append((name, payload.get('run_id'), payload.get('stage')))
             return {'stopped': ['hands']} if name == 'stop' and payload['run_id'] == 'day_a' else {'stopped': []}
+        # 실제 NAS(control/) 대신 임시 폴더
+        _ctl = tempfile.TemporaryDirectory(); self.addCleanup(_ctl.cleanup)
+        _p = patch.object(fleet, 'CONTROL', Path(_ctl.name) / 'control'); _p.start(); self.addCleanup(_p.stop)
         for name, value in [('UI_PASSWORD_FILE', ''), ('ALLOWED_HOSTS', {'testserver'})]:
             p = patch.object(ui, name, value); p.start(); self.addCleanup(p.stop)
         for name, fn in [('local_api', lambda *a, **k: BATCH), ('call', call), ('worker_action', action),

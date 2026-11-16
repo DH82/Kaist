@@ -7,6 +7,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'code/platform'))
 sys.path.insert(0, str(ROOT / 'code/dags'))
 import access
+import fleet
 import platform_app as ui
 from fastapi.testclient import TestClient
 
@@ -21,6 +22,9 @@ class PcLoginTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
         env = patch.dict(os.environ, KAIST_INTAKE_DB=str(Path(self.tmp.name) / 'c.sqlite'), KAIST_AIRFLOW_API_URL='')
         env.start(); self.addCleanup(env.stop)
+        # 실제 NAS(control/) 대신 임시 폴더
+        _ctl = tempfile.TemporaryDirectory(); self.addCleanup(_ctl.cleanup)
+        _p = patch.object(fleet, 'CONTROL', Path(_ctl.name) / 'control'); _p.start(); self.addCleanup(_p.stop)
         for name, value in [('UI_PASSWORD_FILE', ''), ('ALLOWED_HOSTS', {'testserver'})]:
             p = patch.object(ui, name, value); p.start(); self.addCleanup(p.stop)
         self.client = TestClient(ui.app); self.addCleanup(self.client.close)

@@ -196,3 +196,67 @@ def handoff_take(token):
     if data.get('pc') != MACHINE_PC or float(data.get('expires') or 0) < time.time():
         return None
     return data
+
+
+# ---- RAW 선점(PC 간 중복 방지): control/claims/<RAW> = 선점한 PC 이름을 가리키는 symlink ----
+# symlink 생성은 NFS에서도 원자적이라(이미 있으면 실패) 두 PC가 동시에 배정해도 한 PC만 가져갑니다.
+# 배정하거나 실행을 시작할 때 선점하고, 시작 전 배정이 풀리면 해제합니다. 실행을 시작한 RAW는 계속 유지합니다.
+RAW_NAME = re.compile(r'ep_[0-9]{8}_[0-9]{6}')
+
+
+def _claims():
+    return CONTROL / 'claims'
+
+
+def raw_owner(ep):
+    try:
+        return os.readlink(_claims() / ep)
+    except OSError:
+        return None
+
+
+def raw_claim(ep):
+    """이 PC가 RAW를 선점합니다. 이미 이 PC 것이면 True, 다른 PC 것이면 False. NAS를 못 쓰면 True(단독 사용)."""
+    if not RAW_NAME.fullmatch(ep or ''):
+        return True
+    if not available():
+        return True
+    try:
+        _claims().mkdir(parents=True, exist_ok=True)
+        os.symlink(PC_ID, _claims() / ep)
+        return True
+    except FileExistsError:
+        return raw_owner(ep) == PC_ID
+    except OSError:
+        return True
+
+
+def raw_release(ep):
+    if RAW_NAME.fullmatch(ep or '') and raw_owner(ep) == PC_ID:
+        try:
+            os.unlink(_claims() / ep)
+        except OSError:
+            pass
+
+
+def raw_claims():
+    """{RAW: 선점한 PC}"""
+    out = {}
+    try:
+        for p in _claims().iterdir():
+            if RAW_NAME.fullmatch(p.name):
+                try:
+                    out[p.name] = os.readlink(p)
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return out
+
+
+def raw_taken_elsewhere():
+    """다른 PC가 선점했거나 이미 시작한 RAW → {RAW: pc}"""
+    out = {ep: pc for ep, pc in raw_claims().items() if pc != PC_ID}
+    for ep, pc in started_elsewhere().items():
+        out.setdefault(ep, pc)
+    return out

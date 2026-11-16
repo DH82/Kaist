@@ -285,7 +285,9 @@ def info(req:Request):
  d['airflow_public_url']=AIRFLOW_PUBLIC
  d['gpu_test_enabled']='test' in DIRECT_DAGS and access.user(req)['role']=='admin'
  owners=access.owners();user=access.user(req)
- d['episodes']=[ep for ep in d['episodes'] if raw_in_queue(ep,owners)]
+ try:elsewhere=fleet.raw_taken_elsewhere() if fleet.available() else {}
+ except Exception:elsewhere={}
+ d['episodes']=[ep for ep in d['episodes'] if raw_in_queue(ep,owners) and (ep not in elsewhere or owners.get(ep))]
  d['raw_episodes']=[raw_row(ep,owners.get(ep),user) for ep in d['episodes']]
  d['episodes']=[ep for ep in d['episodes'] if access.selectable(req,ep)]
  return d
@@ -369,6 +371,9 @@ def launch(data:Launch,req:Request):
  with lock:
   if data.mode in ('raw','pipeline') and not access.selectable(req,data.episode_id,data.worker_id):
    raise HTTPException(403,'배정이 변경되었거나 내 작업에서 제외한 RAW입니다. 목록을 새로고침하세요.')
+  # PC 간 중복 실행 방지: 다른 PC가 선점한 RAW는 시작하지 않습니다(이 PC에 이미 담당·실행 기록이 있으면 예외).
+  if data.mode in ('raw','pipeline') and not access.owners().get(data.episode_id) and not fleet.raw_claim(data.episode_id):
+   raise HTTPException(409,f'이 RAW는 {(fleet.raw_owner(data.episode_id) or "다른 PC").upper()}에서 작업 중입니다.')
   active=local_api('GET',f'/api/v2/dags/{dag}/dagRuns',params={'limit':100,'order_by':'-logical_date'})
   # MANO 대기(3D 복원 완료)와 MANO 일괄 실행은 동시 실행 수에 넣지 않습니다(퇴근 후 일괄 실행용).
   # 실제 GPU 동시 연산은 Worker의 GPU 슬롯(gpu_slots.py)이 제한하므로, 겹치면 GPU 작업이 잠시 queued로 기다립니다.
@@ -978,10 +983,11 @@ def raw_episodes(req:Request):
  # 3D 복원까지 끝난 RAW(낮 실행 성공 → MANO 대기/완료, 또는 전체 파이프라인 성공)는 배정 부하에서 빠집니다.
  done={ep for ep,(_,_,r,mode) in latest.items() if r['state']=='success' and mode!='raw'}
  # 다른 PC(NAS 관제 기록)에서 이미 시작한 RAW는 이 PC에서 배정·표시하지 않습니다(이 PC에 담당·실행 기록이 있으면 유지).
- try:elsewhere=fleet.started_elsewhere() if fleet.available() else {}
+ # 다른 PC가 선점(NAS control/claims)했거나 이미 시작한 RAW도 같습니다(배정만 하고 시작 전인 것 포함).
+ try:elsewhere=fleet.raw_taken_elsewhere() if fleet.available() else {}
  except Exception:elsewhere={}
  episodes=[ep for ep in episodes if raw_in_queue(ep,owners,latest) and (ep not in elsewhere or owners.get(ep) or ep in latest)]
- assigned,team=access.rebalance(selected_worker(req),episodes,done,set(latest))
+ assigned,team=access.rebalance(selected_worker(req),episodes,done,set(latest),claim=fleet.raw_claim,release=fleet.raw_release)
  excluded=access.excluded_raw(user['name'],selected_worker(req))
  out=[]
  for ep in episodes:
@@ -1397,8 +1403,8 @@ def internal_request(token_value):
 
 def fleet_run_raw(task,p):
  ep=p['episode']
- where=fleet.started_elsewhere().get(ep)
- if where:raise RuntimeError(f'이 RAW는 이미 {where}에서 시작했습니다.')
+ where=fleet.raw_taken_elsewhere().get(ep)
+ if where:raise RuntimeError(f'이 RAW는 이미 {where.upper()}에서 작업 중입니다.')
  # 이 PC 이름(PC1~PC6)의 관리자 세션으로 일반 실행과 같은 검사를 거쳐 시작합니다. 결과는 results/<이 pc>.
  tok=access.login(fleet.PC_ID.upper(),'admin')
  try:
@@ -1523,10 +1529,28 @@ def fleet_snapshot():
  snap['commands']=cmds
  return snap
 
+def reconcile_raw_claims(snap):
+ """NAS RAW 선점을 이 PC 상태와 맞춥니다.
+ - 이 PC의 담당·실행 RAW는 선점(없으면 채움). 배정만 된 RAW를 다른 PC가 먼저 선점했으면 이 PC 배정을 회수.
+ - 이 PC가 선점했지만 배정·담당·실행이 모두 없으면 해제(다른 PC가 가져갈 수 있게)."""
+ with access._assign_lock:
+  started=set(snap.get('raw_started') or []);mine=started|{e for e in access.owners() if fleet.RAW_NAME.fullmatch(e)}
+  for ep in mine:fleet.raw_claim(ep)
+  assigned=access.assignments()
+  for ep in list(assigned):
+   if not fleet.raw_claim(ep):
+    with access.db() as c:c.execute('DELETE FROM raw_assignments WHERE episode=?',(ep,))
+    del assigned[ep]
+  for ep,pc in fleet.raw_claims().items():
+   if pc==fleet.PC_ID and ep not in mine and ep not in assigned:fleet.raw_release(ep)
+
 def fleet_tick():
  with _fleet_lock:
   fleet_process()
-  fleet.publish_status(fleet_snapshot())
+  snap=fleet_snapshot()
+  try:reconcile_raw_claims(snap)
+  except Exception as e:print('RAW 선점 정리 실패:',e,flush=True)
+  fleet.publish_status(snap)
 
 def fleet_loop():
  import logging
@@ -1560,7 +1584,7 @@ def fleet_view(pc):
 def fleet_status(req:Request):
  guard(req);access.admin(req)
  if not fleet.available():raise HTTPException(503,'NAS 관제 폴더를 사용할 수 없습니다: '+str(fleet.CONTROL))
- pcs=fleet.read_all();started={}
+ pcs=fleet.read_all();started=dict(fleet.raw_claims())
  for p in pcs:
   for e in p.get('raw_started') or []:started.setdefault(e,p['pc'])
  try:raws=call('GET','/worker/info',worker_id=DEFAULT_WORKER)['episodes']
@@ -1588,8 +1612,8 @@ def fleet_dispatch(data:FleetDispatch,req:Request):
  if data.type=='run_raw':
   if not data.target_pc or not data.sam_prompt.strip():raise HTTPException(400,'대상 PC와 SAM3 분할 대상을 입력하세요.')
   if not pcs[data.target_pc].get('online'):raise HTTPException(409,data.target_pc+'가 연결되어 있지 않습니다.')
-  where=next((p for p,s in pcs.items() if data.episode in (s.get('raw_started') or [])),None)
-  if where:raise HTTPException(409,f'이 RAW는 이미 {where}에서 시작했습니다.')
+  where=fleet.raw_owner(data.episode) or next((p for p,s in pcs.items() if data.episode in (s.get('raw_started') or [])),None)
+  if where and where!=data.target_pc:raise HTTPException(409,f'이 RAW는 이미 {where.upper()}에서 작업 중입니다.')
   cmd=fleet.send(data.target_pc,{'type':'run_raw','episode':data.episode,'sam_prompt':data.sam_prompt.strip(),'target_pc':data.target_pc,'requested_by':by})
  elif data.type=='mano_transfer':
   if not data.source_pc or not data.target_pc or data.source_pc==data.target_pc:raise HTTPException(400,'원본 PC와 대상 PC를 다르게 고르세요.')

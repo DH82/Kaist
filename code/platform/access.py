@@ -115,7 +115,7 @@ def capture_key(ep):
  # ep_YYYYMMDD_HHMMSS → 촬영 시각 순서(오래된 것부터)
  return ep
 
-def rebalance(worker_id,episodes,done,started,target=ASSIGN_TARGET):
+def rebalance(worker_id,episodes,done,started,target=ASSIGN_TARGET,claim=None,release=None):
  """episodes: 이 PC의 RAW 목록, done: 3D 복원까지 끝난 RAW, started: 실행 기록이 있는 RAW.
  - 회수: 실행을 시작했거나(담당자 생김) 목록에서 사라졌거나 배정받은 작업자의 세션이 없으면 배정을 풉니다.
  - 부하: 작업자별 (시작 전 배정) + (본인 담당이면서 3D 복원이 끝나지 않은 RAW)
@@ -128,6 +128,8 @@ def rebalance(worker_id,episodes,done,started,target=ASSIGN_TARGET):
    for ep,(op,wid) in list(rows.items()):
     if own.get(ep) or ep in started or op not in ops or (wid==worker_id and ep not in eps) or (wid,ep,op) in excluded:
      c.execute('DELETE FROM raw_assignments WHERE episode=?',(ep,));del rows[ep]
+     # 시작하지 않고 풀린 배정은 PC 간 선점(NAS)도 풀어 다른 PC가 가져갈 수 있게 합니다.
+     if release and not own.get(ep) and ep not in started:release(ep)
    load={u:0 for u in ops}
    for ep,(op,_) in rows.items():load[op]+=1
    for ep in eps:
@@ -137,6 +139,7 @@ def rebalance(worker_id,episodes,done,started,target=ASSIGN_TARGET):
    for ep in pool:
     needy=[u for u in ops if load[u]<target and (worker_id,ep,u) not in excluded]
     if not needy:continue
+    if claim and not claim(ep):continue  # 다른 PC가 먼저 선점한 RAW
     u=min(needy,key=lambda n:(load[n],n))
     c.execute('INSERT INTO raw_assignments VALUES(?,?,?,?)',(ep,u,worker_id,time.time()));rows[ep]=(u,worker_id);load[u]+=1
   return {ep:op for ep,(op,_) in rows.items()},dict(users,load=load,target=target)
