@@ -229,7 +229,7 @@ function dashVersion(p){
  if(label)h+=' <span class="'+(stale||st.state==='failed'?'bad':'new')+'">'+label+'</span>';
  if(rq&&!['building','restarting','waiting'].includes(st.state))h+=' <span class="new">요청됨</span>';
  // 지난 결과(완료·실패)는 마지막 기록을 보여줍니다.
- const msg=st.message||(st.last&&now-st.last.at<86400?(st.last.ok?'최근 업데이트: ':'최근 실패: ')+st.last.message:'');
+ const msg=st.message||(st.last&&!st.last.resolved&&now-st.last.at<86400?(st.last.ok?'최근 업데이트: ':'최근 실패: ')+st.last.message:'');
  if(msg)h+='<span class="dbVerMsg">'+escape(msg)+'</span>';
  h+=rq?'<button class="dbLink" data-upd-cancel="'+p.pc+'" title="재시작 전이면 업데이트를 보류합니다. 새 실행 시작 차단도 풀립니다.">요청 취소</button>'
       :'<button class="dbLink" data-upd-pc="'+p.pc+'" title="GitHub 최신 코드를 이 PC에 반영합니다. 진행 중인 작업이 끝난 뒤 재시작하며, 그동안 이 PC에서 새 실행 시작이 막힙니다.">업데이트</button>';
@@ -251,7 +251,7 @@ const UPD_LABEL={building:'빌드 중',restarting:'재시작 중',waiting:'재�
 const updOpen=new Set();
 function updIsActive(p){return !!p.request||UPD_ACTIVE.includes(p.status?.state)}
 function updRun(p){return p.status?.run||(p.request?null:p.status?.last?.run)}
-function updShown(p){const st=p.status;return updIsActive(p)||!!(st&&st.last&&st.last.run&&Date.now()/1000-st.last.at<6*3600)}
+function updShown(p){const st=p.status;return updIsActive(p)||!!(st&&st.last&&st.last.run&&!st.last.resolved&&Date.now()/1000-st.last.at<6*3600)}
 function updAgo(t){return t?dashDur(Date.now()/1000-t):'—'}
 function updPhases(p,run){
  const st=p.status,list=[...(st.phases||[])];
@@ -303,7 +303,7 @@ function renderUpd(){
  const n=f=>pcs.filter(f).length;
  const running=n(p=>p.status&&['building','restarting','rollback'].includes(p.status.state));
  const waiting=n(p=>updIsActive(p)&&!(p.status&&['building','restarting','rollback'].includes(p.status.state)));
- const done=n(p=>!updIsActive(p)&&p.status?.last?.ok),failed=n(p=>!updIsActive(p)&&p.status?.last&&!p.status.last.ok);
+ const done=n(p=>!updIsActive(p)&&p.status?.last?.ok),failed=n(p=>!updIsActive(p)&&p.status?.last&&!p.status.last.ok&&!p.status.last.resolved);
  box.innerHTML='<div class="dbUpdHead"><b>업데이트 진행</b><span class="dbUpdSum">'+(running?'<span>진행 중 '+running+'</span>':'')+(waiting?'<span>대기 '+waiting+'</span>':'')+(done?'<span>완료 '+done+'</span>':'')+(failed?'<span class="bad">실패 '+failed+'</span>':'')+'<span>'+(pcs.some(updIsActive)?'5초마다 갱신':'최근 6시간')+'</span></span></div>'+pcs.map(updRow).join('');
 }
 async function loadUpd(force){

@@ -350,6 +350,17 @@ class Updater:
         self.finish_request(req)   # 실패한 요청은 반복하지 않습니다. 원인 확인 후 다시 요청하세요.
         self.report('failed', message)
 
+    def clear_resolved_failure(self, fetch_error):
+        """지난 실패의 원인이 사라졌으면(GitHub 최신을 포함하고 직접 고친 파일 없음) 대시보드에 계속 실패로 보이지 않게 표시합니다."""
+        last = self.local.get('last')
+        if not last or last.get('ok') or last.get('resolved') or fetch_error:
+            return
+        remote = git('rev-parse', f'origin/{BRANCH}', check=False)
+        if self.dirty() or not remote or not is_ancestor(remote, git('rev-parse', 'HEAD')):
+            return
+        self.save_local(last=dict(last, resolved=time.time()))
+        log('지난 실패 해소됨: 이미 GitHub 최신이고 직접 고친 파일이 없습니다')
+
     def tick(self, now=False, auto=False):
         fetch_error = self.fetch()
         req = self.request()
@@ -359,6 +370,7 @@ class Updater:
             req = {'id': 'auto_' + git('rev-parse', '--short', f'origin/{BRANCH}'), 'requested_by': 'auto'}
         in_progress = self.local.get('prev') is not None
         if not req and not in_progress:
+            self.clear_resolved_failure(fetch_error)
             return self.report('idle', fetch_error or '')
         if not req:
             # 대기 중에 관리자가 요청을 취소함 → 재시작 보류. 다시 요청하면 받아 둔 코드·이미지로 이어서 진행합니다.
