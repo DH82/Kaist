@@ -109,6 +109,8 @@ services:
       PC_ID: ${PC_ID:-pc1}
       NAS_MOUNT: ${NAS_MOUNT:-/mnt/kaist-data}
       KAIST_UI_PUBLIC_URL: http://${HOST_IP:?run ./start.sh first}:${UI_PORT:-18083}
+      # 관리자 통합 관리 '작업 기록': Worker 단계 작업 기록(jobs/<id>/request·status.json)을 읽어 NAS 상태 파일에 올립니다.
+      KAIST_WORKER_JOBS_DIR: /var/lib/kaist-worker-jobs
     group_add: ["${NAS_GID:-65536}"]
     volumes:
       - type: bind
@@ -121,6 +123,7 @@ services:
       - ${STACK_STATE_DIR:-.}/secrets/ui_password:/run/secrets/ui_password:ro
       - ${WORKER_SECRET_FILE}:/run/secrets/worker_token:ro
       - ${NAS_RAW_HOST_PATH:?run ./start.sh first}:/data/raw:ro
+      - ${GPU_STATE_DIR:-./gpu_state}/worker/jobs:/var/lib/kaist-worker-jobs:ro
 
 
   # ---- GPU 파이프라인 컨테이너 (SAM3 → 추적 → 3D 복원 → HaMBA·MANO → NAS 저장) ----
