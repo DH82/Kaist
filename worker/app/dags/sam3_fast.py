@@ -20,6 +20,7 @@ falls back to the original pipeline.sam3().
 """
 import hashlib
 import json
+import os
 import re
 import shutil
 import tempfile
@@ -41,6 +42,15 @@ SOURCE_SAM = ('data_process/segment_object_sam3.py',
               '0a6f63d107a10cafaa67c9156f04a3e42abd7678b52fbe614622b6906a5dec7e')
 CAMERAS = range(4)
 GROUPS_FILE = 'baseline_groups.json'   # _resume/<this>: {cam: 'both'|'controller'}
+# TEST OPTION (sam_feature_reuse.py): on while this file exists on the worker, or KAIST_SAM_FEATURE_REUSE=1.
+FEATURE_REUSE_FLAG = Path(__file__).resolve().parents[1] / 'config' / 'sam_feature_reuse.on'
+
+
+def feature_reuse_enabled():
+    env = os.environ.get('KAIST_SAM_FEATURE_REUSE')
+    if env is not None:
+        return env == '1'
+    return FEATURE_REUSE_FLAG.is_file()
 
 
 def digest(p):
@@ -150,7 +160,9 @@ def _baseline(pipeline, dest, ep, settings, S, source, env, object_tracked):
                 preserve(receipt, dest)
         for cam in cams:
             preserve(dest / f'mask/{cam}', dest)
-        pipeline.execute([S, str(here / 'run_sam_progress.py'), str(source / SOURCE_SAM[0]),
+        runner = ([str(Path(__file__).with_name('sam_run_reuse.py')), str(here)] if feature_reuse_enabled()
+                  else [str(here / 'run_sam_progress.py')])
+        pipeline.execute([S, *runner, str(source / SOURCE_SAM[0]),
                           '--base_path', str(dest.parent), '--case_name', ep,
                           '--object_prompts', settings['prompt'], '--object_label', settings['label'],
                           '--scene_type', settings['scene'], '--version', 'sam3.1', '--chunk_frames', '300',
@@ -189,7 +201,8 @@ def _roi(pipeline, dest, S, P, source, env, hand_only):
                               '--source-script', str(source / SOURCE_SAM[0]),
                               '--case', str(dest), '--out', str(work),
                               '--profile', str(bundle / 'configs/sam_roi_candidate_v1.json'),
-                              '--cameras', *map(str, cams)], dest / '05_roi.log', source, env)
+                              '--cameras', *map(str, cams),
+                              *(['--feature-reuse'] if feature_reuse_enabled() else [])], dest / '05_roi.log', source, env)
             data = json.loads((work / 'candidate_record.json').read_text())
             if sorted(r['camera'] for r in data['results']) != sorted(cams):
                 raise ValueError('Incomplete camera record')
@@ -261,6 +274,8 @@ def _finish(dest, started, hand_only):
     return record
 
 
+REUSE_NOTE = ('<p><b>테스트 옵션 · 이미지 특징 재사용:</b> 같은 영상의 이미지 특징을 프롬프트 사이에 재사용해 계산했습니다. '
+              '마스크가 평소와 다르게 보이면 알려 주세요.</p>')
 HAND_ONLY_NOTE = ('<p><b>속도 최적화:</b> 이 실행은 물체를 bbox/포인트 추적으로 계산하므로, '
                   '왼쪽 기준선에는 손만 계산했습니다(물체 초록 표시 없음). 검수 대상은 오른쪽 후보입니다.</p>')
 
@@ -301,6 +316,9 @@ def sam3(pipeline, p, ep, new=False, object_tracked=False):
     contract(dest, prepared, settings,
              [here / n for n in ['pipeline.py', 'roi_workflow.py', 'roi_camera.py', 'run_hand_roi.py', 'stage_refs.py']]
              + [source / SOURCE_SAM[0], here / 'sam_roi_bundle/configs/sam_roi_candidate_v1.json'])
+    reuse = feature_reuse_enabled()
+    if reuse:
+        print('[특징 재사용] 테스트 옵션으로 실행합니다 (끄기: ' + str(FEATURE_REUSE_FLAG) + ' 삭제)', flush=True)
     try:
         from stage_refs import inputs
         inputs(dest, prepared)
@@ -326,10 +344,15 @@ def sam3(pipeline, p, ep, new=False, object_tracked=False):
         save(dest / 'state.json', {'status': 'mask_review_pending', 'method': 'full_frame_plus_static_hand_roi_pilot_v1',
                                    'human_approved': False, 'candidate_mask': 'roi_candidate/mask',
                                    'baseline_mask': 'mask', 'input_fingerprint': fp, 'settings': settings,
-                                   'version': 'sam3.1', **({'baseline_object': 'skipped_object_tracked'} if hand_only else {})})
+                                   'version': 'sam3.1', **({'baseline_object': 'skipped_object_tracked'} if hand_only else {}),
+                                   **({'feature_reuse_test': True} if reuse else {})})
         (dest / 'index.html').write_text(pipeline.page(ep + ' · 기준선 / ROI 손 마스크 비교',
-                                                       (HAND_ONLY_NOTE if hand_only else '') + comparison_body()))
-        _finish(dest, started, hand_only)
+                                                       (REUSE_NOTE if reuse else '') + (HAND_ONLY_NOTE if hand_only else '')
+                                                       + comparison_body()))
+        record = _finish(dest, started, hand_only)
+        if reuse:
+            from sam_settings import save as save_json
+            save_json(dest / 'completion.json', {**record, 'feature_reuse_test': True})
         pipeline.overview(p)
         print('Mask review:', dest / 'index.html')
     except (Exception, KeyboardInterrupt) as ex:

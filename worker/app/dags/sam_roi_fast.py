@@ -84,6 +84,7 @@ def main():
     p.add_argument('--out', type=Path, required=True)
     p.add_argument('--profile', type=Path, required=True)
     p.add_argument('--cameras', type=int, nargs='+')
+    p.add_argument('--feature-reuse', action='store_true', help='test option: sam_feature_reuse.py')
     a = p.parse_args()
     sys.path.insert(0, str(a.scripts))
     roi = load_module('delivered_roi', a.scripts / 'roi_camera.py')
@@ -112,6 +113,10 @@ def main():
         return predictor
     sam.build_sam3_predictor = configured
     install(sam)
+    if a.feature_reuse:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import sam_feature_reuse
+        sam_feature_reuse.install()
     out.mkdir(parents=True)
     cams = list(a.cameras if a.cameras is not None else range(meta.get('num_cameras', 4)))
     records = []
