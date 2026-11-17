@@ -113,11 +113,31 @@ class UpdaterTests(unittest.TestCase):
         self.ui(busy={'running_tis': 0, 'batch': False}, stages=['mask_approved', 'tracking_approved'])
         self.assertEqual(self.tick()['state'], 'done')
 
-    def test_run_pinned_code_change_waits_for_review_runs(self):
+    def test_run_pinned_code_change_resumes_review_runs(self):
         self.commit('pipeline/current/workspace/kaist-full/PhysTwin/Mono/data_process/x.py', '1'); self.request()
         self.ui(busy={'running_tis': 0, 'batch': False}, stages=['mask_approved'])
         st = self.tick()
-        self.assertEqual(st['state'], 'waiting'); self.assertIn('진행 중인 실행 1개', st['message'])
+        self.assertEqual(st['state'], 'done')
+
+    def test_pipeline_code_change_allows_review_waits(self):
+        self.commit('pipeline/current/project/00_scripts/x.py', '1'); self.request()
+        self.ui(busy={'running_tis': 0, 'batch': False}, stages=us.WAIT_STAGES)
+        self.assertEqual(self.tick()['state'], 'done')
+
+    def test_review_wait_does_not_hide_worker_or_airflow_activity(self):
+        self.commit('pipeline/current/project/00_scripts/x.py', '1'); self.request()
+        self.ui(busy={'running_tis': 1, 'batch': False}, stages=('mask_approved',))
+        self.assertEqual(self.tick()['state'], 'waiting')
+        self.ui(busy={'running_tis': 0, 'batch': False}, stages=('mask_approved',))
+        self.job('running')
+        self.assertEqual(self.tick()['state'], 'waiting')
+        self.job('success')
+        self.assertEqual(self.tick()['state'], 'done')
+
+    def test_config_change_still_waits_for_review(self):
+        self.commit('pipeline/current/workspace/kaist-full/config.env', 'A=2'); self.request()
+        self.ui(busy={'running_tis': 0, 'batch': False}, stages=('mask_approved',))
+        self.assertEqual(self.tick()['state'], 'waiting')
 
     def test_stale_ui_status_blocks_restart(self):
         self.commit('code/a.py', '1'); self.request(); self.ui(busy={}, age=600)
@@ -294,7 +314,7 @@ class FleetUpdateRequestTests(unittest.TestCase):
 
 
 class ReconstructFollowupTests(UpdaterTests):
-    """배포 뒤(다음 주기): 3D 결과가 고정한 코드 해시가 배포 코드와 다르면 UI 수신함에 '3D 복원 다시'를 한 번 보냅니다."""
+    """코드가 바뀌어도 과거 복원 결과를 자동으로 재실행하지 않습니다."""
 
     def setUp(self):
         super().setUp()
@@ -314,20 +334,16 @@ class ReconstructFollowupTests(UpdaterTests):
     def inbox(self):
         return sorted((self.nas / 'control/inbox/pc2').glob('*.json'))
 
-    def test_sends_changed_episodes_once(self):
-        self.tick()
-        cmds = self.inbox()
-        self.assertEqual(len(cmds), 1)
-        cmd = json.loads(cmds[0].read_text())
-        self.assertEqual((cmd['type'], cmd['episodes'], cmd['files']), ('reconstruct_redo', ['ep_old'], ['align.py']))
-        self.tick()
-        self.assertEqual(len(self.inbox()), 1)
-
-    def test_not_while_update_in_progress(self):
-        state = json.loads((us.LOCAL / 'state.json').read_text()); state['prev'] = self.deployed
-        us.write_json(us.LOCAL / 'state.json', state)
-        u = us.Updater(self.pc / '.env'); u.reconstruct_followup()
+    def test_update_does_not_enqueue_old_reconstructions(self):
+        for _ in range(2):
+            self.tick()
         self.assertEqual(self.inbox(), [])
+        self.commit('pipeline/current/workspace/kaist-full/PhysTwin/data_process/other.py', 'newer')
+        self.request()
+        self.assertEqual(self.tick()['state'], 'done')
+        self.tick()
+        self.assertEqual(self.inbox(), [])
+
 
 
 if __name__ == '__main__':

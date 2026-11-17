@@ -420,6 +420,29 @@ def copy_versioned_raw(pipeline, project, source, episode):
     pipeline.save(pipeline.manifest(project, episode), rec)
 
 
+def resume_review_identity(pinned, identity, stage):
+    """검수 경계에서 코드만 갱신. 입력·설정은 고정하고 이전 코드 기록은 보존합니다."""
+    if stage not in ('sam_settings_ready', 'mask_approved', 'tracking_approved') or not pinned.exists():
+        return
+    previous = read(pinned)
+    def inputs(value):
+        value = dict(value)
+        value.pop('code', None)
+        request = dict(value.get('sam_request', {}))
+        for key in ('object_tracker_sha256', 'object_point_tracker_sha256'):
+            request.pop(key, None)
+        value['sam_request'] = request
+        return value
+    if previous == identity or inputs(previous) != inputs(identity):
+        return
+    archive = pinned.parent / ('identity.json.review-' + uuid.uuid4().hex)
+    archive.write_text(json.dumps({'stage': stage, 'previous': previous, 'next': identity}, indent=2))
+    pending = pinned.with_suffix('.tmp')
+    pending.write_text(json.dumps(identity, indent=2))
+    pending.replace(pinned)
+    print('검수 대기 중 코드 업데이트: 이전 코드 기록을 보관하고 새 코드로 이어갑니다.', flush=True)
+
+
 def execute(stage, episode, run_id, config_path, sam_prompt='', sam_scene='2d', sam_confirmed=False, raw_episode=None,
             object_mode='text', object_bboxes=None, object_points=None, result_pc=None,
             transfer_from=None, transfer_key=None):
@@ -483,6 +506,7 @@ def execute(stage, episode, run_id, config_path, sam_prompt='', sam_scene='2d', 
                 raise RuntimeError('Output episode already exists without this run identity; refusing reuse: '+episode)
     if stage in ('prepare_raw', 'preflight') and not pinned.exists():
         pinned.write_text(json.dumps(identity, indent=2))
+    resume_review_identity(pinned, identity, stage)
     if not pinned.exists() or read(pinned) != identity:
         raise RuntimeError('Code/config changed during run; restore it or start a new run')
     env = os.environ.copy()

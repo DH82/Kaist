@@ -1757,37 +1757,9 @@ def fleet_raw_reset(task,p):
  task_update(task['id'],state='done',message=msg)
 
 def fleet_reconstruct_redo(task,p):
- """업데이트(updater)가 보낸 '3D 복원 다시': 3D 결과가 고정한 코드가 새 코드와 달라진 에피소드를 MANO 대기 상태로 다시 만듭니다.
- MANO 대기(낮 실행·3D까지만 실행) 중인 실행만 3D 복원 단계부터 하나씩 초기화합니다. 동시 실행 자리가 없거나 MANO 일괄
- 실행에 들어 있으면 다음 주기(20초)에 다시 시도하고, MANO가 이미 시작·완료된 실행은 건너뜁니다."""
- todo=p.setdefault('todo',list(p.get('episodes') or []));done=p.setdefault('done',[]);skipped=p.setdefault('skipped',{})
- if any(r.get('state')=='running' for r in RESETS.values()):
-  task_update(task['id'],state='running',message=f"3D 복원 다시: 다른 초기화 진행 중 · 남음 {len(todo)} / 완료 {len(done)}");return
- runs={}
- for run in mano_ready_runs():
-  ep=(run.get('conf') or {}).get('episode_id')
-  if ep and ep not in runs:runs[ep]=run
- waiting=''
- for ep in list(todo):
-  run=runs.get(ep)
-  if run is None:
-   todo.remove(ep);skipped[ep]='MANO 대기 실행이 아님(진행 중이거나 MANO까지 완료) — 건너뜀';continue
-  conf=run.get('conf') or {}
-  if mano_transfer_of(run['dag_run_id']):
-   todo.remove(ep);skipped[ep]='다른 PC로 MANO 이관됨 — 건너뜀';continue
-  hands=call('POST','/worker/jobs/status',json=request_for('hands',run['dag_run_id'],conf),worker_id=DEFAULT_WORKER,timeout=15).get('state')
-  if hands in ('queued','running','success'):
-   todo.remove(ep);skipped[ep]=f'MANO 단계가 이미 {hands} — 건너뜀';continue
-  try:
-   start_reset(ResetJob(dag_id=run['dag_id'],run_id=run['dag_run_id'],stage='reconstruct',until_3d=True),who='업데이트(코드 변경)')
-  except HTTPException as e:
-   if e.status_code==409 and any(k in str(e.detail) for k in ('작업이 실행 중','일괄 실행','실행 중입니다','초기화 중')):
-    waiting=str(e.detail);break                             # 자리·일괄 실행·같은 에피소드 대기: 다음 주기에 다시
-   todo.remove(ep);skipped[ep]='초기화 실패: '+str(e.detail)[-200:];continue
-  todo.remove(ep);done.append(ep);break                     # 한 주기에 하나씩
- with fleet_db() as c:c.execute('UPDATE fleet_tasks SET payload=? WHERE id=?',(json.dumps(p,ensure_ascii=False),task['id']))
- msg=f"3D 복원 다시(코드 변경 {', '.join(p.get('files') or [])}): 시작 {len(done)} · 남음 {len(todo)} · 건너뜀 {len(skipped)}"+(f" · 대기: {waiting}" if waiting else '')
- task_update(task['id'],state='running' if todo else 'done',message=msg[-400:])
+ """이전 updater가 보낸 자동 재복원 요청은 종료합니다. 재복원은 사용자가 직접 선택합니다."""
+ task_update(task['id'],state='cancelled',
+             message='자동 3D 재복원 중지 · 추가 실행 없음 · 이미 시작한 작업은 계속 진행합니다. 필요하면 작업 목록에서 직접 재실행하세요.')
 
 FLEET_HANDLERS={'reconstruct_redo':fleet_reconstruct_redo,'raw_reset':fleet_raw_reset,'run_raw':fleet_run_raw,'mano_export':fleet_mano_export,'mano_import':fleet_mano_import,'mano_release':fleet_mano_release}
 

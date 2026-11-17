@@ -252,7 +252,7 @@ class ResetEndpointTests(unittest.TestCase):
 
 
 class ReconstructRedoTests(ResetEndpointTests):
-    """업데이트가 보낸 reconstruct_redo: MANO 대기 실행만 3D 복원부터 한 주기에 하나씩 초기화합니다."""
+    """이전 업데이트의 reconstruct_redo 요청을 실제 작업 변경 없이 취소합니다."""
 
     def setUp(self):
         super().setUp()
@@ -269,17 +269,11 @@ class ReconstructRedoTests(ResetEndpointTests):
         with self.ui.fleet_db() as c:
             return dict(c.execute('SELECT state,message,payload FROM fleet_tasks WHERE id=?', (task['id'],)).fetchone())
 
-    def test_waiting_run_is_reset_from_reconstruction(self):
-        row = self.redo([EP])
-        self.assertEqual(row['state'], 'done', row['message'])
-        self.assertIn(('reset', {'episode': EP, 'run_id': RUN, 'start': 'prepare_reconstruction'}), self.worker)
-
-    def test_mano_started_and_unknown_runs_are_skipped(self):
-        self.worker_states['hands'] = 'success'
+    def test_legacy_auto_request_is_cancelled_without_reset(self):
         row = self.redo([EP, 'ep_not_waiting'])
-        self.assertEqual(row['state'], 'done')
-        self.assertFalse([w for w in self.worker if w[0] == 'reset'])
-        self.assertEqual(len(json.loads(row['payload'])['skipped']), 2)
+        self.assertEqual(row['state'], 'cancelled')
+        self.assertFalse(self.worker)
+        self.assertEqual(json.loads(row['payload'])['episodes'], [EP, 'ep_not_waiting'])
 
 
 class ResetUntil3DTests(ResetEndpointTests):

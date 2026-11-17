@@ -14,7 +14,7 @@ Docker PC 순서 (한 번에 끝나지 않으면 다음 타이머 실행에서 �
   2) 새 이미지 빌드 (기존 서비스는 계속 동작)
   3) 이 PC가 쉴 때까지 대기: Worker 단계 작업·NAS 업로드·Airflow 실행 중 태스크·MANO 일괄 실행이 없을 것.
      파이프라인 코드(pipeline/)가 바뀌면 진행 중인 실행이 "Code/config changed during run"으로 실패하므로
-     진행 중(queued/running) 실행이 모두 끝날 때까지 기다립니다.
+     검수·설정 입력 대기를 제외한 진행 중(queued/running) 실행이 끝날 때까지 기다립니다.
   4) GPU 자체 점검. SAM3·CUDA 확장·모델을 실제로 GPU에 올리므로 작업 중에 돌리면 메모리가 모자라 점검이
      실패하고(2026-11-17 PC5 10/12) 돌던 작업까지 망칠 수 있어, 쉴 때만 합니다.
   5) 서비스 재시작 + UI 연결 검사. 실패하면 이전 커밋으로 되돌려 다시 빌드·기동합니다.
@@ -45,12 +45,13 @@ from start_stack import read_env  # noqa: E402
 
 BRANCH = 'main'
 PINNED = ('pipeline/',)          # 실행이 해시를 고정하는 파이프라인 코드(아래 두 범위로 나눠 판단)
-# 실행 시작(prepare_raw) 때 identity.json에 고정되는 코드: 바뀌면 진행 중인 실행 전부를 기다립니다.
+# 실행 시작(prepare_raw) 때 고정되는 코드: 검수·설정 입력 대기를 제외한 실행을 기다립니다.
 RUN_PINNED = ('pipeline/current/project/', 'pipeline/current/workspace/kaist-full/PhysTwin/Mono/data_process/',
               'pipeline/current/workspace/kaist-full/config.env',
               'worker/app/dags/sam_object_track.py', 'worker/app/dags/sam_object_point_track.py')
 # 그 밖의 pipeline/ 코드(예: PhysTwin/data_process)는 3D 복원 단계에서 고정됩니다. 그 전 단계(마스크·추적 검수 대기 등)의
 # 실행은 나중에 새 코드로 복원하므로 기다리지 않고, 3D 복원 이후 단계에 있는 실행만 기다립니다.
+WAIT_STAGES = ('sam_settings_ready', 'mask_approved', 'tracking_approved')
 LATE_STAGES = ('prepare_reconstruction', 'reconstruct', 'hands', 'validate', 'publish')
 STALE = 120                      # UI 상태 파일이 이보다 오래되면 '쉬는지 모름'으로 봅니다
 LOCAL = ROOT / 'state' / 'updater'
@@ -300,6 +301,8 @@ class Updater:
             c = sqlite3.connect(f'file:{path}?mode=ro&immutable=1', uri=True)
             meta = {k: json.loads(v) for k, v in c.execute('SELECT key,value FROM meta')}
             runs = c.execute("SELECT count(*) FROM runs WHERE state IN ('queued','running')").fetchone()[0]
+            active = c.execute("SELECT count(*) FROM runs WHERE state IN ('queued','running') "
+                               "AND (stage IS NULL OR stage NOT IN (%s))" % ','.join('?' * len(WAIT_STAGES)), WAIT_STAGES).fetchone()[0]
             # 3D 복원 이후 단계(또는 단계를 모르는 실행 중) — 3D 복원 코드만 바뀐 업데이트가 기다릴 실행
             late = c.execute("SELECT count(*) FROM runs WHERE (state='running' AND (stage IS NULL OR stage IN (%s)))"
                              % ','.join('?' * len(LATE_STAGES)), LATE_STAGES).fetchone()[0]
@@ -308,7 +311,7 @@ class Updater:
             return None
         if time.time() - float(meta.get('updated_at') or 0) > STALE or 'update_busy' not in meta:
             return None
-        return dict(meta['update_busy'] or {}, inflight=runs, inflight_late=late)
+        return dict(meta['update_busy'] or {}, inflight=runs, inflight_active=active, inflight_late=late)
 
     def idle_reasons(self, pinned):
         reasons = []
@@ -328,8 +331,10 @@ class Updater:
         if pinned == 'late':
             if ui.get('inflight_late', ui.get('inflight')):
                 reasons.append(f"3D 복원 코드가 바뀌어 3D 복원 이후 단계의 실행 {ui.get('inflight_late', ui.get('inflight'))}개가 끝날 때까지 대기")
-        elif pinned and ui.get('inflight'):
-            reasons.append(f"파이프라인 코드가 바뀌어 진행 중인 실행 {ui['inflight']}개가 끝날 때까지 대기")
+        elif pinned:
+            count = ui.get('inflight') if pinned == 'all' else ui.get('inflight_active', ui.get('inflight'))
+            if count:
+                reasons.append(f"파이프라인 코드·설정이 바뀌어 진행 중인 실행 {count}개가 끝날 때까지 대기")
         return reasons
 
     # ---------- 실행 ----------
@@ -408,58 +413,8 @@ class Updater:
         self.save_local(last=dict(last, resolved=time.time()))
         log('지난 실패 해소됨: 이미 GitHub 최신이고 직접 고친 파일이 없습니다')
 
-    # ---------- 배포 뒤: 바뀐 코드로 3D 복원 다시 하기 ----------
-    def reconstruction_drift(self):
-        """3D 복원 결과(06_reconstruction/<ep>/_resume/contract.json)가 고정한 코드 해시가 지금 배포된 코드와 다른 에피소드.
-        그대로 두면 MANO(hands) 단계가 'Code/config changed'로 실패하므로, UI가 3D 복원부터 다시 하게 합니다."""
-        import hashlib
-        work = Path(self.env.get('GPU_PROJECT_DIR') or '')
-        recon = work / '06_reconstruction'
-        phystwin = ROOT / 'pipeline/current/workspace/kaist-full/PhysTwin/data_process'
-        scripts = ROOT / 'pipeline/current/project/00_scripts'
-        if not recon.is_dir() or not phystwin.is_dir():
-            return []
-
-        def digest(path):
-            try:
-                return hashlib.sha256(path.read_bytes()).hexdigest()
-            except OSError:
-                return None
-        cache, drifted = {}, []
-        for contract in sorted(recon.glob('ep_*/_resume/contract.json')):
-            c = read_json(contract) or {}
-            pins = [(phystwin / f'{n}.py', h) for n, h in (c.get('code') or {}).items()]
-            pins += [(scripts / n, h) for n, h in (c.get('adapters') or {}).items()]
-            if c.get('worker'):
-                pins.append((scripts / 'reconstruction_worker.py', c['worker']))
-            changed = sorted(f.name for f, h in pins if cache.setdefault(f, digest(f)) != h)
-            if changed:
-                drifted.append({'episode': contract.parents[1].name, 'files': changed})
-        return drifted
-
-    def reconstruct_followup(self):
-        """배포가 끝난 뒤(다음 실행 주기, 새 코드로) 한 번: 코드가 바뀐 3D 결과의 에피소드를 이 PC UI에 '3D 복원 다시'로 보냅니다.
-        UI(reconstruct_redo)가 MANO 대기 중인 실행만 하나씩 초기화합니다(MANO까지 끝난 결과는 건드리지 않음)."""
-        deployed = self.local.get('deployed')
-        if self.mode != 'docker' or not deployed or self.local.get('prev') is not None:
-            return
-        if self.local.get('recon_checked') == deployed:
-            return
-        drifted = self.reconstruction_drift()
-        if drifted:
-            cid = 'recon_' + time.strftime('%Y%m%dT%H%M%S') + '_' + deployed[:7]
-            inbox = self.control / 'inbox' / self.pc
-            inbox.mkdir(parents=True, exist_ok=True)
-            write_json(inbox / f'{cid}.json', {'id': cid, 'type': 'reconstruct_redo', 'at': time.time(),
-                                                'requested_by': 'updater', 'commit': deployed,
-                                                'episodes': [d['episode'] for d in drifted],
-                                                'files': sorted({f for d in drifted for f in d['files']})})
-            log(f'3D 복원 다시: 코드가 바뀐 에피소드 {len(drifted)}개를 UI에 보냄 ({cid})')
-        self.save_local(recon_checked=deployed)
-
     def tick(self, now=False, auto=False):
         fetch_error = self.fetch()
-        self.reconstruct_followup()
         req = self.request()
         if not req and now:
             req = {'id': 'manual_' + time.strftime('%Y%m%dT%H%M%S'), 'requested_by': 'local'}
@@ -522,7 +477,8 @@ class Updater:
             self.save_local(built=head, checked=None)
         if self.local.get('deployed') == head and not changed:
             return self.done(req, '이미 최신입니다')
-        pinned = (True if any(f.startswith(RUN_PINNED) for f in changed)
+        pinned = ('all' if any(f.startswith('pipeline/') and not f.endswith('.py') for f in changed)
+                  else True if any(f.startswith(RUN_PINNED) for f in changed)
                   else 'late' if any(f.startswith(PINNED) for f in changed) else False)
         self.set_phase('wait')
         reasons = self.idle_reasons(pinned)
