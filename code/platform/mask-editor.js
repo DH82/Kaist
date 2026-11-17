@@ -360,12 +360,14 @@ $('hcEditObj').onchange=async()=>{
 };
 hcWandSyncName();
 document.addEventListener('keydown',e=>{
- if(page!=='review'||!hcMeta||hcStage!=='mask'||$('hcWorkspace').classList.contains('hidden')||document.querySelector('dialog[open]')||e.isComposing||e.target.closest('input,textarea,select,[contenteditable="true"]'))return;
+ if(page!=='review'||!hcMeta||hcStage!=='mask'||$('hcWorkspace').classList.contains('hidden')||document.querySelector('dialog[open]')||e.isComposing||e.target.closest('input:not([type=range]):not([type=checkbox]),textarea,select,[contenteditable="true"]'))return;
  const key=e.key.toLowerCase();
  if((e.ctrlKey||e.metaKey)&&key==='z'){e.preventDefault();e.shiftKey?hcEditRedo():hcEditUndo()}
  else if(e.ctrlKey&&key==='y'){e.preventDefault();hcEditRedo()}
  else if(!e.ctrlKey&&!e.metaKey&&!e.altKey&&(key==='b'||key==='e'||key==='w')){e.preventDefault();hcSetTool({b:'add',e:'erase',w:'wand'}[key])}
  else if(key==='enter'&&hcWandReadyCams().length){e.preventDefault();hcWandApply()}
+ // 브러시·지우개 수정: Enter = 수정 저장(버튼에 포커스가 있어도 그 버튼을 누르지 않고 저장합니다)
+ else if(key==='enter'&&!e.repeat&&hcEditDirty()){e.preventDefault();if(!hcEdit.saving)hcSaveEdits()}
  else if(key==='escape'){if(hcWandClear())e.preventDefault();else if(hcEdit.solo!==null){e.preventDefault();hcToggleSolo(hcEdit.solo)}}
 });
 window.addEventListener('beforeunload',e=>{if(hcEditDirty()||hcBatch.running){e.preventDefault();e.returnValue=''}});
