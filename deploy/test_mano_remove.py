@@ -60,5 +60,43 @@ class ManoRemoveTests(unittest.TestCase):
         self.assertEqual(self.remove('day_a').status_code, 403)
 
 
+class ManoRedoBatchUiTests(ManoRemoveTests):
+    """3D 복원 다시 일괄 실행: 진행 로그에 다시 하는 3D 복원 단계가 보이고, 준비(결과 보관) 중에는 제거를 막습니다."""
+    def setUp(self):
+        BATCH['conf']['redo_3d'] = True; self.addCleanup(BATCH['conf'].pop, 'redo_3d')
+        ui.MANO_DONE.clear()
+        super().setUp()
+        self.status = {('day_a', 'reconstruct'): 'running', ('day_b', 'reconstruct'): 'success'}
+        self.reset_state = 'success'
+        def action(name, payload, wid):
+            self.actions.append((name, payload.get('run_id'), payload.get('stage')))
+            if name == 'reset-status': return {'state': self.reset_state}
+            return {'stopped': ['reconstruct']} if name == 'stop' and payload['run_id'] == 'day_a' else {'stopped': []}
+        p = patch.object(ui, 'worker_action', side_effect=action); p.start(); self.addCleanup(p.stop)
+        p = patch.object(ui, 'stage_log', return_value={'state': 'running', 'log': [], 'bars': [], 'sub': None}); p.start(); self.addCleanup(p.stop)
+
+    def test_status_shows_redo_stage(self):
+        sel = self.client.get('/api/pc1/mano/status', headers=self.h).json()['selected']
+        lines = '\n'.join(sel['summary'])
+        self.assertIn('3D 복원 다시', lines)
+        self.assertIn('ep_20261116_000001  ▶ 3D 복원(다시) · 진행 중', lines)
+        self.assertNotIn('ep_20261116_000002  ▶', lines)         # 원래 3D가 끝난 에피소드는 다시 하는 것으로 보이지 않음
+        self.assertEqual((sel['current']['stage'], sel['current']['label']), ('reconstruct', '3D 복원(다시)'))
+        self.assertTrue(sel['queue'][0]['running'])
+
+    def test_running_redo_is_stopped_on_remove(self):
+        self.assertEqual(self.remove('day_a').status_code, 200)
+        stop = [a for a in self.actions if a[0] == 'stop']
+        self.assertEqual(stop, [('stop', 'day_a', None)])
+
+    def test_remove_refused_while_reset_prepares(self):
+        self.reset_state = 'running'
+        self.assertEqual(self.remove('day_b').status_code, 409)
+        self.assertFalse([a for a in self.actions if a[0] in ('stop', 'skip')])
+
+    test_running_episode_is_stopped_and_back_to_waiting = None
+    test_waiting_episode_is_skipped = None
+
+
 if __name__ == '__main__':
     unittest.main()

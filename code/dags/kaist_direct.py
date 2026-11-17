@@ -47,7 +47,9 @@ for worker_id,mode,dag_id in dag_entries():
 # 낮에 완료한 원본 실행을 선택한 순서로 이어갑니다.
 with DAG(BATCH_DAG, schedule=None, catchup=False, max_active_runs=1,
          start_date=datetime(2026,1,1,tzinfo=timezone.utc), tags=['kaist', DEFAULT_WORKER],
-         params={'sources': Param(type='array', minItems=1, maxItems=100)},
+         params={'sources': Param(type='array', minItems=1, maxItems=100),
+                 # 업데이트 전 대기열: 업데이트 전 코드로 고정된 에피소드만 3D 복원부터 다시 한 뒤 MANO 진행
+                 'redo_3d': Param(False, type='boolean')},
          default_args={'pool':worker(DEFAULT_WORKER,False)['pool'],'retries':0}) as mano_batch:
     PythonSensor(task_id='process_in_order', python_callable=poll_mano_batch,
                  mode='reschedule', poke_interval=20, timeout=7*24*3600)

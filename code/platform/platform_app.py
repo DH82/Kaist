@@ -14,7 +14,7 @@ ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(Path(__file__).parent))
 import intake,access,re,fleet
 sys.path.insert(0,str(ROOT/'dags'))
-from direct_worker import call,token,request_for,MANO_STAGES,mano_cutoff,MANO_CUTOFF_HOUR
+from direct_worker import call,token,request_for,MANO_STAGES,mano_cutoff,MANO_CUTOFF_HOUR,REDO_STAGES,REDO_LABELS,REDO_START
 from workers import workers,worker,dag_entries,dag_worker,DEFAULT_WORKER,DAY_DAG,BATCH_DAG,MAX_PARALLEL_RUNS,POOL_SLOTS
 DIRECT_DAGS={"test":"kaist_mac_to_4090_test","pipeline":"kaist_direct_pipeline_4090","raw":"kaist_direct_raw_4090"}
 if os.environ.get('KAIST_GPU_TEST_ENABLED','true').lower()=='false':DIRECT_DAGS.pop('test')
@@ -577,6 +577,8 @@ def mano_progress(run,history):
 
 class ManoSelection(BaseModel):
  runs:list[str]=Field(min_length=1,max_length=100)
+ # 업데이트 전 대기열: 업데이트 전 코드로 고정된 에피소드만 3D 복원부터 다시 한 뒤 MANO 진행(그 밖의 에피소드는 MANO만)
+ redo_3d:bool=False
 
 @app.get('/api/pc1/mano')
 def mano_candidates(req:Request):
@@ -609,15 +611,17 @@ def launch_mano(data:ManoSelection,req:Request):
    sources.append({'run_id':run_id,'conf':conf})
   for source in sources:
    if history.get(source['run_id']):
-    for stage in MANO_STAGES:
+    # 3D 복원 다시는 일괄 실행 안에서만 실행되므로, 앞선 일괄 실행에서 실패·중단된 것도 다시 시작합니다.
+    for stage in (REDO_STAGES if data.redo_3d else ())+MANO_STAGES:
      payload=request_for(stage,source['run_id'],source['conf'])
      if call('POST','/worker/jobs/status',json=payload)['state'] in ('failed','interrupted'):
       call('POST','/worker/jobs/retry',json=payload)
   ensure_worker_pool(worker(DEFAULT_WORKER))
   local_api('PATCH',f'/api/v2/dags/{BATCH_DAG}',json={'is_paused':False})
   now=datetime.now(timezone.utc)
-  result=local_api('POST',f'/api/v2/dags/{BATCH_DAG}/dagRuns',json={'dag_run_id':'mano_'+secrets.token_hex(10),'logical_date':now.isoformat(),'conf':{'sources':sources}})
-  return {'run_id':result['dag_run_id'],'count':len(sources)}
+  result=local_api('POST',f'/api/v2/dags/{BATCH_DAG}/dagRuns',json={'dag_run_id':'mano_'+secrets.token_hex(10),'logical_date':now.isoformat(),'conf':{'sources':sources,'redo_3d':data.redo_3d}})
+  access.audit(req,'mano '+result['dag_run_id']+(' redo_3d' if data.redo_3d else ''))
+  return {'run_id':result['dag_run_id'],'count':len(sources),'redo_3d':data.redo_3d}
 
 def needs_hc(state,predecessor_state,approval,worker_state=None):
  return bool(state not in ('success','failed','skipped') and predecessor_state=='success' and
@@ -1505,10 +1509,13 @@ def hidden_set(data:HideRequest,req:Request):
  return {'ok':True}
 
 # ---- MANO 일괄 실행 진행 로그 ----
-MANO_LABELS={'hands':'MANO 피팅','validate':'결과 검사','publish':'최종 저장'}
+MANO_LABELS={'hands':'MANO 피팅','validate':'결과 검사','publish':'최종 저장',**REDO_LABELS}
+MANO_ALL_STAGES=REDO_STAGES+MANO_STAGES  # 강제 종료·대기열 제거 대상(3D 복원 다시 포함)
 
-def mano_source_state(src):
- """일괄 실행 안 한 에피소드의 MANO 단계 상태. 끝난 것은 다시 묻지 않습니다."""
+def mano_source_state(src,redo=False):
+ """일괄 실행 안 한 에피소드의 MANO 단계 상태. 끝난 것은 다시 묻지 않습니다.
+ redo(3D 복원 다시 일괄 실행): MANO 시작 전이면 3D 복원 단계 중 진행·실패한 것도 앞에 넣습니다.
+ (원래 성공한 3D 복원은 넣지 않습니다. 다시 하지 않은 에피소드가 '다시 완료'로 보이지 않게)"""
  if src['run_id'] in MANO_DONE:return {s:{'state':'success'} for s in MANO_STAGES}
  states={}
  for stage in MANO_STAGES:
@@ -1518,12 +1525,18 @@ def mano_source_state(src):
    for rest in MANO_STAGES[MANO_STAGES.index(stage)+1:]:states[rest]={'state':'not_started'}
    break
  if states['publish']['state']=='success':MANO_DONE.add(src['run_id'])
+ if redo and states['hands']['state']=='not_started':
+  front={}
+  for stage in REDO_STAGES:
+   st=call('POST','/worker/jobs/status',json=request_for(stage,src['run_id'],src['conf']),timeout=15)
+   if st['state'] in ('queued','running','failed','interrupted'):front[stage]=st
+  states={**front,**states}
  return states
 
 def mano_line(n,total,episode,states,waiting=''):
  head=f'[{n}/{total}] {episode}'
  if states['publish']['state']=='success':return head+'  ✔ 전체 완료'
- for stage in MANO_STAGES:
+ for stage in states:
   st=states[stage];label=MANO_LABELS[stage]
   if st['state'] in ('failed','interrupted'):return head+'  ✖ '+label+(' · 강제 종료(건너뜀)' if st.get('stopped_by_user') else ' · 실패(건너뜀)')
   if st['state'] in ('running','queued'):
@@ -1546,19 +1559,19 @@ def mano_status(req:Request,run_id:str=''):
  out={'batches':[{'run_id':b['dag_run_id'],'state':b['state'],'start':b.get('start_date') or b.get('queued_at'),'end':b.get('end_date'),'count':len(srcs)} for b,srcs in batches],'selected':None}
  pick=next(((b,srcs) for b,srcs in batches if b['dag_run_id']==run_id),batches[0] if batches else None)
  if not pick:return out
- b,sources=pick;lines=[];current=None;total=len(b['conf'].get('sources',[]))
+ b,sources=pick;lines=[];current=None;total=len(b['conf'].get('sources',[]));redo=bool(b['conf'].get('redo_3d'))
  removed={r for _,r in mano_removed(b['dag_run_id'])};queue=[]
  for n,src in enumerate(b['conf'].get('sources',[]),1):
   if src not in sources:continue
   if src['run_id'] in removed:
    lines.append(f'[{n}/{total}] {src["conf"].get("episode_id")}  ⊘ 대기열에서 제거됨 (MANO 대기로 돌아감)');continue
-  try:states=mano_source_state(src)
+  try:states=mano_source_state(src,redo)
   except (httpx.HTTPError,OSError,ValueError):lines.append(f'[{n}/{total}] {src["conf"].get("episode_id")}  ? GPU PC 연결 확인 필요');continue
   active=b['state'] in ('queued','running')
   lines.append(mano_line(n,total,src['conf'].get('episode_id'),states,'대기' if active else f'대기 · 시작 안 함 (평일 오전 {MANO_CUTOFF_HOUR}시 이후 또는 중단) → 목록에서 다시 선택'))
   if active and states['publish']['state']!='success':queue.append({'n':n,'episode':src['conf'].get('episode_id'),'run_id':src['run_id'],
-   'running':any(states[x]['state'] in ('running','queued') for x in MANO_STAGES)})
-  for stage in MANO_STAGES:
+   'running':any(st['state'] in ('running','queued') for st in states.values())})
+  for stage in states:
    s=states[stage]['state']
    if s in ('running','queued') or (current is None and s in ('failed','interrupted')):
     if s in ('running','queued') or current is None:current=(src,stage,n)
@@ -1567,7 +1580,9 @@ def mano_status(req:Request,run_id:str=''):
  cut=mano_cutoff(b.get('start_date') or b.get('queued_at'))
  days='월화수목금토일'
  head=[f"MANO 일괄 실행 {b['dag_run_id']} · {state_label}",f"시작 {when(b.get('start_date') or b.get('queued_at'))}"+(f" · 종료 {when(b.get('end_date'))}" if b.get('end_date') else ''),
-       f"새 에피소드 시작 마감: {cut:%m-%d}({days[cut.weekday()]}) {cut:%H:%M} · 이후에는 진행 중인 에피소드까지만 끝내고 나머지는 대기",'']
+       f"새 에피소드 시작 마감: {cut:%m-%d}({days[cut.weekday()]}) {cut:%H:%M} · 이후에는 진행 중인 에피소드까지만 끝내고 나머지는 대기"]
+ if redo:head.append('업데이트 전 대기열 3D 복원 다시: 업데이트 전 코드로 만든 3D 결과만 3D 복원부터 다시 한 뒤 MANO 진행')
+ head.append('')
  sel={'run_id':b['dag_run_id'],'state':b['state'],'summary':head+lines,'current':None,'queue':queue,
       'can_stop':b['state'] in ('queued','running') and (access.user(req)['role']=='admin' or len(sources)==total)}
  if current:
@@ -1596,7 +1611,10 @@ def mano_remove(data:ManoRemove,req:Request):
   if (data.run_id,data.source_run_id) in mano_removed(data.run_id):return {'ok':True,'episode':ep,'stopped':[],'already':True}
   states=mano_source_state(src)
   if states['publish']['state']=='success':raise HTTPException(409,'이미 MANO까지 끝난 에피소드입니다.')
-  res=worker_action('stop',{'episode':ep,'run_id':src['run_id'],'stages':list(MANO_STAGES)},DEFAULT_WORKER)
+  # 3D 복원 다시 준비(결과 보관·작업 되돌리기) 중에 빼면, 준비가 끝나며 건너뜀 표시까지 되돌려 일괄 실행이 이어서 진행합니다.
+  if b['conf'].get('redo_3d') and worker_action('reset-status',{'episode':ep,'run_id':src['run_id'],'start':REDO_START},DEFAULT_WORKER).get('state')=='running':
+   raise HTTPException(409,'3D 복원 다시 준비(이전 결과 보관) 중입니다. 잠시 뒤 다시 제거하세요.')
+  res=worker_action('stop',{'episode':ep,'run_id':src['run_id'],'stages':list(MANO_ALL_STAGES)},DEFAULT_WORKER)
   # 아직 시작 전인 다음 MANO 단계는 '사용자 강제 종료'로 기록 → 일괄 실행이 이 에피소드를 건너뜁니다.
   if not res.get('stopped'):
    for stage in MANO_STAGES:
@@ -1622,7 +1640,7 @@ def mano_stop(data:ManoStop,req:Request):
   fail_airflow_run(BATCH_DAG,data.run_id,'UI 강제 종료: '+access.user(req)['name'])
   stopped=[]
   for src in sources:
-   res=worker_action('stop',{'episode':src['conf']['episode_id'],'run_id':src['run_id'],'stages':list(MANO_STAGES)},DEFAULT_WORKER)
+   res=worker_action('stop',{'episode':src['conf']['episode_id'],'run_id':src['run_id'],'stages':list(MANO_ALL_STAGES)},DEFAULT_WORKER)
    stopped+=[src['conf']['episode_id']+' '+s for s in res.get('stopped',[])]
   access.audit(req,'force-stop mano '+data.run_id)
   return {'ok':True,'stopped':stopped}

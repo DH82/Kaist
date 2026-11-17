@@ -119,6 +119,24 @@ class StageResetTests(unittest.TestCase):
         self.assertEqual(stage_reset.code_drift(self.w.cfg, pin)[1], [])
         self.assertFalse((self.w.project / '03_prepared' / EP).exists())
 
+    def test_code_change_3d_reset_repins_and_keeps_approved_inputs(self):
+        (self.w.scripts / '18_fit_hands.py').write_text('# v2\n')
+        self.assertEqual(stage_reset.drift_report(self.w.cfg, EP, RUN),
+                         {'pinned': True, 'changed': ['18_fit_hands.py'], 'code_only': True, 'transfer': False})
+        rec = self.reset('prepare_reconstruction')
+        self.assertEqual(rec['repinned'], ['18_fit_hands.py'])
+        self.assertTrue(list(self.w.receipt.glob('identity.json.reset-*')))                  # 이전 고정 기록 보관
+        self.assertEqual(stage_reset.drift_report(self.w.cfg, EP, RUN)['changed'], [])
+        self.assertTrue((self.w.project / '05_tracking/approved' / EP).is_dir())             # 승인한 추적은 그대로
+        self.assertFalse((self.w.project / '06_reconstruction' / EP).exists())
+
+    def test_config_change_blocks_3d_reset(self):
+        (self.w.pipeline / 'kaist-full/config.env').write_text('A=2\n')
+        self.assertFalse(stage_reset.drift_report(self.w.cfg, EP, RUN)['code_only'])
+        with self.assertRaisesRegex(RuntimeError, 'config.env'):
+            self.reset('prepare_reconstruction')
+        self.assertTrue((self.w.project / '06_reconstruction' / EP / 'hands').is_dir())
+
     def test_unknown_start_rejected(self):
         with self.assertRaises(ValueError):
             self.reset('mask_approved')

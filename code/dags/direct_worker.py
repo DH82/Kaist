@@ -63,6 +63,76 @@ MANO_STAGES = ('hands', 'validate', 'publish')
 
 MANO_LABELS = {'hands': 'MANO 피팅', 'validate': '결과 검사', 'publish': '최종 저장'}
 
+# 업데이트 전 대기열 3D 복원 다시(일괄 실행 conf redo_3d): 업데이트 전 코드로 고정된 에피소드만 3D 복원부터 다시 합니다.
+# 그대로 두면 MANO 피팅이 'Code/config changed during run'으로 실패합니다. 업데이트 뒤에 만든 실행은 그대로 MANO만 합니다.
+REDO_START = 'prepare_reconstruction'
+REDO_STAGES = ('prepare_reconstruction', 'reconstruct')
+REDO_LABELS = {'prepare_reconstruction': '3D 복원 준비(다시)', 'reconstruct': '3D 복원(다시)'}
+
+
+def started_ts(run_obj):
+    when = run_obj.start_date or run_obj.queued_at or run_obj.logical_date
+    if isinstance(when, str):
+        import datetime as dt
+        when = dt.datetime.fromisoformat(when.replace('Z', '+00:00'))
+    return when.timestamp() if when else 0
+
+
+CLOCK_SLACK = 600  # 일괄 실행 시작 시각(Airflow)과 Worker 초기화 기록 시각 사이의 시계 차이 허용(초)
+
+
+def redo_started(reset, since):
+    """이번 일괄 실행이 시작한 '3D 복원 다시' 초기화 기록인지(같은 실행의 예전 수동 초기화와 구분)."""
+    return reset['state'] != 'not_started' and reset.get('start') == REDO_START and reset.get('started', 0) >= since - CLOCK_SLACK
+
+
+def redo_3d(request, worker_call, run, conf, reset, since):
+    """한 에피소드의 '3D 복원 다시'를 한 걸음 진행합니다.
+    반환: ('done', 메모) 다시 할 필요 없음/다시 끝남 → MANO 진행 · ('pending', 메모) 다음 확인에 이어서 · ('skip', 이유).
+    reset: 이 실행의 Worker 초기화 상태(reset-status). 이번 일괄 실행이 시작한 초기화 기록이 있으면 그 결과를 따르므로,
+    다시 고정한 뒤에는 코드 비교를 다시 하지 않습니다."""
+    ids = {'episode': conf['episode_id'], 'run_id': run}
+    hands = request('hands', 'status')
+    if hands['state'] == 'interrupted' and hands.get('stopped_by_user'):
+        return 'skip', 'MANO 피팅 강제 종료됨'
+    if not redo_started(reset, since):
+        if hands['state'] != 'not_started':
+            return 'done', ''                                   # MANO를 이미 시작한 에피소드는 그대로 이어갑니다.
+        drift = worker_call('drift', ids)
+        if not drift.get('changed'):
+            # 코드가 그대로면 MANO만 합니다. 앞선 일괄 실행에서 다시 고정한 뒤 3D 복원 다시가 실패·중단됐으면 그 단계부터 잇습니다.
+            if request('reconstruct', 'status')['state'] == 'success' or reset['state'] != 'success' or reset.get('start') != REDO_START:
+                return 'done', ''
+            return redo_stages(request)
+        if not drift.get('pinned') or drift.get('transfer'):
+            return 'skip', '업데이트 전 코드로 만든 3D 결과 · 이 PC에서 처음부터 만든 실행이 아니라 3D 복원을 다시 할 수 없음'
+        if not drift.get('code_only'):
+            return 'skip', '업데이트로 설정이 바뀜(' + ', '.join(drift['changed'][:4]) + ') · 3D 복원부터 다시 할 수 없어 새 실행 필요'
+        worker_call('reset', {**ids, 'start': REDO_START})
+        return 'pending', '업데이트 전 3D 결과 → 3D 복원 다시 준비(이전 결과 보관) · 바뀐 코드: ' + ', '.join(drift['changed'][:4]) + \
+            (' 외' if len(drift['changed']) > 4 else '')
+    if reset['state'] == 'running':
+        return 'pending', '3D 복원 다시 준비 중(이전 결과 보관)'
+    if reset['state'] != 'success':
+        return 'skip', '3D 복원 다시 준비 실패: ' + str(reset.get('error', ''))[-200:]
+    return redo_stages(request)
+
+
+def redo_stages(request):
+    for stage in REDO_STAGES:
+        current = request(stage, 'status')
+        if current['state'] == 'interrupted' and current.get('stopped_by_user'):
+            return 'skip', REDO_LABELS[stage] + ' 강제 종료됨'
+        result = request(stage, 'start')
+        state = result['state']
+        if state in ('failed', 'interrupted'):
+            return 'skip', REDO_LABELS[stage] + (' 강제 종료됨' if result.get('stopped_by_user') else ' ' + state)
+        if state != 'success':
+            progress = result.get('progress') or {}
+            detail = f" · {progress.get('label')} {progress.get('done')}/{progress.get('total')}" if progress.get('total') else ''
+            return 'pending', REDO_LABELS[stage] + ' ' + state + detail
+    return 'done', '3D 복원 다시 완료'
+
 # 평일(월~금) 오전 8시가 되면 그때 진행 중인 에피소드까지만 끝내고, 다음 에피소드는 시작하지 않습니다.
 # 기준 시각은 일괄 실행을 시작한 뒤 처음 오는 평일 오전 8시입니다(예: 금 18시 시작 → 월 08:00).
 MANO_TZ = 'Asia/Seoul'
@@ -84,6 +154,7 @@ def mano_cutoff(started):
 
 def poll_mano_batch(**ctx):
     """선택한 순서대로 에피소드마다 hands→validate→publish를 진행합니다.
+    redo_3d가 켜져 있으면 업데이트 전 코드로 고정된 에피소드만 먼저 3D 복원부터 다시 합니다(redo_3d 참고).
     한 에피소드가 실패하거나(단계 실패·3D 복원 미완료·작업 요청 오류) UI에서 강제 종료되면
     일괄 실행을 멈추지 않고 그 에피소드만 건너뛰어 다음 에피소드로 넘어갑니다.
     실패한 작업은 Worker가 다시 시작하지 않으므로(start는 실패 상태를 그대로 돌려줌) 다음 확인에서도 계속 건너뜁니다.
@@ -92,6 +163,8 @@ def poll_mano_batch(**ctx):
     sources = ctx['dag_run'].conf['sources']
     run_obj = ctx['dag_run']
     cutoff = mano_cutoff(run_obj.start_date or run_obj.queued_at or run_obj.logical_date)
+    redo = bool(run_obj.conf.get('redo_3d'))
+    since = started_ts(run_obj)
     skipped = []
     for n, source in enumerate(sources, 1):
         conf = source['conf']
@@ -103,21 +176,35 @@ def poll_mano_batch(**ctx):
         def skip(reason):
             print(tag, reason, '· 이 에피소드는 건너뛰고 다음으로 진행합니다')
             skipped.append(f"{conf['episode_id']}({reason})")
+        def worker_call(action, body):
+            return call('POST', '/worker/jobs/' + action, worker_id=DEFAULT_WORKER, json=body)
 
         try:
             if request('publish', 'status')['state'] == 'success':
                 print(tag, '완료')
                 continue
-            if request('reconstruct', 'status')['state'] != 'success':
-                skip('3D 복원 완료 기록 없음')
-                continue
+            # 이번 일괄 실행이 이미 3D 복원 다시를 시작한 에피소드는 오전 8시 마감과 관계없이 끝까지 진행합니다.
+            reset = worker_call('reset-status', {'episode': conf['episode_id'], 'run_id': run, 'start': REDO_START}) if redo else None
+            redoing = bool(reset) and redo_started(reset, since)
             # 아직 MANO를 시작하지 않은 에피소드: 평일 오전 8시가 지났으면 여기서 멈추고 나머지는 대기로 남깁니다.
             # 앞에서 실패해 건너뛴 에피소드는 대기 목록에 넣지 않습니다(이미 실패로 표시됨).
-            if request('hands', 'status')['state'] == 'not_started' and dt.datetime.now(cutoff.tzinfo) >= cutoff:
+            if not redoing and request('hands', 'status')['state'] == 'not_started' and dt.datetime.now(cutoff.tzinfo) >= cutoff:
                 left = [s['conf']['episode_id'] for s in sources[n - 1:]]
                 print(f"평일 오전 {MANO_CUTOFF_HOUR}시({cutoff:%m-%d %H:%M}) 이후라 새 에피소드를 시작하지 않습니다. "
                       f"대기로 남김 {len(left)}개: {', '.join(left)}")
                 break
+            if redo:
+                phase, note = redo_3d(request, worker_call, run, conf, reset, since)
+                if phase == 'skip':
+                    skip(note)
+                    continue
+                if note:
+                    print(tag, note)
+                if phase == 'pending':
+                    return False
+            if request('reconstruct', 'status')['state'] != 'success':
+                skip('3D 복원 완료 기록 없음')
+                continue
             outcome = 'success'
             for stage in MANO_STAGES:
                 current = request(stage, 'status')

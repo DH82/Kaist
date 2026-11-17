@@ -5,8 +5,9 @@ UI '단계 초기화'가 Worker runner.py reset 으로 호출합니다. 원본 �
 99_history/reset/<ep>/<시각>/ 아래로 옮겨(삭제하지 않음) 새로 계산하게 합니다.
 
 - 최종 저장 후 로컬 작업 폴더가 지워진 실행은 NAS work/<이 PC>에서 먼저 되돌려 받습니다.
-- 실행 시작 후 파이프라인 코드가 바뀌었으면, 처음(RAW 준비)부터 초기화할 때만 새 코드로 다시 고정합니다.
-  중간 단계부터는 앞 단계 결과가 예전 코드로 만들어졌으므로 거부합니다(새 실행으로 시작).
+- 실행 시작 후 파이프라인 코드가 바뀌었으면, 처음(RAW 준비)부터 초기화할 때 새 코드로 다시 고정합니다.
+  3D 복원(prepare_reconstruction)부터는 코드만 바뀐 경우에 한해 새 코드로 다시 고정합니다(검수·승인한 마스크·추적은 그대로).
+  그 밖의 중간 단계·설정 변경은 앞 단계 결과가 예전 코드·설정으로 만들어졌으므로 거부합니다(새 실행으로 시작).
 - NAS에 저장된 최종 결과는 NAS work/<이 PC>/99_history/reset_results/<ep>/<시각>/ 로 옮깁니다.
   다시 저장(publish)할 때 '기존 NAS 결과와 다름'으로 실패하지 않게 하고, 이전 결과도 남깁니다.
 """
@@ -66,6 +67,27 @@ def code_drift(cfg, pin):
     return new, names
 
 
+# 3D 복원부터 다시: 코드(.py·SAM 추적 파일)만 바뀐 경우 새 코드로 다시 고정합니다. 앞 단계 결과(마스크·추적)는 사람이
+# 검수·승인한 입력이고, 검수 경계(tracking_approved)에서도 코드만 바뀐 실행은 새 코드로 이어가므로(kaist_runtime.
+# resume_review_identity) 같은 기준입니다. 설정(runtime.local.json·config.env)이 바뀌었으면 처음부터 해야 합니다.
+CODE_ONLY = {'code', 'sam_request'}
+
+
+def repin_allowed(start, new):
+    return start == 'prepare_raw' or (start == 'prepare_reconstruction' and set(new) <= CODE_ONLY)
+
+
+def drift_report(cfg, episode, run_id):
+    """MANO 일괄 실행의 '업데이트 전 3D 복원 다시' 판단: 이 실행의 고정 기록이 지금 코드와 다른지(읽기만 합니다)."""
+    receipt = receipt_dir(cfg, episode, run_id)
+    pinned = receipt / 'identity.json'
+    if not pinned.is_file():
+        return {'pinned': False, 'changed': [], 'code_only': False, 'transfer': False}
+    new, changed = code_drift(cfg, rt.read(pinned))
+    return {'pinned': True, 'changed': changed, 'code_only': repin_allowed('prepare_reconstruction', new),
+            'transfer': (receipt / 'transfer.json').exists()}
+
+
 def move_aside(src, dst, log):
     """에피소드 폴더를 보관 위치로 옮깁니다. 파이프라인 stage_refs.move를 써서 바깥을 가리키는 링크를 유지합니다."""
     dst.parent.mkdir(parents=True, exist_ok=True)
@@ -90,7 +112,7 @@ def reset_outputs(cfg, episode, run_id, start, log=print):
     if pin.get('run_id') != run_id or pin.get('episode') != episode:
         raise RuntimeError('실행 기록이 요청과 다릅니다: ' + str(pinned))
     new, changed = code_drift(cfg, pin)
-    if changed and start != 'prepare_raw':
+    if changed and not repin_allowed(start, new):
         raise RuntimeError('이 실행을 시작한 뒤 파이프라인 코드·설정이 바뀌었습니다(' + ', '.join(changed[:8]) +
                            (' 외' if len(changed) > 8 else '') + '). 앞 단계 결과가 예전 코드로 만들어져 중간부터 다시 할 수 없습니다. '
                            '처음(RAW 준비)부터 초기화하거나 새 실행으로 시작하세요.')
@@ -137,7 +159,8 @@ def reset_outputs(cfg, episode, run_id, start, log=print):
         shutil.copy2(pinned, receipt / f'identity.json.reset-{when}')
         pin.update(new)
         pinned.write_text(json.dumps(pin, indent=2))
-        log('처음부터 다시 실행: 바뀐 코드로 실행 기록을 다시 고정했습니다 (' + ', '.join(changed[:8]) + ')')
+        log(('처음부터' if start == 'prepare_raw' else '3D 복원부터') + ' 다시 실행: 바뀐 코드로 실행 기록을 다시 고정했습니다 ('
+            + ', '.join(changed[:8]) + (' 외' if len(changed) > 8 else '') + ')')
 
     record = {'episode': episode, 'run_id': run_id, 'start': start, 'at': when, 'archive': str(archive),
               'moved': moved, 'restored_from_nas': restored, 'published_result': result, 'repinned': changed}

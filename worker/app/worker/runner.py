@@ -293,6 +293,12 @@ def reset_start(req):
    proc=subprocess.Popen(['/usr/bin/python3',str(__file__),'reset-run',str(d)],stdin=subprocess.DEVNULL,stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
   write(d/'status.json',{'state':'running',**clean,'started':time.time(),'pid':proc.pid})
  return reset_status(req)
+def drift(req):
+ """이 실행의 고정 기록(identity.json)이 지금 코드와 다른지 확인합니다(읽기만). MANO 일괄 실행이 업데이트 전 대기열을 고릅니다."""
+ _check_ids(req)
+ sys.path.insert(0,str(ADAPTER.parent))
+ import stage_reset
+ return stage_reset.drift_report(json.loads(CONFIG.read_text()),req['episode'],req['run_id'])
 def reset_run(d):
  import contextlib,shutil
  req=json.loads((d/'request.json').read_text());started=json.loads((d/'status.json').read_text()).get('started',time.time())
@@ -361,6 +367,7 @@ if __name__=='__main__':
   elif action=='sam-settings':print(json.dumps(sam_settings(req),ensure_ascii=False))
   elif action=='reset':print(json.dumps(reset_start(req),ensure_ascii=False))
   elif action=='reset-status':print(json.dumps(reset_status(req),ensure_ascii=False))
+  elif action=='drift':print(json.dumps(drift(req),ensure_ascii=False))
   else:
    p=folder(req)
    print(json.dumps(start(req) if action=='start' else retry(req) if action=='retry' else rewind(req) if action=='rewind' else status(p)))
