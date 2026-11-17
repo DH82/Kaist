@@ -167,59 +167,13 @@ if __name__ == "__main__":
 
     exist_dir(f"{base_path}/{case_name}/pcd")
 
-    cameras = []
-    # Visualize the cameras
-    for i in range(num_cam):
-        camera = getCamera(
-            c2ws[i],
-            intrinsics[i, 0, 0],
-            intrinsics[i, 1, 1],
-            intrinsics[i, 0, 2],
-            intrinsics[i, 1, 2],
-            z_flip=True,
-            scale=0.2,
-        )
-        cameras += camera
-
-    vis = o3d.visualization.Visualizer()
-    vis.create_window(visible=False)  # headless
-    for camera in cameras:
-        vis.add_geometry(camera)
-
-    coordinate = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.5)
-    vis.add_geometry(coordinate)
-
-    pcd = None
+    # Headless pipeline: the original Open3D preview window (offscreen render of
+    # ~1.4M points per frame under xvfb) produced no output and took ~0.37s/frame.
+    # The saved pcd/<frame>.npz files are byte-for-byte unchanged.
     for i in tqdm(range(frame_num)):
         points, colors, masks = get_pcd_from_data(
             f"{base_path}/{case_name}", i, num_cam, intrinsics, c2ws
         )
-
-        if i == 0:
-            pcd = o3d.geometry.PointCloud()
-            pcd.points = o3d.utility.Vector3dVector(
-                points.reshape(-1, 3)[masks.reshape(-1)]
-            )
-            pcd.colors = o3d.utility.Vector3dVector(
-                colors.reshape(-1, 3)[masks.reshape(-1)]
-            )
-            vis.add_geometry(pcd)
-            # Adjust the viewpoint
-            view_control = vis.get_view_control()
-            view_control.set_front([1, 0, -2])
-            view_control.set_up([0, 0, -1])
-            view_control.set_zoom(1)
-        else:
-            pcd.points = o3d.utility.Vector3dVector(
-                points.reshape(-1, 3)[masks.reshape(-1)]
-            )
-            pcd.colors = o3d.utility.Vector3dVector(
-                colors.reshape(-1, 3)[masks.reshape(-1)]
-            )
-            vis.update_geometry(pcd)
-
-            vis.poll_events()
-            vis.update_renderer()
 
         np.savez(
             f"{base_path}/{case_name}/pcd/{i}.npz",
