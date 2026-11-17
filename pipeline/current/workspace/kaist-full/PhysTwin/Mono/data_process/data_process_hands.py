@@ -13,6 +13,34 @@ from argparse import ArgumentParser
 from scipy.optimize import minimize
 from sklearn.cluster import KMeans
 from models.mano_wrapper import MANO
+import smplx.lbs as _smplx_lbs
+import torch.nn.functional as _F
+_PARENTS_CACHE = {}
+def _parents_list(parents):
+    # smplx indexes a Python list with a CUDA tensor element (transform_chain[parents[i]]),
+    # forcing a GPU->CPU sync 15x per MANO forward. Same math, parents read once.
+    key = (parents.device, parents.data_ptr(), tuple(parents.shape))
+    if key not in _PARENTS_CACHE:
+        _PARENTS_CACHE[key] = [int(p) for p in parents.tolist()]
+    return _PARENTS_CACHE[key]
+def _batch_rigid_transform(rot_mats, joints, parents, dtype=torch.float32):
+    plist = _parents_list(parents)
+    joints = torch.unsqueeze(joints, dim=-1)
+    rel_joints = joints.clone()
+    rel_joints[:, 1:] -= joints[:, parents[1:]]
+    transforms_mat = _smplx_lbs.transform_mat(
+        rot_mats.reshape(-1, 3, 3),
+        rel_joints.reshape(-1, 3, 1)).reshape(-1, joints.shape[1], 4, 4)
+    transform_chain = [transforms_mat[:, 0]]
+    for i in range(1, len(plist)):
+        transform_chain.append(torch.matmul(transform_chain[plist[i]], transforms_mat[:, i]))
+    transforms = torch.stack(transform_chain, dim=1)
+    posed_joints = transforms[:, :, :3, 3]
+    joints_homogen = _F.pad(joints, [0, 0, 0, 1])
+    rel_transforms = transforms - _F.pad(
+        torch.matmul(transforms, joints_homogen), [3, 0, 0, 0, 0, 0, 0, 0])
+    return posed_joints, rel_transforms
+_smplx_lbs.batch_rigid_transform = _batch_rigid_transform
 
 from pytorch3d.structures import Meshes
 from pytorch3d.renderer import (
@@ -767,45 +795,132 @@ def rendered_silhouette_loss(pred_2d_v, pred_z, faces, targets):
     return torch.stack(terms).mean() if terms else pred_2d_v.sum()*0
 
 
+_FRAME_PACK = {}
+def _frame_pack(kind, items, targets, build):
+    # Per-frame constants (mask DT maps, cover points, wrist regions) are packed once per
+    # frame instead of once per iteration. Keyed by object identity of the frame's lists.
+    hit = _FRAME_PACK.get(kind)
+    if hit is not None and hit[0] is items and hit[1] is targets:
+        return hit[2]
+    packed = build(items, targets)
+    _FRAME_PACK[kind] = (items, targets, packed)
+    return packed
+
+
+def _wrist_pack(cams, targets):
+    """(origin, axis, has) per listed cam; has=0 means weight 1 everywhere (wrist None / no targets)."""
+    origin = torch.zeros((len(cams), 2), device=device)
+    axis = torch.ones((len(cams), 2), device=device)
+    has = torch.zeros((len(cams),), device=device)
+    for k, c in enumerate(cams):
+        wrist = targets[c]['wrist'] if targets else None
+        if wrist is not None:
+            origin[k], axis[k], has[k] = wrist[0], wrist[1], 1.0
+    return origin, axis, has
+
+
+def _wrist_weights_batched(uv, origin, axis, has):
+    """Same formula as wrist_weights, for uv (C,N,2) with per-cam wrist regions."""
+    t = ((uv - origin[:, None]) * axis[:, None]).sum(-1) / axis.square().sum(-1).clamp_min(1.0)[:, None]
+    w = args.wrist_weight + (1.0 - args.wrist_weight) * torch.sigmoid((t - 0.25) / 0.10)
+    return torch.where(has[:, None] > 0, w, torch.ones_like(w))
+
+
+def _pack_cover(cover_pts, targets):
+    cams = [c for c in range(NUM_CAMS) if cover_pts[c] is not None]
+    if not cams:
+        return None
+    m = max(int(cover_pts[c].shape[0]) for c in cams)
+    pts = torch.zeros((len(cams), m, 2), device=device)
+    valid = torch.zeros((len(cams), m), dtype=torch.bool, device=device)
+    for k, c in enumerate(cams):
+        n = int(cover_pts[c].shape[0])
+        pts[k, :n] = cover_pts[c]
+        pts[k, n:] = cover_pts[c][:1]
+        valid[k, :n] = True
+    weight = _wrist_weights_batched(pts, *_wrist_pack(cams, targets))  # fixed observations
+    return torch.tensor(cams, device=device), pts, valid, weight
+
+
+def _masked_cam_mean(sq, keep, weight):
+    """Per cam: sum(sq*w)/sum(w).clamp_min(1) over keep; mean over cams with any kept element.
+    Sync-free equivalent of boolean indexing + `if int(keep.sum()) > 0`."""
+    zero = torch.zeros_like(sq)
+    num = torch.where(keep, sq * weight, zero).sum(-1)
+    den = torch.where(keep, weight, zero).sum(-1).clamp_min(1)
+    used = keep.any(-1).to(sq.dtype)
+    return (num / den * used).sum() / used.sum().clamp_min(1)
+
+
 def mask_cover_loss(pred_2d_v, cover_pts, targets=None):
     """Two-sided complement of mask_align_loss: every sampled inside-mask pixel should
     be near some projected vert. Pixels farther than cover_max_px from all verts are
     dropped (forearm/cuff area outside MANO coverage).
     pred_2d_v (NUM_CAMS,V,2) px; cover_pts list of (M,2) or None."""
-    terms = []
-    for cam_idx in range(NUM_CAMS):
-        cp = cover_pts[cam_idx]
-        if cp is None:
-            continue
-        d = torch.cdist(cp, pred_2d_v[cam_idx]).min(dim=1).values  # (M,) px
-        keep = d < cover_max_px
-        if int(keep.sum()) > 0:
-            weight = wrist_weights(cp, targets[cam_idx]['wrist']) if targets else torch.ones_like(d)
-            terms.append(((d[keep] ** 2)*weight[keep]).sum()/weight[keep].sum().clamp_min(1))
-    if not terms:
+    packed = _frame_pack('cover', cover_pts, targets, _pack_cover)
+    if packed is None:
         return pred_2d_v.sum() * 0.0
-    return torch.stack(terms).mean()
+    cams, pts, valid, weight = packed
+    d = torch.cdist(pts, pred_2d_v.index_select(0, cams)).min(dim=-1).values  # (C,M) px
+    keep = (d < cover_max_px) & valid
+    return _masked_cam_mean(d ** 2, keep, weight)
+
+
+def _pack_dt(dt_maps, targets):
+    cams = [c for c in range(NUM_CAMS) if dt_maps[c] is not None]
+    if not cams:
+        return None
+    return torch.tensor(cams, device=device), torch.cat([dt_maps[c] for c in cams], 0), _wrist_pack(cams, targets)
 
 
 def mask_align_loss(pred_2d_v, dt_maps, targets=None):
     """One-sided silhouette term: squared DT px of projected verts outside the mask.
     pred_2d_v (3,V,2) px; dt_maps list of (1,1,H,W) or None."""
-    terms = []
-    for cam_idx in range(NUM_CAMS):
-        if dt_maps[cam_idx] is None:
-            continue
-        uv = pred_2d_v[cam_idx]
-        grid = torch.stack([uv[:, 0] / (RES[0] - 1) * 2 - 1,
-                            uv[:, 1] / (RES[1] - 1) * 2 - 1], dim=-1)[None, None]  # (1,1,V,2)
-        d = torch.nn.functional.grid_sample(dt_maps[cam_idx], grid, mode='bilinear',
-                                            padding_mode='border', align_corners=True)[0, 0, 0]
-        inb = (uv[:, 0] >= 0) & (uv[:, 0] < RES[0]) & (uv[:, 1] >= 0) & (uv[:, 1] < RES[1])
-        if int(inb.sum()) > 0:
-            weight = wrist_weights(uv,targets[cam_idx]['wrist']) if targets else torch.ones_like(d)
-            terms.append(((d[inb] ** 2)*weight[inb]).sum()/weight[inb].sum().clamp_min(1))
-    if not terms:
+    packed = _frame_pack('dt', dt_maps, targets, _pack_dt)
+    if packed is None:
         return pred_2d_v.sum() * 0.0
-    return torch.stack(terms).mean()
+    cams, dts, wrist = packed
+    uv = pred_2d_v.index_select(0, cams)  # (C,V,2)
+    grid = torch.stack([uv[..., 0] / (RES[0] - 1) * 2 - 1,
+                        uv[..., 1] / (RES[1] - 1) * 2 - 1], dim=-1)[:, None]  # (C,1,V,2)
+    d = torch.nn.functional.grid_sample(dts, torch.nan_to_num(grid), mode='bilinear',
+                                        padding_mode='border', align_corners=True)[:, 0, 0]
+    inb = (uv[..., 0] >= 0) & (uv[..., 0] < RES[0]) & (uv[..., 1] >= 0) & (uv[..., 1] < RES[1])
+    weight = _wrist_weights_batched(uv, *wrist)
+    return _masked_cam_mean(d ** 2, inb, weight)
+
+
+_KS_T = {}
+def _intrinsics_t():
+    """(fx, fy, cx, cy) per cam as (C,1) tensors; same values hamba_3d_to_2d(cam_idx=c) uses."""
+    if 'k' not in _KS_T:
+        rows = []
+        for c in range(NUM_CAMS):
+            if REAL_KS is not None:
+                K = REAL_KS[c]; rows.append([K[0][0], K[1][1], K[0][2], K[1][2]])
+            else:
+                rows.append([fx, fy, cx, cy])
+        _KS_T['k'] = torch.tensor(rows, dtype=torch.float64).to(torch.float32).to(device).T[..., None]
+    return _KS_T['k']
+
+
+_HAMBA_VALID = {}
+def _hamba_valid(gt_valid_hamba):
+    hit = _HAMBA_VALID.get('v')
+    if hit is None or hit[0] is not gt_valid_hamba:
+        idx = torch.nonzero(gt_valid_hamba).flatten()
+        hit = (gt_valid_hamba, int(idx.numel()), idx)
+        _HAMBA_VALID['v'] = hit
+    return hit[1], hit[2]
+
+
+_TEMP_TGT = {}
+def _temp_target(arr):
+    hit = _TEMP_TGT.get('verts')
+    if hit is None or hit[0] is not arr:
+        hit = (arr, torch.Tensor(arr).to(device))
+        _TEMP_TGT['verts'] = hit
+    return hit[1]
 
 
 def compute_loss(verts_wld, joints_wld, params, T_w2c, gt_2d, gt_valid, gt_2d_hamba, gt_valid_hamba, prev_params, check_2d_validity=False, validity=None, obj_pts=None, hand_faces=None, dt_maps=None, cover_pts=None, temp_shift=None, silhouette_data=None, silhouette_active=False):
@@ -825,22 +940,14 @@ def compute_loss(verts_wld, joints_wld, params, T_w2c, gt_2d, gt_valid, gt_2d_ha
     pred_z = []
     loss = {}
 
-    # need to change it to batch operation
-    for cam_idx in range(NUM_CAMS):
-        # Apply inverse transform
-        vertices_hom = (T_w2c[cam_idx] @ vertices_world_hom.T).T  # (N, 4)
-        joints_hom = (T_w2c[cam_idx] @ joints_world_hom.T).T  # (N, 4)
-
-        # Optionally extract 3D camera coordinates
-        vertices_cam = vertices_hom[:, :3]
-        joints_cam = joints_hom[:, :3]
-        pred_z.append(vertices_cam[:,2])
-
-        pred_2d_v.append(hamba_3d_to_2d(vertices_cam, cam_idx=cam_idx)[None])
-        pred_2d_j.append(hamba_3d_to_2d(joints_cam, cam_idx=cam_idx)[None])
-
-    pred_2d_v = torch.cat(pred_2d_v, 0)
-    pred_2d_j = torch.cat(pred_2d_j, 0)
+    # All cameras at once (same per-camera transform and pinhole projection).
+    fx_, fy_, cx_, cy_ = _intrinsics_t()
+    nv = vertices_world_hom.shape[0]
+    cam_pts = torch.matmul(T_w2c[:NUM_CAMS], torch.cat([vertices_world_hom, joints_world_hom], 0).T).transpose(1, 2)[..., :3]
+    pred_2d_all = torch.stack([fx_ * cam_pts[..., 0] / cam_pts[..., 2] + cx_,
+                               fy_ * cam_pts[..., 1] / cam_pts[..., 2] + cy_], dim=-1)
+    pred_2d_v, pred_2d_j = pred_2d_all[:, :nv], pred_2d_all[:, nv:]
+    pred_z = cam_pts[:, :nv, 2]
 
     if validity is not None:
         mp_val = torch.Tensor(np.asarray(validity[0]).astype(np.float32)).to(gt_2d.device)
@@ -860,8 +967,9 @@ def compute_loss(verts_wld, joints_wld, params, T_w2c, gt_2d, gt_valid, gt_2d_ha
     else:
         loss['2d'] = (2*args.robust_joint_delta*torch.nn.functional.smooth_l1_loss(pred_2d_j,gt_2d,beta=args.robust_joint_delta) if args.robust_joint_delta>0 else loss_fn(pred_2d_j,gt_2d))
 
-    if sum(gt_valid_hamba) > 0:
-        loss['2d_hamba'] = loss_fn(pred_2d_v[gt_valid_hamba] * hamba_weight_, gt_2d_hamba * hamba_weight_)
+    n_hamba, hamba_idx = _hamba_valid(gt_valid_hamba)
+    if n_hamba > 0:
+        loss['2d_hamba'] = loss_fn(pred_2d_v.index_select(0, hamba_idx) * hamba_weight_, gt_2d_hamba * hamba_weight_)
 
     if w_pen > 0 and obj_pts is not None and hand_faces is not None:
         loss['pen'] = w_pen * penetration_loss(verts_wld, hand_faces, obj_pts, pen_band_mm / 1000.0)
@@ -893,7 +1001,7 @@ def compute_loss(verts_wld, joints_wld, params, T_w2c, gt_2d, gt_valid, gt_2d_ha
                 continue
 
             elif key == 'verts':
-                _tgt = torch.Tensor(prev_params[key]).to(device)
+                _tgt = _temp_target(prev_params[key])
                 if temp_shift is not None:
                     # ball-anchor: rigid hold => the hand moves WITH the ball this frame
                     _tgt = _tgt + torch.Tensor(temp_shift).to(device)[None]
@@ -1289,9 +1397,7 @@ def register(frame_data, c2ws, is_right, prev_params, ref_cidx, fidx, mp_out, ob
 
     validity = None
 
-    for i in range(num_iters):
-        optimizer.zero_grad()
-
+    def forward_loss(i, validity):
         pred_mano_params['global_orient'] = rotation_6d_to_matrix(rot_global)
         pred_mano_params['hand_pose'] = rotation_6d_to_matrix(rot_hand)
         # Forward pass through your MANO model
@@ -1331,14 +1437,58 @@ def register(frame_data, c2ws, is_right, prev_params, ref_cidx, fidx, mp_out, ob
             loss_dict['shape_temporal'] = args.fit_shape_temporal_weight * (pred_mano_params['betas'] - prev_params['betas'].detach()).square().mean()
         if args.w_pose_prior > 0:
             loss_dict['pose_prior'] = args.w_pose_prior * (pred_mano_params['hand_pose']-initial_pose).square().mean()
+        return loss_dict, val
 
-        if (val is not None) and (case_name in filter_list):
-            validity = val
+    # The fit is ~1500 tiny MANO forward/backward passes per frame; launching their ~600
+    # kernels one by one costs several times the GPU work. From the 2nd iteration on, the
+    # forward+backward is captured once per frame as a CUDA graph and replayed. The
+    # optimizer, LR schedule and staged gradient masks stay eager and unchanged.
+    # Paths with per-iteration host work (penetration, silhouette, ball anchor, validity
+    # filter) keep the eager loop. KAIST_MANO_CUDA_GRAPH=0 disables replay.
+    graph_ok = (os.environ.get('KAIST_MANO_CUDA_GRAPH', '1') != '0' and torch.cuda.is_available()
+                and not (w_pen > 0 and obj_pts_t is not None) and not args.w_silhouette > 0
+                and _ball_shift is None)
+    graph = None
 
-        loss = sum(loss_dict.values())
+    def capture_graph():
+        # Drop every reference to the eager iteration's autograd graph first: it holds the
+        # parameters' gradient accumulators bound to the default stream, which a capture
+        # must not depend on.
+        for key in ('global_orient', 'hand_pose'):
+            pred_mano_params[key] = pred_mano_params[key].detach()
+        optimizer.zero_grad(set_to_none=True)
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            for _ in range(2):  # warm caches/allocator; gradients discarded, params untouched
+                warm_dict, _ = forward_loss(1, None)
+                sum(warm_dict.values()).backward()
+                optimizer.zero_grad(set_to_none=True)
+        torch.cuda.current_stream().wait_stream(side)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, capture_error_mode="thread_local"):
+            static_dict, _ = forward_loss(1, None)
+            sum(static_dict.values()).backward()
+        return g, static_dict
 
-        # Backprop + optimize
-        loss.backward()
+    for i in range(num_iters):
+        if graph is None and graph_ok and i >= 1 and validity is None:
+            loss_dict = loss = val = None
+            graph, graph_loss_dict = capture_graph()
+        if graph is not None:
+            graph.replay()
+            loss_dict = graph_loss_dict
+        else:
+            optimizer.zero_grad()
+            loss_dict, val = forward_loss(i, validity)
+
+            if (val is not None) and (case_name in filter_list):
+                validity = val
+
+            loss = sum(loss_dict.values())
+
+            # Backprop + optimize
+            loss.backward()
         if args.staged_fit and rot_hand.grad is not None:
             if i < int(num_iters*0.10):
                 rot_hand.grad.zero_()
