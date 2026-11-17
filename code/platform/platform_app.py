@@ -572,6 +572,7 @@ def launch_mano(data:ManoSelection,req:Request):
   sources=[]
   history=batch_history()
   for run_id in data.runs:
+   reset_busy(run_id)
    run=local_api('GET',f'/api/v2/dags/{DAY_DAG}/dagRuns/'+quote(run_id,safe=''))
    conf=run['conf']
    access.require(req,conf['episode_id'])
@@ -673,6 +674,10 @@ def jobs(req:Request):
        if st.get('progress'):entry['progress']=st['progress']
        item.setdefault('tasks',[]).append(entry)
    item['review_required']=next((t['review_stage'] for t in item.get('tasks',[]) if t.get('review_required')),None)
+   if mode!='test' and detailed and r['state'] in ('success','failed') and (user['role']=='admin' or owner_of(r.get('conf',{}))==user['name']):
+    # 단계 초기화 · 다시 실행: 끝났거나 실패한 실행에서 앞 단계가 모두 완료된 결과 단계
+    item['reset_stages']=resettable_stages(item.get('tasks',[]))
+   if r['dag_run_id'] in RESETS:item['reset']=RESETS[r['dag_run_id']]
    item['can_retry']=bool(r['state']=='failed' and (owners.get(item['episode']) or r.get('conf',{}).get('operator_id'))==user['name'] and any(t.get('state')=='failed' for t in item.get('tasks',[])))
    if mode!='test' and summary and not detailed:
     item['tasks']=[t for t in item['tasks'] if t['state'] not in ('success','skipped')]
@@ -1126,6 +1131,7 @@ def retry_job(data:RetryJob,req:Request):
  wid=dag_worker(data.dag_id)
  if data.dag_id not in [d for w,m,d in active_dags()] or data.stage not in order:raise HTTPException(400,'재시도할 단계를 확인하세요.')
  with lock:
+  reset_busy(data.run_id)
   base=f'/api/v2/dags/{data.dag_id}/dagRuns/'+quote(data.run_id,safe='')
   run=local_api('GET',base);conf=run.get('conf',{});ep=conf.get('episode_id','')
   owner=access.owners().get(ep) or conf.get('operator_id')
@@ -1179,6 +1185,93 @@ def retry_job(data:RetryJob,req:Request):
   local_api('POST',f'/api/v2/dags/{data.dag_id}/clearTaskInstances',json={**payload,'dry_run':False})
   access.audit(req,'retry '+data.run_id+' '+start)
   return {'ok':True,'stage':start,'requested_stage':data.stage}
+
+
+# ---- 단계 초기화 · 다시 실행: 완료(또는 실패)한 실행의 한 단계부터 결과를 보관하고 다시 실행합니다 ----
+# 원본 단계 스크립트는 기존 결과를 이어서 쓰므로 Worker(stage_reset.py)가 그 단계부터의 결과를 99_history/reset으로 옮기고
+# 작업 상태를 되돌린 뒤, 이 서버가 Airflow 단계를 다시 실행합니다. 검수 확인 단계는 앞 결과 단계의 초기화로 함께 다시 열립니다.
+RESET_START={'prepare_raw':'prepare_raw','sam_settings_ready':'sam3','sam3':'sam3','preflight':'preflight','track':'preflight',
+             'prepare_reconstruction':'prepare_reconstruction','reconstruct':'prepare_reconstruction','hands':'hands','validate':'validate','publish':'publish'}
+RESET_STARTS=('prepare_raw','sam3','preflight','prepare_reconstruction','hands','validate','publish')
+RESETS={}  # run_id → {'state':'running'|'success'|'failed','stage','message','at'} (최근 초기화 진행 상황 · 작업 현황 표시용)
+
+def resettable_stages(tasks):
+ """완료된 단계 목록에서 초기화를 시작할 수 있는 단계: 그 단계가 끝났거나 실패했고, 앞 단계가 모두 완료된 경우."""
+ by={t['task']:t.get('state') for t in tasks}
+ out=[]
+ for start in RESET_STARTS:
+  if by.get(start) not in ('success','failed'):continue
+  if all(by[t]=='success' for t in by if JOB_STAGES.index(t)<JOB_STAGES.index(start)):out.append(start)
+ return out
+
+def reset_busy(run_id):
+ if RESETS.get(run_id,{}).get('state')=='running':raise HTTPException(409,'이 실행은 단계 초기화 중입니다. 끝난 뒤 다시 시도하세요.')
+
+class ResetJob(BaseModel):
+ dag_id:str
+ run_id:str=Field(min_length=1,max_length=250)
+ stage:str
+
+@app.post('/api/jobs/reset')
+def reset_job(data:ResetJob,req:Request):
+ guard(req);update_block()
+ start=RESET_START.get(data.stage)
+ wid=dag_worker(data.dag_id)
+ if not start or data.dag_id not in [d for w,m,d in active_dags()]:raise HTTPException(400,'초기화할 단계를 확인하세요.')
+ with lock:
+  reset_busy(data.run_id)
+  base=f'/api/v2/dags/{data.dag_id}/dagRuns/'+quote(data.run_id,safe='')
+  run=local_api('GET',base);conf=run.get('conf',{});ep=conf.get('episode_id','')
+  require_owner(req,conf)
+  if run['state'] not in ('success','failed'):raise HTTPException(409,'완료되었거나 실패한 실행만 초기화할 수 있습니다. 진행 중이면 먼저 강제 종료하세요.')
+  if active_batch_sources(run_id=data.run_id):raise HTTPException(409,'MANO 일괄 실행에 들어 있는 실행입니다. 일괄 실행이 끝나거나 제거한 뒤 초기화하세요.')
+  tasks=[{'task':t['task_id'],'state':t['state']} for t in local_api('GET',base+'/taskInstances')['task_instances']]
+  airflow_ids={t['task'] for t in tasks}
+  if start in MANO_STAGES and start not in airflow_ids:
+   # 낮 실행(3D 복원까지): MANO 단계는 Worker 작업 상태로 확인합니다.
+   for stage in MANO_STAGES:
+    tasks.append({'task':stage,'state':{'success':'success','failed':'failed','interrupted':'failed'}.get(call('POST','/worker/jobs/status',json=request_for(stage,data.run_id,conf),worker_id=wid,timeout=15).get('state'))})
+  if start not in resettable_stages(tasks):raise HTTPException(409,'이 단계는 아직 끝나지 않았거나 앞 단계가 완료되지 않아 초기화할 수 없습니다. 새로고침하세요.')
+  rerun=[t for t in airflow_ids if JOB_STAGES.index(t)>=JOB_STAGES.index(start)]
+  if rerun:
+   # 다시 실행하면 이 실행이 동시 실행 자리를 차지합니다(MANO 일괄 실행·검수 대기는 세지 않음).
+   running=[(w,d,r) for w,d,r in active_runs() if w==wid and not run_waiting(d,r)]
+   if any((r.get('conf') or {}).get('episode_id')==ep for w,d,r in active_runs()):raise HTTPException(409,'같은 에피소드가 실행 중입니다.')
+   if len(running)>=MAX_PARALLEL_RUNS:raise HTTPException(409,f'이 PC에서 이미 {MAX_PARALLEL_RUNS}개 작업이 실행 중입니다. 하나가 끝난 뒤 초기화하세요.')
+  payload={'episode':ep,'run_id':data.run_id,'start':start}
+  st=worker_action('reset',payload,wid)
+  if st.get('state')=='failed':raise HTTPException(409,'초기화 실패: '+str(st.get('error','')))
+  RESETS[data.run_id]={'state':'running','stage':start,'message':'결과 보관 중','at':time.time()}
+  access.audit(req,'reset '+data.run_id+' '+start)
+ spawn_reset(data.dag_id,wid,data.run_id,payload,sorted(rerun,key=JOB_STAGES.index),access.user(req)['name'])
+ return {'ok':True,'stage':start,'requested_stage':data.stage,'airflow':bool(rerun)}
+
+def spawn_reset(*args):
+ threading.Thread(target=_finish_reset,args=args,name='kaist-reset',daemon=True).start()
+
+def _finish_reset(dag_id,wid,run_id,payload,rerun,who):
+ """Worker 초기화(NAS 되돌리기·결과 보관·작업 되돌리기)가 끝나면 Airflow 단계를 다시 실행합니다."""
+ entry=RESETS[run_id]
+ try:
+  deadline=time.monotonic()+6*3600
+  while True:
+   st=worker_action('reset-status',payload,wid)
+   if st.get('state')!='running':break
+   if time.monotonic()>deadline:raise RuntimeError('초기화가 6시간 안에 끝나지 않았습니다.')
+   time.sleep(3)
+  if st.get('state')!='success':raise RuntimeError(st.get('error') or '초기화 실패')
+  if rerun:
+   with lock:
+    base=f'/api/v2/dags/{dag_id}/dagRuns/'+quote(run_id,safe='')
+    if local_api('GET',base)['state'] not in ('success','failed'):raise RuntimeError('초기화 중 실행 상태가 바뀌어 다시 실행하지 않았습니다. 새로고침 후 확인하세요.')
+    body={'dag_run_id':run_id,'task_ids':rerun,'only_failed':False,'reset_dag_runs':True,'include_upstream':False,
+          'include_downstream':False,'prevent_running_task':True,'note':'UI reset by '+who}
+    local_api('POST',f'/api/v2/dags/{dag_id}/clearTaskInstances',json={**body,'dry_run':True})
+    local_api('POST',f'/api/v2/dags/{dag_id}/clearTaskInstances',json={**body,'dry_run':False})
+  MANO_DONE.discard(run_id);finished_tasks.cache_clear()
+  entry.update(state='success',message=('다시 실행 시작' if rerun else 'MANO 대기로 되돌림'),archive=st.get('archive'),at=time.time())
+ except Exception as e:
+  entry.update(state='failed',message=str(getattr(e,'detail',None) or e)[-400:],at=time.time())
 
 
 # ---- 목록 항목 관리: NAS에 올리기 · 강제 종료 · 목록에서 삭제(숨김) ----

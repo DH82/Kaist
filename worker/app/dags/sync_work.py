@@ -144,6 +144,44 @@ def import_episode(cfg, source_pc, ep, log=print, allow_existing=False):
     return {'paths': paths, 'bytes': total, 'source': str(src_root), 'source_record': record}
 
 
+def restore_local(cfg, ep, log=print):
+    """단계 초기화(재실행) 전: 최종 저장 후 로컬에서 지운 이 에피소드 작업 폴더를 NAS work/<이 PC>에서 되돌려 받습니다.
+
+    - 이 PC의 업로드 기록(99_history/nas_sync/<ep>.json)의 local_deleted 경로 중 로컬에 없는 것만 가져옵니다.
+    - 가져온 뒤 rsync로 다시 비교해 차이가 0건이어야 성공이고, 기록에 restored_local로 남깁니다."""
+    project = Path(cfg['project_dir'])
+    nas = work_root(cfg)
+    rec_path = nas / '99_history/nas_sync' / f'{ep}.json'
+    if not rec_path.is_file():
+        return []
+    rec = json.loads(rec_path.read_text())
+    todo = [rel for rel in rec.get('local_deleted') or [] if not (project / rel).exists()]
+    if not todo:
+        return []
+    if not Path(cfg['nas_mount']).is_mount():
+        raise RuntimeError('NAS가 마운트되어 있지 않아 지운 로컬 작업 폴더를 되돌릴 수 없습니다: ' + cfg['nas_mount'])
+    total = 0
+    for rel in todo:
+        src = nas / rel
+        if Path(rel).name not in (ep, ep + '.json') or '..' in Path(rel).parts:
+            raise RuntimeError('업로드 기록의 경로가 에피소드 경로가 아닙니다: ' + rel)
+        if not src.exists():
+            raise RuntimeError('NAS 사본이 없습니다: ' + str(src))
+        log(f'NAS → 로컬 되돌리기: {rel}')
+        rsync(src, project / rel); total += size(src)
+    diff = []
+    for rel in todo:
+        diff += rsync(nas / rel, project / rel, dry=True)
+    if diff:
+        raise RuntimeError(f'되돌린 사본 검증 실패 ({len(diff)}건): ' + '; '.join(diff[:5]))
+    rec['restored_local'] = todo
+    rec['restored_local_at'] = datetime.datetime.now().astimezone().isoformat()
+    rec['local_deleted'] = [rel for rel in rec.get('local_deleted') or [] if rel not in todo]
+    rec_path.write_text(json.dumps(rec, ensure_ascii=False, indent=2))
+    log(f'NAS → 로컬 되돌리기 완료: {ep} ({len(todo)}개 경로, {total/1e9:.2f} GB, 검증 통과)')
+    return todo
+
+
 def published_to_nas(project, ep):
     """최종 저장(publish)이 NAS results에 끝났는지. NAS가 없어 로컬(07_deliverables/local_results)에
     저장된 경우는 False — 그때는 로컬이 유일한 사본이므로 지우면 안 됩니다."""

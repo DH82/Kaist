@@ -256,6 +256,83 @@ def sync_run(episode):
   traceback.print_exc()
   write(d/'status.json',{'state':'failed','episode':episode,'started':started,'pid':os.getpid(),'finished':time.time(),'error':str(e)[-600:]})
 
+# ---- 단계 초기화 (UI '단계 초기화 · 다시 실행'): 끝난 실행의 한 단계부터 결과를 보관하고 작업을 시작 전으로 되돌립니다 ----
+# NAS에서 작업 폴더를 되돌려 받을 수 있어(수 GB) 업로드처럼 별도 프로세스로 실행하고 reset-status로 확인합니다.
+# 결과 보관 규칙은 dags/stage_reset.py, Airflow 단계 재실행은 UI가 이 작업이 끝난 뒤 요청합니다.
+RESET=JOBS/'_reset'
+RESET_STARTS=('prepare_raw','sam3','preflight','prepare_reconstruction','hands','validate','publish')
+def _reset_dir(req):
+ _check_ids(req)
+ return RESET/hashlib.sha256((req['run_id']+'\0'+req['episode']).encode()).hexdigest()[:32]
+def reset_status(req):
+ d=_reset_dir(req)
+ if not (d/'status.json').exists():return {'state':'not_started','episode':req['episode']}
+ st=json.loads((d/'status.json').read_text())
+ if st['state']=='running':
+  pid=st.get('pid')
+  try:alive=bool(pid and b'reset-run' in (Path('/proc')/str(pid)/'cmdline').read_bytes())
+  except OSError:alive=False
+  if not alive and time.time()-st.get('started',0)>20:
+   st={**st,'state':'failed','error':'초기화 프로세스가 중단되었습니다. 로그를 확인하고 다시 시도하세요.'};write(d/'status.json',st)
+ return st
+def _run_stages(req):
+ return STAGE_ORDER[STAGE_ORDER.index(req['start']):]
+def reset_start(req):
+ if req.get('start') not in RESET_STARTS:raise ValueError('초기화할 수 없는 단계입니다.')
+ d=_reset_dir(req);d.mkdir(parents=True,exist_ok=True)
+ with (d/'launch.lock').open('a') as lock:
+  fcntl.flock(lock,fcntl.LOCK_EX)
+  st=reset_status(req)
+  if st['state']=='running':return st
+  for stage in _run_stages(req):
+   p=_job_dir(req['run_id'],req['episode'],stage)
+   if p.exists() and status(p)['state'] in ('queued','running'):raise ValueError(stage+' 단계가 실행 중입니다. 끝나거나 강제 종료한 뒤 초기화하세요.')
+  clean={'episode':req['episode'],'run_id':req['run_id'],'start':req['start']}
+  write(d/'request.json',clean);write(d/'status.json',{'state':'running',**clean,'started':time.time()})
+  with (d/'reset.log').open('ab') as log:
+   proc=subprocess.Popen(['/usr/bin/python3',str(__file__),'reset-run',str(d)],stdin=subprocess.DEVNULL,stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
+  write(d/'status.json',{'state':'running',**clean,'started':time.time(),'pid':proc.pid})
+ return reset_status(req)
+def reset_run(d):
+ import contextlib,shutil
+ req=json.loads((d/'request.json').read_text());started=json.loads((d/'status.json').read_text()).get('started',time.time())
+ base={**req,'started':started,'pid':os.getpid()}
+ print('단계 초기화 시작:',req['episode'],req['start'],'부터',time.strftime('%Y-%m-%d %H:%M:%S'),flush=True)
+ try:
+  sys.path.insert(0,str(ADAPTER.parent))
+  import stage_reset
+  cfg=json.loads(CONFIG.read_text())
+  # NAS에서 되돌려 받기는 잠금 없이 먼저 합니다(오래 걸림). 결과 이동·작업 되돌리기는 단계 작업 시작 잠금을 모두 잡고 합니다.
+  stage_reset.sync_work.restore_local(cfg,req['episode'],lambda m:print(m,flush=True))
+  with contextlib.ExitStack() as stack:
+   jobs=[]
+   for stage in _run_stages(req):
+    p=_job_dir(req['run_id'],req['episode'],stage)
+    if not p.exists():continue
+    fcntl.flock(stack.enter_context((p/'launch.lock').open('a')),fcntl.LOCK_EX)
+    st=status(p)
+    if st['state'] in ('queued','running'):raise RuntimeError(stage+' 단계가 실행 중이라 초기화를 중단했습니다(변경 없음).')
+    jobs.append((p,stage,st))
+   locks=Path(cfg['project_dir'])/'99_history/locks';locks.mkdir(parents=True,exist_ok=True)
+   ep_lock=stack.enter_context((locks/f"{req['episode']}.lock").open('a'))
+   fcntl.flock(ep_lock,fcntl.LOCK_EX)  # 같은 에피소드의 검수 저장이 끝날 때까지 기다립니다.
+   record=stage_reset.reset_outputs(cfg,req['episode'],req['run_id'],req['start'],lambda m:print(m,flush=True))
+   rewound=[]
+   for p,stage,st in jobs:
+    if st['state']=='not_started':continue
+    archive=p/'attempts'/uuid.uuid4().hex;archive.mkdir(parents=True)
+    for name in ('request.json','status.json','job.log','pid'):
+     if (p/name).exists():shutil.copy2(p/name,archive/name)
+    (p/'pid').unlink(missing_ok=True)
+    write(p/'status.json',{'state':'not_started','stage':stage,'retry_prepared':time.time(),'reset_from':req['start'],'rewound_from':st['state'],'previous_attempt':str(archive),'log':str(p/'job.log')})
+    rewound.append(stage)
+  print('작업 상태 되돌림:',', '.join(rewound) or '없음',flush=True)
+  write(d/'status.json',{**base,'state':'success','finished':time.time(),'rewound':rewound,'archive':record['archive'],
+                         'moved':record['moved'],'restored':record['restored_from_nas'],'published_result':record['published_result'],'repinned':record['repinned']})
+ except Exception as e:
+  traceback.print_exc()
+  write(d/'status.json',{**base,'state':'failed','finished':time.time(),'error':str(e)[-600:]})
+
 # ---- SAM3 분할 대상 저장 (UI 'SAM3 설정 대기' → 이어서 실행) ----
 # RAW 전처리만 하고 sam_settings_ready에서 기다리는 실행에, 파이프라인의 sam_local_setup.approve_only로
 # 03_prepared/<ep>/sam3_settings.json 을 저장합니다. 다음 확인 때 sam_settings_ready가 통과하고 SAM3가 시작됩니다.
@@ -274,6 +351,7 @@ def sam_settings(req):
 if __name__=='__main__':
  if sys.argv[1]=='run':run(Path(sys.argv[2]))
  elif sys.argv[1]=='sync-run':sync_run(sys.argv[2])
+ elif sys.argv[1]=='reset-run':reset_run(Path(sys.argv[2]))
  else:
   req=json.load(sys.stdin);action=sys.argv[1]
   if action=='stop':print(json.dumps(stop(req)))
@@ -281,6 +359,8 @@ if __name__=='__main__':
   elif action=='sync':print(json.dumps(sync_start(req)))
   elif action=='sync-status':print(json.dumps(sync_status(req)))
   elif action=='sam-settings':print(json.dumps(sam_settings(req),ensure_ascii=False))
+  elif action=='reset':print(json.dumps(reset_start(req),ensure_ascii=False))
+  elif action=='reset-status':print(json.dumps(reset_status(req),ensure_ascii=False))
   else:
    p=folder(req)
    print(json.dumps(start(req) if action=='start' else retry(req) if action=='retry' else rewind(req) if action=='rewind' else status(p)))
