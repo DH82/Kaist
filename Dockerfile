@@ -36,7 +36,9 @@ COPY pipeline/dependency-source/co-tracker ${DEP_ROOT}/co-tracker
 COPY pipeline/dependency-source/diffoctreerast ${DEP_ROOT}/diffoctreerast
 COPY pipeline/dependency-source/mip-splatting ${DEP_ROOT}/mip-splatting
 RUN --mount=type=cache,target=/root/.cache/uv /opt/kaist-env/build_envs.sh phystwin
-COPY pipeline/dependency-source/kaist-full ${DEP_ROOT}/kaist-full
+# HaMBA 빌드에는 kaist-full 중 Hamba 폴더만 필요합니다. kaist-full 전체는 실행 이미지 끝부분에서 넣으므로
+# PhysTwin 스크립트를 고쳐도 이 층(mmcv·selective_scan CUDA 컴파일, 수십 분)과 큰 환경 복사 층은 캐시를 씁니다.
+COPY pipeline/dependency-source/kaist-full/PhysTwin/Mono/data_process/Hamba ${DEP_ROOT}/kaist-full/PhysTwin/Mono/data_process/Hamba
 RUN --mount=type=cache,target=/root/.cache/uv /opt/kaist-env/build_envs.sh hamba
 
 # ---------------------------------------------------------------------------------------------
@@ -81,15 +83,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends gcc g++ libc6-d
  && ln -s /usr/bin/gcc "${DEP_ROOT}/toolchain/compiler/bin/x86_64-conda-linux-gnu-gcc" \
  && ln -s /usr/bin/g++ "${DEP_ROOT}/toolchain/compiler/bin/x86_64-conda-linux-gnu-g++"
 
-# ---- 파이프라인 코드 (02_current: workspace 코드 + 00_scripts) ----
-COPY --chown=${HOST_UID} ["pipeline/current/workspace", "${REV_ROOT}/workspace"]
-COPY --chown=${HOST_UID} ["pipeline/current/project", "${REV_ROOT}/project"]
-
-# 원래 PC와 같은 심볼릭 링크: 환경 3개, 그리고 weight(실행 시 DEP_ROOT 아래에 마운트됨)
-COPY gpu/env/link_workspace.sh gpu/env/weights.txt /opt/kaist/
-RUN /opt/kaist/link_workspace.sh "${DEP_ROOT}" "${REV_ROOT}/workspace" \
- && chown -h -R ${HOST_UID} "${REV_ROOT}/workspace"
-
 # ---- GPU Worker (UI·Airflow가 호출하는 HTTP 서비스) ----
 COPY gpu/requirements-worker.txt /opt/kaist/requirements-worker.txt
 RUN "${DEP_ROOT}/python/cpython-3.10.22-linux-x86_64-gnu/bin/python3.10" -m venv ${WORKER_ROOT}/venv \
@@ -108,6 +101,20 @@ new = "    return _USE_FLASH_ATTENTION_3 and torch.cuda.get_device_capability() 
 assert s.count(old) == 1, 'xformers dispatch.py changed; review FA3 patch'
 open(p, 'w').write(s.replace(old, new))
 EOF
+# ---- 파이프라인 코드: 자주 바뀌므로 큰 층·venv 설치 뒤에 둡니다 ----
+# kaist-full 나머지(Hamba 제외 — Hamba는 위 envs 단계에서 빌드 산출물과 함께 들어옴)
+RUN --mount=type=bind,source=pipeline/dependency-source/kaist-full,target=/tmp/kaist-full-src \
+    rsync -a --exclude=/PhysTwin/Mono/data_process/Hamba /tmp/kaist-full-src/ "${DEP_ROOT}/kaist-full/" \
+ && chown -R ${HOST_UID} "${DEP_ROOT}/kaist-full"
+# 02_current: workspace 코드 + 00_scripts
+COPY --chown=${HOST_UID} ["pipeline/current/workspace", "${REV_ROOT}/workspace"]
+COPY --chown=${HOST_UID} ["pipeline/current/project", "${REV_ROOT}/project"]
+
+# 원래 PC와 같은 심볼릭 링크: 환경 3개, 그리고 weight(실행 시 DEP_ROOT 아래에 마운트됨)
+COPY gpu/env/link_workspace.sh gpu/env/weights.txt /opt/kaist/
+RUN /opt/kaist/link_workspace.sh "${DEP_ROOT}" "${REV_ROOT}/workspace" \
+ && chown -h -R ${HOST_UID} "${REV_ROOT}/workspace"
+
 # worker/ 폴더는 실행 시 호스트 상태 폴더(gpu_state/worker: secret, jobs, 등록 폴더, GPU lock)를
 # 마운트하는 자리입니다. 코드는 /opt/kaist/worker-code에 두고 entrypoint가 매번 덮어씁니다.
 COPY --chown=${HOST_UID} worker/app/worker  /opt/kaist/worker-code
