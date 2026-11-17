@@ -7,7 +7,10 @@
   status.json   이 스크립트가 매 실행마다 씁니다(현재 커밋, GitHub 최신 커밋, 진행 상태). 대시보드가 읽습니다.
 
 Docker PC 순서 (한 번에 끝나지 않으면 다음 타이머 실행에서 이어서 진행):
-  1) git fetch → 작업 트리에 수정이 없을 때만 fast-forward (실행 중인 컨테이너에는 영향 없음)
+  1) git fetch → origin/main으로 맞춤 (실행 중인 컨테이너에는 영향 없음)
+     이 PC에서 직접 고친 파일·GitHub와 갈라진 커밋이 있어도 멈추지 않고, state/updater/discarded/<시각>/ 에
+     패치(local.patch)와 백업 브랜치(updater-backup/<시각>)로 보관한 뒤 GitHub 최신 코드로 덮어씁니다.
+     GitHub보다 앞선(아직 올리지 않은) 커밋만 있으면 그대로 둡니다.
   2) 새 이미지 빌드 + GPU 자체 점검 (기존 서비스는 계속 동작)
   3) 이 PC가 쉴 때까지 대기: Worker 단계 작업·NAS 업로드·Airflow 실행 중 태스크·MANO 일괄 실행이 없을 것.
      파이프라인 코드(pipeline/)가 바뀌면 진행 중인 실행이 "Code/config changed during run"으로 실패하므로
@@ -227,19 +230,40 @@ class Updater:
         except (RuntimeError, subprocess.TimeoutExpired) as e:
             return f'GitHub 확인 실패: {e}'
 
+    def backup_local(self, head, files, diverged):
+        """버리기 전에 직접 고친 내용(패치)과 커밋(백업 브랜치)을 보관합니다. 되살리기:
+        git apply state/updater/discarded/<시각>/local.patch  또는  git log updater-backup/<시각>"""
+        stamp = time.strftime('%Y%m%d-%H%M%S')
+        d = LOCAL / 'discarded' / stamp
+        d.mkdir(parents=True, exist_ok=True)
+        if files:
+            patch = subprocess.run(['git', '-C', str(ROOT), 'diff', '--binary', 'HEAD'], capture_output=True, timeout=120)
+            (d / 'local.patch').write_bytes(patch.stdout)
+        branch = f'updater-backup/{stamp}'
+        git('branch', '--force', branch, head)
+        write_json(d / 'info.json', {'at': time.time(), 'head': head, 'branch': branch, 'files': files, 'diverged': diverged})
+        log(f'직접 고친 내용 보관: {d} (파일 {len(files)}개{" · 갈라진 커밋 " + branch if diverged else ""})')
+        return f'state/updater/discarded/{stamp}'
+
     def fast_forward(self):
-        """origin/main으로 fast-forward. (이전 커밋, 바뀐 파일 목록)을 돌려줍니다."""
+        """origin/main으로 맞춥니다. (이전 커밋, 바뀐 파일 목록)을 돌려줍니다.
+        직접 고친 파일·갈라진 커밋은 보관(backup_local)한 뒤 버리고 GitHub 최신 코드로 덮어씁니다."""
         head, remote = git('rev-parse', 'HEAD'), git('rev-parse', f'origin/{BRANCH}')
-        if head == remote or is_ancestor(remote, head):
-            return head, []
-        if not is_ancestor(head, remote):
-            raise RuntimeError('이 PC의 커밋이 GitHub와 갈라졌습니다. 직접 확인이 필요합니다.')
-        if self.dirty():
-            raise RuntimeError('이 PC에서 직접 고친 파일이 있어 업데이트하지 않습니다: ' + ', '.join(
-                l.split(None, 1)[-1] for l in self.dirty().splitlines()[:5]))
+        dirty = self.dirty()
+        files = git('diff', '--name-only', 'HEAD').splitlines() if dirty else []
+        ahead = head == remote or is_ancestor(remote, head)
+        diverged = not ahead and not is_ancestor(head, remote)
+        if files or diverged:
+            where = self.backup_local(head, files, diverged)
+            git('reset', '--hard', '--quiet', remote if diverged else 'HEAD')
+            # 이미지가 고친 파일로 빌드됐을 수 있으므로 다시 빌드합니다.
+            self.save_local(built=None, discarded={'at': time.time(), 'path': where, 'files': files, 'diverged': diverged})
+        if ahead:
+            return head, files
         changed = git('diff', '--name-only', head, remote).splitlines()
-        git('merge', '--ff-only', '--quiet', remote)
-        return head, changed
+        if not diverged:
+            git('merge', '--ff-only', '--quiet', remote)
+        return head, sorted(set(changed) | set(files))
 
     # ---------- 쉬는지 확인 ----------
     def worker_busy(self):
@@ -337,6 +361,10 @@ class Updater:
             return f' → 이전 커밋 {prev[:7]}로 되돌렸지만 재기동 실패: {e}'
 
     def done(self, req, message):
+        gone = self.local.get('discarded')
+        if gone:
+            message += f" · 직접 고친 파일 {len(gone['files'])}개{'·갈라진 커밋' if gone.get('diverged') else ''}를 {gone['path']}에 보관하고 GitHub 코드로 덮어씀"
+            self.save_local(discarded=None)
         run = self.end_run(True)
         self.save_local(last={'at': time.time(), 'ok': True, 'message': message, 'request': (req or {}).get('id'), 'run': run},
                         prev=None, changed=[], run=None)

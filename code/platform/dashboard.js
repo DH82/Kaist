@@ -224,7 +224,7 @@ function dashVersion(p){
  let h='<code title="'+escape((st.subject||'')+(st.mode==='native'?' · native':''))+'">'+escape(String(st.commit||'').slice(0,7))+'</code>';
  if(st.behind>0)h+=' <span class="new" title="GitHub: '+escape(st.remote_subject||'')+'">새 버전 '+st.behind+'개</span>';
  else if(st.behind===0)h+=' <span class="zero">최신</span>';
- if(st.dirty)h+=' <span class="bad" title="이 PC에서 직접 고친 파일이 있어 업데이트가 멈춥니다.">수정됨</span>';
+ if(st.dirty)h+=' <span class="bad" title="이 PC에서 직접 고친 파일이 있습니다. 업데이트하면 state/updater/discarded에 보관한 뒤 GitHub 최신 코드로 덮어씁니다.">수정됨</span>';
  const label=stale?'업데이터 응답 없음':DASH_UPD[st.state];
  if(label)h+=' <span class="'+(stale||st.state==='failed'?'bad':'new')+'">'+label+'</span>';
  if(rq&&!['building','restarting','waiting'].includes(st.state))h+=' <span class="new">요청됨</span>';

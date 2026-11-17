@@ -121,11 +121,36 @@ class UpdaterTests(unittest.TestCase):
         self.assertEqual(st['state'], 'failed'); self.assertEqual(self.head(), self.deployed)
         self.assertEqual(self.calls[-1], ())   # 이전 커밋으로 전체 빌드·기동
 
-    def test_local_edits_block_update(self):
+    def test_local_edits_are_backed_up_and_overwritten(self):
         self.commit('README.md', 'v2'); self.request()
         (self.pc / 'README.md').write_text('local edit')
         st = self.tick()
-        self.assertEqual(st['state'], 'failed'); self.assertIn('직접 고친 파일', st['message']); self.assertEqual(self.calls, [])
+        self.assertEqual(st['state'], 'done'); self.assertIn('직접 고친 파일 1개', st['message'])
+        self.assertEqual(self.head(), sh(self.dev, 'git', 'rev-parse', 'HEAD'))
+        self.assertEqual((self.pc / 'README.md').read_text(), 'v2'); self.assertFalse(st['dirty'])
+        self.assertEqual(self.calls, [('--build-only',), ('--skip-build',)])
+        backup = next((us.LOCAL / 'discarded').iterdir())
+        self.assertIn('local edit', (backup / 'local.patch').read_text())
+        self.assertEqual(json.loads((backup / 'info.json').read_text())['files'], ['README.md'])
+
+    def test_local_edits_without_new_commit_rebuild_clean(self):
+        self.request()
+        (self.pc / 'README.md').write_text('local edit')
+        st = self.tick()
+        self.assertEqual(st['state'], 'done'); self.assertEqual((self.pc / 'README.md').read_text(), 'v1')
+        self.assertEqual(self.calls, [('--build-only',), ('--skip-build',)])
+
+    def test_diverged_commit_is_backed_up_and_reset(self):
+        self.commit('README.md', 'v2'); self.request()
+        for k, v in (('user.email', 't@t'), ('user.name', 't')):
+            sh(self.pc, 'git', 'config', k, v)
+        (self.pc / 'local.txt').write_text('x'); sh(self.pc, 'git', 'add', '-A'); sh(self.pc, 'git', 'commit', '-qm', 'local')
+        local = self.head()
+        st = self.tick()
+        self.assertEqual(st['state'], 'done'); self.assertEqual(self.head(), sh(self.dev, 'git', 'rev-parse', 'HEAD'))
+        self.assertFalse((self.pc / 'local.txt').exists())
+        branches = sh(self.pc, 'git', 'branch', '--list', 'updater-backup/*', '--format=%(objectname)')
+        self.assertEqual(branches, local)
 
     def test_cancel_while_waiting_pauses(self):
         self.commit('code/a.py', '1'); self.request(); self.job('running')

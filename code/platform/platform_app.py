@@ -513,6 +513,34 @@ def batch_history():
  BATCH_OF.clear();BATCH_OF.update(batch_of)
  return history
 
+# ---- 단계 초기화로 '3D 복원까지만' 다시 실행한 전체 파이프라인 실행 ----
+# Airflow의 MANO 단계(hands·validate·publish)는 skipped로 두고, 낮 실행(DAY_DAG)처럼 'MANO 대기' → MANO 일괄 실행으로 이어 갑니다.
+# MANO 일괄 실행은 이 PC Worker(DEFAULT_WORKER)에서만 하므로 그 PC의 전체 파이프라인 실행만 해당합니다.
+def deferred_db():
+ c=access.db()
+ c.execute('CREATE TABLE IF NOT EXISTS mano_deferred (run_id TEXT PRIMARY KEY,dag_id TEXT NOT NULL,at REAL)')
+ return c
+
+def deferred_runs():
+ with deferred_db() as c:return {r[0]:r[1] for r in c.execute('SELECT run_id,dag_id FROM mano_deferred')}
+
+def set_deferred(dag,run_id,on):
+ with deferred_db() as c:
+  if on:c.execute('INSERT OR REPLACE INTO mano_deferred VALUES(?,?,?)',(run_id,dag,time.time()))
+  else:c.execute('DELETE FROM mano_deferred WHERE run_id=?',(run_id,))
+
+def mano_dag(run_id):
+ """MANO 대기 실행이 들어 있는 DAG: 낮 실행 또는 '3D까지만' 초기화한 전체 파이프라인"""
+ return deferred_runs().get(run_id,DAY_DAG)
+
+def mano_ready_runs():
+ """3D 복원까지 끝난(성공) 낮 실행 + '3D까지만' 초기화한 뒤 성공한 전체 파이프라인 실행"""
+ yield from airflow_runs(DAY_DAG,state='success')
+ for run_id,dag in deferred_runs().items():
+  try:run=local_api('GET',f'/api/v2/dags/{dag}/dagRuns/'+quote(run_id,safe=''))
+  except Exception:continue
+  if run.get('state')=='success':yield run
+
 # ---- MANO 일괄 실행 대기열에서 에피소드 하나 제거 ----
 def mano_removed_db():
  c=access.db()
@@ -555,7 +583,7 @@ def mano_candidates(req:Request):
  guard(req)
  history=batch_history()
  rows=[]
- for run in airflow_runs(DAY_DAG,state='success'):
+ for run in mano_ready_runs():
   conf=run['conf']
   if not access.allowed(req,conf['episode_id']):continue
   label,ready=mano_progress(run,history)
@@ -573,7 +601,7 @@ def launch_mano(data:ManoSelection,req:Request):
   history=batch_history()
   for run_id in data.runs:
    reset_busy(run_id)
-   run=local_api('GET',f'/api/v2/dags/{DAY_DAG}/dagRuns/'+quote(run_id,safe=''))
+   run=local_api('GET',f'/api/v2/dags/{mano_dag(run_id)}/dagRuns/'+quote(run_id,safe=''))
    conf=run['conf']
    access.require(req,conf['episode_id'])
    if run['state']!='success' or not mano_progress(run,history)[1]:
@@ -615,7 +643,7 @@ def jobs(req:Request):
   if wid not in reviews:
    reviews[wid]={(x['episode'],x['stage']):x for x in all_review_items(wid) if not x.get('unavailable')}
   return reviews[wid].get((episode,stage),{})
- history=None
+ history=None;deferred=deferred_runs()
  entries=active_dags()+([(DEFAULT_WORKER,'test',DIRECT_DAGS['test'])] if 'test' in DIRECT_DAGS else [])
  for wid,mode,dag in entries:
   d=local_api('GET',f'/api/v2/dags/{dag}/dagRuns',params={'limit':12,'order_by':'-logical_date'})
@@ -661,7 +689,11 @@ def jobs(req:Request):
       entry['review_required']=entry['review_invalidated'] or needs_hc(t['state'],prior.get('state'),approval,entry.get('worker_state'))
      item['tasks'].append(entry)
     if mode=='raw' and r['state']=='success':item['prepared_path']='03_prepared/'+item['episode']
-   if mode=='day' and r['state']=='success':
+   if r['dag_run_id'] in deferred:
+    # '3D까지만' 초기화한 실행: Airflow의 MANO 단계(skipped) 대신 Worker 상태(MANO 일괄 실행)를 보여 줍니다.
+    item['mano_deferred']=True
+    if 'tasks' in item:item['tasks']=[t for t in item['tasks'] if t['task'] not in MANO_STAGES]
+   if (mode=='day' or r['dag_run_id'] in deferred) and r['state']=='success':
      if history is None:history=batch_history()
      item['mano_progress']=mano_progress(r,history)[0]
      # MANO 일괄 실행 단계(손·검사·저장)도 단계 목록과 로그 창에 보이도록 Worker 상태를 붙입니다.
@@ -1024,7 +1056,8 @@ def raw_episodes(req:Request):
   for r in runs:
    ep=r.get('conf',{}).get('raw_episode_id') or r.get('conf',{}).get('episode_id');stamp=r.get('logical_date') or r.get('queued_at') or ''
    if ep in episodes and (ep not in latest or stamp>latest[ep][0]):latest[ep]=(stamp,dag,r,mode)
- batch_states=batch_history() if any(v[3]=='day' and v[2]['state']=='success' for v in latest.values()) else {}
+ deferred=deferred_runs()
+ batch_states=batch_history() if any((v[3]=='day' or v[2]['dag_run_id'] in deferred) and v[2]['state']=='success' for v in latest.values()) else {}
  labels={'prepare_raw':'RAW 전처리','sam_settings_ready':'분할 설정 확인','sam3':'SAM3','mask_approved':'마스크 검수','preflight':'추적 사전 검사','track':'추적','tracking_approved':'추적 검수','prepare_reconstruction':'복원 준비','reconstruct':'3D 복원','hands':'MANO 피팅','validate':'결과 검사','publish':'최종 저장'}
  # 3D 복원까지 끝난 RAW(낮 실행 성공 → MANO 대기/완료, 또는 전체 파이프라인 성공)는 배정 부하에서 빠집니다.
  done={ep for ep,(_,_,r,mode) in latest.items() if r['state']=='success' and mode!='raw'}
@@ -1041,8 +1074,18 @@ def raw_episodes(req:Request):
  queued=[ep for ep in episodes if raw_in_queue(ep,owners,latest)]
  episodes=[ep for ep in queued if ep not in elsewhere or owners.get(ep) or ep in latest]
  others=[ep for ep in queued if ep not in set(episodes)]
- assigned,team=access.rebalance(selected_worker(req),episodes,done,set(latest),claim=fleet.raw_claim,release=fleet.raw_release)
+ # '내 작업에서 제외'한 RAW: 이 PC 기록은 NAS에도 남기고(예전 제외분 포함), 어느 PC든 제외한 RAW는 아무에게도 배정하지 않습니다.
+ # 제외한 본인(제외 취소용)·관리자·이미 이 PC에서 담당/실행한 RAW가 아니면 목록에도 보이지 않습니다.
+ local_excl=access.excluded_any(selected_worker(req))
+ excluded_by={ep:pc.upper() for ep,pc in global_excluded().items()}
+ for ep,op in local_excl.items():
+  if ep not in excluded_by:fleet.raw_exclude(ep);excluded_by[ep]=op
  excluded=access.excluded_raw(user['name'],selected_worker(req))
+ def hidden(ep):
+  return user['role']!='admin' and ep in excluded_by and ep not in excluded and owners.get(ep)!=user['name'] and ep not in latest
+ assigned,team=access.rebalance(selected_worker(req),episodes,done,set(latest),claim=fleet.raw_claim,release=fleet.raw_release,blocked=set(excluded_by))
+ episodes=[ep for ep in episodes if not hidden(ep)]
+ others=[ep for ep in others if not hidden(ep)]
  out=[]
  for ep in episodes:
   owner=owners.get(ep);row=raw_row(ep,owner,user)
@@ -1052,10 +1095,10 @@ def raw_episodes(req:Request):
   row['can_exclude']=user['role']=='operator' and ep not in excluded and ((owner==user['name'] and ep not in done) or (not owner and assigned.get(ep)==user['name']))
   if user['role']!='admin':row['can_run']=ep not in excluded and (owner==user['name'] or (not owner and assigned.get(ep)==user['name']))
   progress='실행 전' if not owner else '실행 기록 확인 필요'
-  if not owner and ep not in latest:progress=('배정됨 · 실행 전' if assigned.get(ep) else '미배정 · 대기')
+  if not owner and ep not in latest:progress=('배정됨 · 실행 전' if assigned.get(ep) else '제외됨 · '+excluded_by[ep] if ep in excluded_by else '미배정 · 대기')
   if ep in latest:
    _,dag,r,mode=latest[ep]
-   if mode=='day' and r['state']=='success':progress=mano_progress(r,batch_states)[0]
+   if (mode=='day' or r['dag_run_id'] in deferred) and r['state']=='success':progress=mano_progress(r,batch_states)[0]
    elif r['state']=='success':progress='RAW 전처리 완료' if mode=='raw' else '전체 완료'
    else:
     tasks=local_api('GET',f"/api/v2/dags/{dag}/dagRuns/"+quote(r['dag_run_id'],safe='')+'/taskInstances')['task_instances']
@@ -1068,7 +1111,7 @@ def raw_episodes(req:Request):
  for ep in others:
   pc=elsewhere[ep];ran=started_other.get(ep)==pc
   out.append({'episode':ep,'operator':None,'assigned_to':None,'can_run':False,'done':False,'excluded_from_mine':False,'can_exclude':False,
-              'elsewhere':pc.upper(),'elsewhere_started':ran,'progress':'다른 PC에서 실행' if ran else '다른 PC 배정 · 실행 전'})
+              'elsewhere':pc.upper(),'elsewhere_started':ran,'progress':'다른 PC에서 실행' if ran else '제외됨 · '+excluded_by[ep] if ep in excluded_by else '다른 PC 배정 · 실행 전'})
  return {'episodes':out,'team':{'total_users':team['total'],'operators':team['operators'],'admins':team['admins'],'target':team['target'],
          'load':team['load'],'me':user['name'],'role':user['role']}}
 
@@ -1096,7 +1139,17 @@ def exclude_raw_episode(data:RawExclusion,req:Request):
    if any(matches(r.get('conf') or {}) for _,_,r in active_runs()) or any(matches(s.get('conf') or {}) for _,s in active_batch_sources()):
     raise HTTPException(409,'대기·실행 중인 작업이 있습니다. 내 작업 현황에서 먼저 강제 종료한 뒤 제외하세요.')
   access.exclude_raw(person['name'],data.worker_id,data.episode,data.excluded)
+  # 다른 PC에도 배정·표시하지 않도록 NAS에 제외 표시를 남깁니다(제외 취소 시 이 PC가 남긴 표시만 지움).
+  try:
+   if data.excluded:fleet.raw_exclude(data.episode)
+   elif not access.excluded_any(data.worker_id).get(data.episode):fleet.raw_unexclude(data.episode)
+  except Exception:pass
  return {'ok':True,'excluded':data.excluded}
+
+def global_excluded():
+ """NAS에 기록된, 어느 PC에서든 '내 작업에서 제외'한 RAW → 제외한 PC"""
+ try:return fleet.raw_excluded() if fleet.available() else {}
+ except Exception:return {}
 
 # 추적 결과가 지금 승인된 마스크와 맞지 않을 때(마스크를 고쳐 다시 승인했거나 아직 승인 전) 추적 검수에 나오는 사유.
 STALE_TRACKING_REASONS=('추적 입력이 현재 승인본과 다릅니다','승인된 마스크가 없습니다','승인 이후 초안이 바뀌었습니다')
@@ -1211,6 +1264,7 @@ class ResetJob(BaseModel):
  dag_id:str
  run_id:str=Field(min_length=1,max_length=250)
  stage:str
+ until_3d:bool=True  # 전체 파이프라인: 3D 복원까지만 다시 하고 MANO 대기로 둡니다(MANO는 일괄 실행에서).
 
 @app.post('/api/jobs/reset')
 def reset_job(data:ResetJob,req:Request):
@@ -1227,12 +1281,20 @@ def reset_job(data:ResetJob,req:Request):
   if active_batch_sources(run_id=data.run_id):raise HTTPException(409,'MANO 일괄 실행에 들어 있는 실행입니다. 일괄 실행이 끝나거나 제거한 뒤 초기화하세요.')
   tasks=[{'task':t['task_id'],'state':t['state']} for t in local_api('GET',base+'/taskInstances')['task_instances']]
   airflow_ids={t['task'] for t in tasks}
-  if start in MANO_STAGES and start not in airflow_ids:
-   # 낮 실행(3D 복원까지): MANO 단계는 Worker 작업 상태로 확인합니다.
+  mode=next((m for w,m,d in active_dags() if d==data.dag_id),None)
+  was_deferred=data.run_id in deferred_runs()
+  until_3d=data.until_3d and mode=='pipeline' and wid==DEFAULT_WORKER
+  if start in MANO_STAGES and (start not in airflow_ids or was_deferred):
+   # 낮 실행·'3D까지만' 초기화한 실행: MANO 단계는 Worker 작업 상태로 확인합니다.
+   tasks=[t for t in tasks if t['task'] not in MANO_STAGES]
    for stage in MANO_STAGES:
     tasks.append({'task':stage,'state':{'success':'success','failed':'failed','interrupted':'failed'}.get(call('POST','/worker/jobs/status',json=request_for(stage,data.run_id,conf),worker_id=wid,timeout=15).get('state'))})
   if start not in resettable_stages(tasks):raise HTTPException(409,'이 단계는 아직 끝나지 않았거나 앞 단계가 완료되지 않아 초기화할 수 없습니다. 새로고침하세요.')
   rerun=[t for t in airflow_ids if JOB_STAGES.index(t)>=JOB_STAGES.index(start)]
+  # 3D까지만: Airflow의 MANO 단계는 다시 실행하지 않고 skipped로 둡니다 → 실행이 3D 복원 뒤 성공으로 끝나 MANO 대기가 됩니다.
+  skip=[t for t in MANO_STAGES if t in airflow_ids] if until_3d else []
+  rerun=[t for t in rerun if t not in skip]
+  defer=True if until_3d else (False if was_deferred else None)
   if rerun:
    # 다시 실행하면 이 실행이 동시 실행 자리를 차지합니다(MANO 일괄 실행·검수 대기는 세지 않음).
    running=[(w,d,r) for w,d,r in active_runs() if w==wid and not run_waiting(d,r)]
@@ -1243,13 +1305,21 @@ def reset_job(data:ResetJob,req:Request):
   if st.get('state')=='failed':raise HTTPException(409,'초기화 실패: '+str(st.get('error','')))
   RESETS[data.run_id]={'state':'running','stage':start,'message':'결과 보관 중','at':time.time()}
   access.audit(req,'reset '+data.run_id+' '+start)
- spawn_reset(data.dag_id,wid,data.run_id,payload,sorted(rerun,key=JOB_STAGES.index),access.user(req)['name'])
- return {'ok':True,'stage':start,'requested_stage':data.stage,'airflow':bool(rerun)}
+ spawn_reset(data.dag_id,wid,data.run_id,payload,sorted(rerun,key=JOB_STAGES.index),access.user(req)['name'],skip,defer)
+ return {'ok':True,'stage':start,'requested_stage':data.stage,'airflow':bool(rerun),'until_3d':until_3d}
 
 def spawn_reset(*args):
  threading.Thread(target=_finish_reset,args=args,name='kaist-reset',daemon=True).start()
 
-def _finish_reset(dag_id,wid,run_id,payload,rerun,who):
+def skip_tasks(dag_id,run_id,tasks,note):
+ """Airflow 단계를 skipped로 바꿉니다. 뒤 단계부터 바꿔야 Airflow가 '뒤의 실패 단계 다시 시작'(set_task_instance_state)을 하지 않습니다."""
+ base=f'/api/v2/dags/{dag_id}/dagRuns/'+quote(run_id,safe='')
+ current={t['task_id']:t['state'] for t in run_tasks(dag_id,run_id)}
+ for t in sorted(tasks,key=JOB_STAGES.index,reverse=True):
+  if current.get(t)=='skipped':continue
+  local_api('PATCH',base+'/taskInstances/'+quote(t,safe=''),json={'new_state':'skipped','note':note})
+
+def _finish_reset(dag_id,wid,run_id,payload,rerun,who,skip=(),defer=None):
  """Worker 초기화(NAS 되돌리기·결과 보관·작업 되돌리기)가 끝나면 Airflow 단계를 다시 실행합니다."""
  entry=RESETS[run_id]
  try:
@@ -1260,16 +1330,22 @@ def _finish_reset(dag_id,wid,run_id,payload,rerun,who):
    if time.monotonic()>deadline:raise RuntimeError('초기화가 6시간 안에 끝나지 않았습니다.')
    time.sleep(3)
   if st.get('state')!='success':raise RuntimeError(st.get('error') or '초기화 실패')
-  if rerun:
-   with lock:
-    base=f'/api/v2/dags/{dag_id}/dagRuns/'+quote(run_id,safe='')
-    if local_api('GET',base)['state'] not in ('success','failed'):raise RuntimeError('초기화 중 실행 상태가 바뀌어 다시 실행하지 않았습니다. 새로고침 후 확인하세요.')
+  with lock:
+   base=f'/api/v2/dags/{dag_id}/dagRuns/'+quote(run_id,safe='')
+   if (rerun or skip) and local_api('GET',base)['state'] not in ('success','failed'):raise RuntimeError('초기화 중 실행 상태가 바뀌어 다시 실행하지 않았습니다. 새로고침 후 확인하세요.')
+   if skip:skip_tasks(dag_id,run_id,skip,'UI reset (3D까지만 · MANO 대기) by '+who)
+   if defer is not None:set_deferred(dag_id,run_id,defer)
+   # MANO 단계만 초기화(다시 실행할 Airflow 단계 없음): 실패로 끝났던 실행도 3D 복원까지는 끝났으므로 성공 → MANO 대기
+   if skip and not rerun and local_api('GET',base)['state']=='failed':
+    local_api('PATCH',base,json={'state':'success','note':'UI reset → MANO 대기 by '+who})
+   if rerun:
     body={'dag_run_id':run_id,'task_ids':rerun,'only_failed':False,'reset_dag_runs':True,'include_upstream':False,
           'include_downstream':False,'prevent_running_task':True,'note':'UI reset by '+who}
     local_api('POST',f'/api/v2/dags/{dag_id}/clearTaskInstances',json={**body,'dry_run':True})
     local_api('POST',f'/api/v2/dags/{dag_id}/clearTaskInstances',json={**body,'dry_run':False})
   MANO_DONE.discard(run_id);finished_tasks.cache_clear()
-  entry.update(state='success',message=('다시 실행 시작' if rerun else 'MANO 대기로 되돌림'),archive=st.get('archive'),at=time.time())
+  msg='다시 실행 시작'+(' · 3D 복원까지 하고 MANO 대기로 둡니다' if skip else '') if rerun else 'MANO 대기로 되돌림'
+  entry.update(state='success',message=msg,archive=st.get('archive'),at=time.time())
  except Exception as e:
   entry.update(state='failed',message=str(getattr(e,'detail',None) or e)[-400:],at=time.time())
 
@@ -1604,7 +1680,7 @@ def fleet_run_raw(task,p):
 def fleet_mano_export(task,p):
  run_id,ep,target=p['run_id'],p['episode'],p['target_pc']
  if not task['step']:
-  run=local_api('GET',f'/api/v2/dags/{DAY_DAG}/dagRuns/'+quote(run_id,safe=''))
+  run=local_api('GET',f'/api/v2/dags/{mano_dag(run_id)}/dagRuns/'+quote(run_id,safe=''))
   if run['conf'].get('episode_id')!=ep or run['state']!='success':raise RuntimeError('복원이 끝난 실행이 아닙니다.')
   label,ready=mano_progress(run,batch_history())
   if not ready:raise RuntimeError('MANO 대기 상태가 아닙니다: '+label)
@@ -1617,7 +1693,7 @@ def fleet_mano_export(task,p):
  if st['state']!='success':
   with fleet_db() as c:c.execute('DELETE FROM mano_transfers WHERE run_id=?',(run_id,))
   raise RuntimeError('NAS 업로드 실패: '+str(st.get('error') or st['state']))
- run=local_api('GET',f'/api/v2/dags/{DAY_DAG}/dagRuns/'+quote(run_id,safe=''))
+ run=local_api('GET',f'/api/v2/dags/{mano_dag(run_id)}/dagRuns/'+quote(run_id,safe=''))
  conf=run['conf']
  fleet.send(target,{'type':'mano_import','episode':ep,'source_pc':fleet.PC_ID,'source_run_id':run_id,
   'source_key':hashlib.sha256(run_id.encode()).hexdigest()[:24],'sam_prompt':conf.get('sam_prompt',''),
@@ -1664,11 +1740,13 @@ def fleet_raw_reset(task,p):
  with access._assign_lock:
   with access.db() as c:
    rows=[r[0] for r in (c.execute('SELECT episode FROM raw_assignments WHERE episode=?',(ep,)) if ep else c.execute('SELECT episode FROM raw_assignments'))]
+   unmark=[] if ep else [r[0] for r in c.execute('SELECT DISTINCT episode FROM raw_exclusions')]
    c.execute('DELETE FROM raw_assignments WHERE episode=?',(ep,)) if ep else c.execute('DELETE FROM raw_assignments')
    excl=0 if ep else c.execute('DELETE FROM raw_exclusions').rowcount
    c.execute('INSERT INTO ui_audit VALUES(?,?,?)',(time.time(),str(p.get('requested_by')),'raw-reset '+(ep or 'all')))
   for e in rows:
    if not own.get(e):fleet.raw_release(e)
+  for e in unmark:fleet.raw_unexclude(e)  # 이 PC가 NAS에 남긴 제외 표시도 풉니다.
   # 겹침 정리: 남기는 PC가 따로 있으면 이 PC의 선점도 풉니다(이 PC가 실행한 RAW는 제외).
   if ep and not own.get(ep):fleet.raw_release(ep)
  msg=(f'{ep} 시작 전 배정 해제' if ep else f'대기열 초기화: 시작 전 배정 {len(rows)}개 · 제외 기록 {excl}개 해제')+(' (배정 없음)' if not rows else '')
@@ -1824,7 +1902,7 @@ def fleet_snapshot():
                 'sam_prompt':conf.get('sam_prompt'),'state':r['state'],'stage':stage,'started':r.get('start_date') or r.get('queued_at'),'ended':r.get('end_date')})
  snap['runs']=runs;snap['raw_started']=sorted(e for e in started if e and re.fullmatch(r'ep_\d{8}_\d{6}',e))
  history=batch_history();waiting=[]
- for r in airflow_runs(DAY_DAG,state='success'):
+ for r in mano_ready_runs():
   label,ready=mano_progress(r,history);conf=r['conf']
   if ready:waiting.append({'run_id':r['dag_run_id'],'episode':conf['episode_id'],'raw_episode':conf.get('raw_episode_id'),'operator':conf.get('operator_id'),'sam_prompt':conf.get('sam_prompt'),'status':label})
  snap['mano_waiting']=waiting

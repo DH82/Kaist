@@ -103,6 +103,12 @@ def excluded_raw(name,worker_id=None):
   else:rows=c.execute('SELECT episode FROM raw_exclusions WHERE operator=? AND worker_id=?',(name,worker_id))
   return {r['episode'] for r in rows}
 
+def excluded_any(worker_id=None):
+ """이 PC에서 누구든 '내 작업에서 제외'한 RAW → 제외한 작업자"""
+ with db() as c:
+  rows=c.execute('SELECT episode,operator FROM raw_exclusions'+(' WHERE worker_id=?' if worker_id else ''),(worker_id,) if worker_id else ())
+  return {r['episode']:r['operator'] for r in rows}
+
 def exclude_raw(name,worker_id,episode,excluded=True):
  """Remove only this operator's assignment; retain RAW, ownership and run history."""
  with _assign_lock:
@@ -125,18 +131,20 @@ def capture_key(ep):
  # ep_YYYYMMDD_HHMMSS → 촬영 시각 순서(오래된 것부터)
  return ep
 
-def rebalance(worker_id,episodes,done,started,target=ASSIGN_TARGET,claim=None,release=None):
+def rebalance(worker_id,episodes,done,started,target=ASSIGN_TARGET,claim=None,release=None,blocked=()):
  """episodes: 이 PC의 RAW 목록, done: 3D 복원까지 끝난 RAW, started: 실행 기록이 있는 RAW.
  - 회수: 실행을 시작했거나(담당자 생김) 목록에서 사라졌거나 배정받은 작업자의 세션이 없으면 배정을 풉니다.
  - 부하: 작업자별 (시작 전 배정) + (본인 담당이면서 3D 복원이 끝나지 않은 RAW)
- - 채우기: 담당자·실행 기록·배정이 없는 RAW를 오래된 촬영부터, 부하가 가장 적은 작업자에게 하나씩 줍니다."""
+ - 채우기: 담당자·실행 기록·배정이 없는 RAW를 오래된 촬영부터, 부하가 가장 적은 작업자에게 하나씩 줍니다.
+ - 제외: 누구든 '내 작업에서 제외'한 RAW(이 PC 기록 + blocked: 다른 PC가 NAS에 남긴 제외)는 아무에게도 배정하지 않습니다."""
  with _assign_lock:
   users=logged_in();ops=users['operators'];own=owners();eps=set(episodes)
   with db() as c:
    excluded={(r['worker_id'],r['episode'],r['operator']) for r in c.execute('SELECT worker_id,episode,operator FROM raw_exclusions')}
    rows={r['episode']:(r['operator'],r['worker_id']) for r in c.execute('SELECT episode,operator,worker_id FROM raw_assignments')}
+   blocked=set(blocked)|{e for w,e,_ in excluded if w==worker_id}
    for ep,(op,wid) in list(rows.items()):
-    if own.get(ep) or ep in started or op not in ops or (wid==worker_id and ep not in eps) or (wid,ep,op) in excluded:
+    if own.get(ep) or ep in started or op not in ops or (wid==worker_id and ep not in eps) or (wid,ep,op) in excluded or ep in blocked:
      c.execute('DELETE FROM raw_assignments WHERE episode=?',(ep,));del rows[ep]
      # 시작하지 않고 풀린 배정은 PC 간 선점(NAS)도 풀어 다른 PC가 가져갈 수 있게 합니다.
      if release and not own.get(ep) and ep not in started:release(ep)
@@ -145,7 +153,7 @@ def rebalance(worker_id,episodes,done,started,target=ASSIGN_TARGET,claim=None,re
    for ep in eps:
     o=own.get(ep)
     if o in load and ep not in done and (worker_id,ep,o) not in excluded:load[o]+=1
-   pool=[ep for ep in sorted(eps,key=capture_key) if not own.get(ep) and ep not in started and ep not in rows]
+   pool=[ep for ep in sorted(eps,key=capture_key) if not own.get(ep) and ep not in started and ep not in rows and ep not in blocked]
    for ep in pool:
     needy=[u for u in ops if load[u]<target and (worker_id,ep,u) not in excluded]
     if not needy:continue

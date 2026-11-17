@@ -55,13 +55,36 @@ class RawExclusionTests(unittest.TestCase):
         self.assertEqual(self.change(episode, False).status_code, 200)
         self.assertNotIn(episode, access.excluded_raw('PC1', 'gpu_4090_a'))
 
-    def test_exclusion_is_personal_not_global(self):
+    def test_exclusion_is_global(self):
+        # 한 작업자가 제외한 RAW는 다른 작업자에게도 배정하지 않습니다.
         episode = self.episodes[0]
-        self.change(episode).raise_for_status()
+        with patch.object(fleet, 'available', return_value=True):
+            self.change(episode).raise_for_status()
         access.login('PC2', 'operator')
         access.rebalance('gpu_4090_a', self.episodes, set(), set())
-        self.assertEqual(access.assignments()[episode], 'PC2')
+        self.assertNotIn(episode, access.assignments())
         self.assertEqual(access.excluded_raw('PC2', 'gpu_4090_a'), set())
+        # 다른 PC도 NAS 제외 표시를 보고 배정하지 않습니다.
+        self.assertEqual(fleet.raw_excluded(), {episode: fleet.PC_ID})
+
+    def test_excluded_elsewhere_is_hidden_and_not_assigned(self):
+        episode = self.episodes[1]
+        with access.db() as c:
+            c.execute('DELETE FROM raw_assignments')
+        (fleet.CONTROL / 'excluded').mkdir(parents=True, exist_ok=True)
+        os.symlink('pc3', fleet.CONTROL / 'excluded' / episode)
+        with patch.object(fleet, 'available', return_value=True):
+            data = self.client.get('/api/raw-episodes').json()
+        self.assertNotIn(episode, [r['episode'] for r in data['episodes']])
+        self.assertNotIn(episode, access.assignments())
+
+    def test_restore_removes_nas_mark(self):
+        episode = self.episodes[0]
+        with patch.object(fleet, 'available', return_value=True):
+            self.change(episode).raise_for_status()
+            self.assertIn(episode, fleet.raw_excluded())
+            self.change(episode, False).raise_for_status()
+        self.assertEqual(fleet.raw_excluded(), {})
 
     def test_other_assignment_wrong_worker_and_csrf_are_rejected(self):
         self.assertEqual(self.change(self.episodes[-1]).status_code, 403)

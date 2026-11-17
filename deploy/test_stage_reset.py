@@ -251,5 +251,61 @@ class ResetEndpointTests(unittest.TestCase):
         self.assertEqual(self.ui.RESETS[RUN]['state'], 'failed')
 
 
+class ResetUntil3DTests(ResetEndpointTests):
+    """전체 파이프라인 실행 초기화(기본): 3D 복원까지만 다시 실행하고 MANO 단계는 skipped → MANO 대기(일괄 실행 후보)."""
+    DAG = 'kaist_direct_pipeline_4090'
+
+    def setUp(self):
+        super().setUp()
+        self.ui.active_dags.side_effect = lambda: [('gpu_4090_a', 'pipeline', self.DAG)]
+        self.patched = []
+        orig = self.ui.local_api.side_effect
+        def local_api(method, path, **kw):
+            if method == 'PATCH':
+                self.patched.append((path.rsplit('/', 1)[1], kw['json'].get('new_state') or kw['json'].get('state')))
+                if '/taskInstances/' in path:
+                    next(t for t in self.tasks if t['task_id'] == path.rsplit('/', 1)[1])['state'] = kw['json']['new_state']
+                else:
+                    self.run_state = kw['json']['state']
+                return {}
+            return orig(method, path, **kw)
+        self.ui.local_api.side_effect = local_api
+
+    def reset(self, stage, **kw):
+        return self.c.post('/api/jobs/reset', headers=self.h, json={'dag_id': self.DAG, 'run_id': RUN, 'stage': stage, **kw})
+
+    def test_reconstruct_resets_from_prepare_reconstruction(self):
+        r = self.reset('reconstruct')
+        self.assertEqual(r.status_code, 200, r.text); self.assertTrue(r.json()['until_3d'])
+        # 뒤 단계부터 skipped로 바꾼 뒤(Airflow가 실패 단계를 다시 시작하지 않게) 3D 복원까지만 다시 실행
+        self.assertEqual(self.patched, [('publish', 'skipped'), ('validate', 'skipped'), ('hands', 'skipped')])
+        self.assertEqual(self.cleared, [(True, ORDER[7:9]), (False, ORDER[7:9])])
+        self.assertEqual(self.ui.deferred_runs(), {RUN: self.DAG})
+        self.assertIn('MANO 대기', self.ui.RESETS[RUN]['message'])
+
+    def test_full_rerun_when_unchecked(self):
+        self.ui.set_deferred(self.DAG, RUN, True)
+        r = self.reset('reconstruct', until_3d=False)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(self.patched, []); self.assertEqual(self.cleared, [(True, ORDER[7:]), (False, ORDER[7:])])
+        self.assertEqual(self.ui.deferred_runs(), {})
+
+    def test_mano_reset_goes_to_mano_waiting(self):
+        self.run_state = 'failed'
+        self.tasks[ORDER.index('hands')]['state'] = 'failed'
+        for t in ('validate', 'publish'): self.tasks[ORDER.index(t)]['state'] = 'upstream_failed'
+        r = self.reset('hands')
+        self.assertEqual(r.status_code, 200, r.text); self.assertFalse(r.json()['airflow'])
+        self.assertEqual(self.cleared, [])
+        self.assertEqual(self.patched[-1], (RUN, 'success'))    # 3D까지는 끝났으므로 성공 → MANO 대기
+        self.assertEqual(self.ui.RESETS[RUN]['message'], 'MANO 대기로 되돌림')
+        # 이후에는 MANO 단계를 Worker 상태로 판단해 다시 초기화할 수 있습니다.
+        self.worker_states = {'hands': 'success', 'validate': 'success', 'publish': 'success'}
+        self.assertEqual(self.reset('validate').status_code, 200)
+
+    def test_day_run_mano_reset_only_rewinds_worker(self):
+        self.skipTest('낮 실행 전용')
+
+
 if __name__ == '__main__':
     unittest.main()

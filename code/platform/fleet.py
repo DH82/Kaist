@@ -247,6 +247,47 @@ def raw_release(ep):
             pass
 
 
+# ---- '내 작업에서 제외'한 RAW: control/excluded/<RAW> = 제외한 PC 이름을 가리키는 symlink ----
+# 한 작업자가 제외한 RAW는 다른 작업자·다른 PC에도 배정·표시하지 않습니다. 제외 취소·대기열 초기화 때 그 PC가 지웁니다.
+def _excluded():
+    return CONTROL / 'excluded'
+
+
+def raw_exclude(ep):
+    if not RAW_NAME.fullmatch(ep or '') or not available():
+        return
+    try:
+        _excluded().mkdir(parents=True, exist_ok=True)
+        os.symlink(PC_ID, _excluded() / ep)
+    except OSError:
+        pass  # 이미 있음(다른 PC가 먼저 제외) 등
+
+
+def raw_unexclude(ep):
+    if not RAW_NAME.fullmatch(ep or ''):
+        return
+    try:
+        if os.readlink(_excluded() / ep) == PC_ID:
+            os.unlink(_excluded() / ep)
+    except OSError:
+        pass
+
+
+def raw_excluded():
+    """{RAW: 제외한 PC}"""
+    out = {}
+    try:
+        for p in _excluded().iterdir():
+            if RAW_NAME.fullmatch(p.name):
+                try:
+                    out[p.name] = os.readlink(p)
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return out
+
+
 def raw_claims():
     """{RAW: 선점한 PC}"""
     out = {}
