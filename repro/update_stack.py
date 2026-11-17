@@ -18,6 +18,9 @@ Docker PC 순서 (한 번에 끝나지 않으면 다음 타이머 실행에서 �
   4) GPU 자체 점검. SAM3·CUDA 확장·모델을 실제로 GPU에 올리므로 작업 중에 돌리면 메모리가 모자라 점검이
      실패하고(2026-11-17 PC5 10/12) 돌던 작업까지 망칠 수 있어, 쉴 때만 합니다.
   5) 서비스 재시작 + UI 연결 검사. 실패하면 이전 커밋으로 되돌려 다시 빌드·기동합니다.
+  강제 업데이트(관리자 '⚡ 강제 업데이트', request.json의 force): 1)~2)는 같고, 3)에서 기다리지 않습니다.
+     stop.json을 써서 이 PC의 UI에 작업 강제 종료를 맡기고(파이프라인 실행·MANO 일괄 실행·GPU 작업, 검수·설정 입력 대기는 유지),
+     UI가 stopped.json을 쓰면(또는 FORCE_UI_TIMEOUT 뒤) GPU 점검·재시작합니다. 종료된 실행은 '실패 단계 다시 실행'으로 잇습니다.
   자동 업데이트(--auto)가 실패한 커밋은 GitHub에 새 커밋이 올라오거나 관리자가 요청할 때까지 다시 시도하지 않습니다.
 Native PC(Docker 없이 systemd --user kaist-ui/kaist-airflow, 예: PC1)는 fast-forward 후 code/가 바뀌면
 kaist-ui만 재시작합니다. GPU Worker·파이프라인 사본(~/Desktop/worker1)은 자동 배포하지 않습니다.
@@ -54,6 +57,8 @@ RUN_PINNED = ('pipeline/current/project/', 'pipeline/current/workspace/kaist-ful
 WAIT_STAGES = ('sam_settings_ready', 'mask_approved', 'tracking_approved')
 LATE_STAGES = ('prepare_reconstruction', 'reconstruct', 'hands', 'validate', 'publish')
 STALE = 120                      # UI 상태 파일이 이보다 오래되면 '쉬는지 모름'으로 봅니다
+FORCE_UI_TIMEOUT = 180           # 강제 업데이트: UI가 이 시간 안에 작업 강제 종료를 끝내지 않으면(꺼짐·이전 버전) 그냥 재시작
+FORCE_SETTLE = 60                # 강제 종료 뒤 GPU 작업 프로세스가 정리되기를 기다리는 최대 시간
 LOCAL = ROOT / 'state' / 'updater'
 REPORT_EVERY = 5                 # 빌드·재시작 중 NAS 상태 갱신 간격(초)
 # 관리자 대시보드에 보이는 단계. rollback은 실패했을 때만 나타납니다.
@@ -174,8 +179,12 @@ class Updater:
     def begin_run(self, req):
         run = self.local.get('run')
         if run and run.get('id') == req.get('id'):
+            if req.get('force') and not run.get('force'):   # 대기 중인 요청을 관리자가 강제로 바꿈
+                run['force'] = True
+                self.save_local(run=run)
             return
-        self.save_local(run={'id': req.get('id'), 'requested_by': req.get('requested_by'), 'requested_at': req.get('at'),
+        self.save_local(forced=None)   # 이전(취소된) 강제 업데이트 기록은 새 요청에 섞지 않습니다
+        self.save_local(run={'id': req.get('id'), 'requested_by': req.get('requested_by'), 'requested_at': req.get('at'), 'force': bool(req.get('force')),
                              'started': time.time(), 'from': git('rev-parse', 'HEAD'), 'phase': None, 'phases': {}})
 
     def set_phase(self, name):
@@ -209,6 +218,42 @@ class Updater:
                 (self.dir / 'request.json').unlink()
         except OSError:
             pass
+        for name in ('stop.json', 'stopped.json'):   # 강제 업데이트 주고받기 파일
+            try:
+                if (read_json(self.dir / name) or {}).get('id') == req.get('id'):
+                    (self.dir / name).unlink()
+            except OSError:
+                pass
+
+    def force_stop(self, req, reasons):
+        """강제 업데이트: 이 PC의 UI에 작업 강제 종료를 맡깁니다. 남은 대기 사유(없으면 [] → 바로 재시작)를 돌려줍니다."""
+        rid, now = req.get('id'), time.time()
+        order = read_json(self.dir / 'stop.json') or {}
+        if order.get('id') == rid and not reasons:
+            # 이미 쉬고 있음(UI가 끝냈거나 작업이 스스로 끝남): UI가 남긴 종료 기록만 받아 두고 진행합니다.
+            done = read_json(self.dir / 'stopped.json') or {}
+            if done.get('id') == rid and not self.local.get('forced'):
+                self.save_local(forced={'id': rid, 'stopped': done.get('stopped') or [], 'errors': done.get('errors') or []})
+            return []
+        if order.get('id') != rid:
+            write_json(self.dir / 'stop.json', {'id': rid, 'at': now, 'reasons': reasons})
+            log('강제 업데이트: UI에 작업 강제 종료 요청 · ' + ' · '.join(reasons))
+            return ['강제 업데이트: 진행 중인 작업 강제 종료 요청함 (' + ' · '.join(reasons) + ')']
+        done = read_json(self.dir / 'stopped.json') or {}
+        if done.get('id') == rid:
+            busy = [b for b in self.worker_busy() if not b.startswith('NAS 업로드')]   # NAS 업로드는 재시작이 끊습니다
+            if busy and now - float(done.get('at') or now) < FORCE_SETTLE:
+                return [f'강제 종료 후 GPU 작업 {len(busy)}개 정리 대기']
+            if not self.local.get('forced'):
+                self.save_local(forced={'id': rid, 'stopped': done.get('stopped') or [], 'errors': done.get('errors') or []})
+            return []
+        waited = now - float(order.get('at') or now)
+        if waited >= FORCE_UI_TIMEOUT:
+            if not self.local.get('forced'):
+                log(f'강제 업데이트: UI가 {FORCE_UI_TIMEOUT}초 안에 응답하지 않아 그대로 재시작합니다')
+                self.save_local(forced={'id': rid, 'stopped': [], 'errors': ['UI 응답 없음 · 재시작으로 작업 종료']})
+            return []
+        return [f'강제 업데이트: UI가 진행 중인 작업을 강제 종료하는 중 ({int(waited)}초)']
 
     def report(self, state, message='', **extra):
         self.cur = (state, message)
@@ -396,6 +441,7 @@ class Updater:
         self.report('done', message)
 
     def fail(self, req, message):
+        message += self.forced_note()
         run = self.end_run(False)
         self.save_local(last={'at': time.time(), 'ok': False, 'message': message, 'request': (req or {}).get('id'), 'run': run},
                         prev=None, changed=[], run=None)
@@ -482,11 +528,13 @@ class Updater:
                   else 'late' if any(f.startswith(PINNED) for f in changed) else False)
         self.set_phase('wait')
         reasons = self.idle_reasons(pinned)
+        if req.get('force') and (reasons or (read_json(self.dir / 'stop.json') or {}).get('id') == req.get('id')):
+            reasons = self.force_stop(req, reasons)
         if reasons:
             return self.report('waiting', '빌드 완료 · 이 PC가 쉬면 GPU 점검 후 재시작합니다: ' + ' · '.join(reasons))
         if self.local.get('checked') != head:
             self.set_phase('check')
-            self.report('building', f'{head[:7]} GPU 점검 중 (작업 없음 확인됨)')
+            self.report('building', f'{head[:7]} GPU 점검 중 (' + ('강제 종료 후' if self.local.get('forced') else '작업 없음 확인됨') + ')')
             try:
                 self.start_stack('--gpu-check-only')
             except RuntimeError as e:
@@ -499,7 +547,16 @@ class Updater:
         except RuntimeError as e:
             return self.fail(req, str(e) + self.rollback(prev, restart=True))
         self.save_local(deployed=head)
-        self.done(req, (f'{prev[:7]} → ' if prev else '') + f'{head[:7]} 반영 완료')
+        self.done(req, (f'{prev[:7]} → ' if prev else '') + f'{head[:7]} 반영 완료' + self.forced_note())
+
+    def forced_note(self):
+        forced = self.local.get('forced')
+        if not forced:
+            return ''
+        self.save_local(forced=None)
+        stopped, errors = forced.get('stopped') or [], forced.get('errors') or []
+        return (f" · 강제 업데이트: 작업 {len(stopped)}개 강제 종료" + (f" ({', '.join(stopped[:5])}{' …' if len(stopped) > 5 else ''})" if stopped else '')
+                + (' · ' + ' / '.join(errors)[:300] if errors else '') + " · 종료된 실행은 '실패 단계 다시 실행'으로 이어서 하세요")
 
 
 def main():

@@ -313,6 +313,85 @@ class FleetUpdateRequestTests(unittest.TestCase):
                 fleet.update_request('pc9', 'x')
 
 
+class ForceUpdateTests(UpdaterTests):
+    """강제 업데이트: 빌드 뒤 기다리지 않고 UI에 작업 강제 종료를 맡긴 다음 재시작합니다."""
+
+    def force(self):
+        with patch.object(fleet, 'CONTROL', self.nas / 'control'):
+            return fleet.update_force('pc2', 'admin@pc1')
+
+    def ui_stops(self, stopped=('ep_1 (track)',), errors=()):
+        """이 PC UI(fleet_tick → force_update_stop)가 하는 일: stop.json을 보고 작업을 끝낸 뒤 stopped.json."""
+        with patch.object(fleet, 'CONTROL', self.nas / 'control'), patch.object(fleet, 'MACHINE_PC', 'pc2'):
+            req = fleet.force_stop_order()
+            if req:
+                self.job('interrupted')
+                fleet.force_stop_done(req['id'], {'stopped': list(stopped), 'errors': list(errors)})
+            return req
+
+    def busy(self):
+        self.job('running')
+        self.ui(busy={'running_tis': 3, 'batch': True}, inflight=2)
+
+    def test_force_stops_work_then_restarts(self):
+        self.commit('pipeline/current/project/00_scripts/x.py', '1'); self.busy()
+        req = self.force()
+        self.assertTrue(req['force'])
+        self.assertIsNone(self.ui_stops())                          # 빌드 전에는 아무것도 멈추지 않음
+        st = self.tick()
+        self.assertEqual(st['state'], 'waiting'); self.assertIn('강제 종료 요청', st['message'])
+        self.assertEqual(self.calls, [('--build-only', '--no-gpu-check')])
+        self.assertEqual(self.ui_stops()['id'], req['id'])
+        self.ui(busy={'running_tis': 0, 'batch': False})
+        st = self.tick()
+        self.assertEqual(st['state'], 'done', st['message'])
+        self.assertIn('강제 업데이트: 작업 1개 강제 종료', st['message'])
+        self.assertEqual(self.calls[1:], [('--gpu-check-only',), ('--skip-build',)])
+        for name in ('request.json', 'stop.json', 'stopped.json'):
+            self.assertFalse((self.nas / 'control/update/pc2' / name).exists(), name)
+        self.assertIsNone(json.loads((us.LOCAL / 'state.json').read_text()).get('forced'))
+
+    def test_force_does_not_wait_for_runs_ui_reports(self):
+        # UI가 강제 종료한 뒤에도 Airflow 상태가 아직 갱신 전(20초 주기)이어도 기다리지 않음
+        self.commit('code/a.py', '1'); self.busy(); self.force()
+        self.tick(); self.ui_stops()
+        self.assertEqual(self.tick()['state'], 'done')
+
+    def test_waits_for_killed_jobs_to_settle(self):
+        self.commit('code/a.py', '1'); self.busy(); self.force()
+        self.tick(); self.ui_stops(); self.job('running')         # 아직 프로세스가 정리되지 않음
+        st = self.tick()
+        self.assertEqual(st['state'], 'waiting'); self.assertIn('정리 대기', st['message'])
+        self.job('interrupted')
+        self.assertEqual(self.tick()['state'], 'done')
+
+    def test_ui_not_answering_restarts_after_timeout(self):
+        self.commit('code/a.py', '1'); self.busy(); self.force()
+        self.tick()
+        self.assertEqual(self.tick()['state'], 'waiting')
+        order = self.nas / 'control/update/pc2/stop.json'
+        o = json.loads(order.read_text()); o['at'] -= us.FORCE_UI_TIMEOUT + 1; order.write_text(json.dumps(o))
+        st = self.tick()
+        self.assertEqual(st['state'], 'done'); self.assertIn('UI 응답 없음', st['message'])
+
+    def test_pending_request_converted_to_force_keeps_id(self):
+        self.commit('code/a.py', '1'); self.busy()
+        req = self.request()
+        self.assertEqual(self.tick()['state'], 'waiting')
+        self.assertFalse((self.nas / 'control/update/pc2/stop.json').exists())   # 일반 요청은 멈추지 않음
+        forced = self.force()
+        self.assertEqual(forced['id'], req['id'])
+        self.tick(); self.ui_stops()
+        self.assertEqual(self.tick()['state'], 'done')
+        self.assertEqual(self.calls.count(('--build-only', '--no-gpu-check')), 1)  # 다시 빌드하지 않음
+
+    def test_normal_request_never_writes_stop(self):
+        self.commit('code/a.py', '1'); self.busy(); self.request()
+        for _ in range(2):
+            self.assertEqual(self.tick()['state'], 'waiting')
+        self.assertIsNone(self.ui_stops())
+
+
 class ReconstructFollowupTests(UpdaterTests):
     """코드가 바뀌어도 과거 복원 결과를 자동으로 재실행하지 않습니다."""
 

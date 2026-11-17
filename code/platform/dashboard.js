@@ -228,22 +228,29 @@ function dashVersion(p){
  const label=stale?'업데이터 응답 없음':DASH_UPD[st.state];
  if(label)h+=' <span class="'+(stale||st.state==='failed'?'bad':'new')+'">'+label+'</span>';
  if(rq&&!['building','restarting','waiting'].includes(st.state))h+=' <span class="new">요청됨</span>';
+ if(rq&&rq.force)h+=' <span class="bad" title="빌드가 끝나면 진행 중인 작업을 모두 강제 종료하고 바로 재시작합니다.">⚡ 강제</span>';
  // 지난 결과(완료·실패)는 마지막 기록을 보여줍니다.
  const msg=st.message||(st.last&&!st.last.resolved&&now-st.last.at<86400?(st.last.ok?'최근 업데이트: ':'최근 실패: ')+st.last.message:'');
  if(msg)h+='<span class="dbVerMsg">'+escape(msg)+'</span>';
  h+=rq?'<button class="dbLink" data-upd-cancel="'+p.pc+'" title="재시작 전이면 업데이트를 보류합니다. 새 실행 시작 차단도 풀립니다.">요청 취소</button>'
       :'<button class="dbLink" data-upd-pc="'+p.pc+'" title="GitHub 최신 코드를 이 PC에 반영합니다. 진행 중인 작업이 끝난 뒤 재시작하며, 그동안 이 PC에서 새 실행 시작이 막힙니다.">업데이트</button>';
+ if(!(rq&&rq.force))h+='<button class="dbLink bad" data-upd-force="'+p.pc+'" title="진행 중인 작업이 있어도 기다리지 않습니다. 빌드가 끝나면 실행·MANO 일괄 실행·GPU 작업을 강제 종료하고 바로 재시작합니다.">⚡ '+(rq?'강제로 전환':'강제 업데이트')+'</button>';
  return h;
 }
 async function dashUpdate(pcs,action){
- if(!pcs.length){alert('업데이트할 PC가 없습니다. (업데이트 타이머가 설치되어 있고 요청 대기 중이 아닌 PC)');return}
+ if(!pcs.length){alert('업데이트할 PC가 없습니다. (업데이트 타이머가 설치되어 있고 '+(action==='force'?'강제 업데이트가 아직 걸리지 않은 PC':'요청 대기 중이 아닌 PC')+')');return}
  const names=pcs.map(dashPcName).join(', ');
  if(action==='request'&&!confirm(names+'에 GitHub 최신 코드를 반영합니다.\n\n· 각 PC는 진행 중인 GPU 작업이 끝난 뒤 서비스를 재시작합니다.\n· 업데이트가 끝날 때까지 해당 PC에서 새 RAW 실행·MANO 일괄 실행을 시작할 수 없습니다.\n\n진행할까요?'))return;
- try{const r=await api('/api/fleet/update',{method:'POST',body:JSON.stringify({pcs,action})});$('dashMsg').hidden=false;$('dashMsg').textContent=(action==='request'?'업데이트 요청: ':'요청 취소: ')+(r.pcs.map(dashPcName).join(', ')||'없음');loadDash(true);loadUpd(true)}
+ if(action==='force'){
+  if(!confirm('⚡ 강제 업데이트: '+names+'\n\n진행 중인 작업을 기다리지 않습니다. 새 이미지 빌드가 끝나면(그동안 작업은 계속 진행)\n· 파이프라인 실행(SAM3·추적·3D 복원·MANO 등)\n· MANO 일괄 실행\n· 그 밖의 GPU 작업(이관 MANO·다시 실행 등)\n을 모두 강제 종료하고 바로 재시작합니다.\n\n· 계산 중이던 결과는 잃고, 종료된 실행은 업데이트 뒤 \'실패 단계 다시 실행\'으로 그 단계부터 다시 합니다.\n· 검수·설정 입력 대기 중인 실행은 그대로 둡니다.\n· NAS 업로드는 재시작으로 끊기므로 다시 올려야 합니다.\n\n강제 업데이트할까요?'))return;
+  if(prompt('확인을 위해 \'강제\'를 입력하세요.')!=='강제')return;
+ }
+ try{const r=await api('/api/fleet/update',{method:'POST',body:JSON.stringify({pcs,action})});$('dashMsg').hidden=false;$('dashMsg').textContent=({request:'업데이트 요청: ',force:'⚡ 강제 업데이트 요청: ',cancel:'요청 취소: '}[action])+(r.pcs.map(dashPcName).join(', ')||'없음');loadDash(true);loadUpd(true)}
  catch(e){alert('업데이트 요청 실패: '+e.message)}
 }
-$('dashPcs').addEventListener('click',e=>{const b=e.target.closest('[data-upd-pc],[data-upd-cancel]');if(!b)return;b.dataset.updPc?dashUpdate([b.dataset.updPc],'request'):dashUpdate([b.dataset.updCancel],'cancel')});
+$('dashPcs').addEventListener('click',e=>{const b=e.target.closest('[data-upd-pc],[data-upd-cancel],[data-upd-force]');if(!b)return;b.dataset.updPc?dashUpdate([b.dataset.updPc],'request'):b.dataset.updForce?dashUpdate([b.dataset.updForce],'force'):dashUpdate([b.dataset.updCancel],'cancel')});
 $('dashUpdateAll').onclick=()=>{const d=dashData;if(!d)return;dashUpdate(d.pcs.filter(p=>p.update&&p.update.status&&!p.update.request).map(p=>p.pc),'request')};
+$('dashForceAll').onclick=()=>{const d=dashData;if(!d)return;dashUpdate(d.pcs.filter(p=>p.update&&p.update.status&&!(p.update.request&&p.update.request.force)).map(p=>p.pc),'force')};
 // ---- 업데이트 진행 패널: 요청이 걸렸거나 최근 6시간 안에 끝난 PC. 진행 중이면 5초마다 갱신 ----
 let updData=null,updTimer=null,updFetched=0,updBusy=false;
 const UPD_ACTIVE=['building','restarting','waiting','rollback','paused'];
@@ -282,7 +289,7 @@ function updRow(p){
  let h='<div class="dbUpdRow" data-upd-row="'+p.pc+'"><div class="dbUpdTop"><b>'+name+'</b><span class="dbState '+cls+'">'+escape(state)+'</span>';
  if(run){
   const from=String(run.from||'').slice(0,7),to=String(run.to||st.commit||'').slice(0,7);
-  h+='<span class="dbSub">'+(from&&from!==to?from+' → '+to+' · ':to?to+' · ':'')+(run.finished?'소요 '+dashDur(run.finished-run.started)+' · '+dashClock(run.finished)+' 종료':'시작 '+dashHM(run.started)+' · 경과 '+updAgo(run.started))+(run.requested_by?' · 요청 '+escape(run.requested_by):'')+'</span>';
+  h+='<span class="dbSub">'+(from&&from!==to?from+' → '+to+' · ':to?to+' · ':'')+(run.finished?'소요 '+dashDur(run.finished-run.started)+' · '+dashClock(run.finished)+' 종료':'시작 '+dashHM(run.started)+' · 경과 '+updAgo(run.started))+(run.requested_by?' · 요청 '+escape(run.requested_by):'')+(run.force||p.request?.force?' · <span class="bad">⚡ 강제</span>':'')+'</span>';
  }else if(rq)h+='<span class="dbSub">요청 '+updAgo(rq.at)+' 전 · 타이머가 3분 안에 가져갑니다</span>';
  h+='</div>';
  if(run)h+=updPhases(p,run);

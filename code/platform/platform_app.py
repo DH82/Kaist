@@ -1963,8 +1963,50 @@ def reconcile_raw_claims(snap):
   for ep,pc in fleet.raw_claims().items():
    if pc==fleet.PC_ID and ep not in mine and ep not in assigned:fleet.raw_release(ep)
 
+# ---- 강제 업데이트: updater가 빌드를 마치고 stop.json을 쓰면, 이 PC의 진행 중인 작업을 모두 강제 종료합니다 ----
+def stop_for_update(note):
+ """MANO 일괄 실행·파이프라인 실행(검수·설정 입력 대기는 유지)·그 밖의 GPU 작업(이관 MANO·다시 실행 등)을 강제 종료합니다.
+ Airflow 단계는 failed로 두므로 업데이트 뒤 '실패 단계 다시 실행'으로 이어서 할 수 있습니다. → {'stopped':[...],'errors':[...]}"""
+ stopped,errors=[],[]
+ def attempt(label,fn):
+  try:return fn()
+  except Exception as e:errors.append(f'{label}: '+str(getattr(e,'detail',None) or e)[-200:])
+ with lock:
+  for b in attempt('MANO 일괄 실행 조회',lambda:list(airflow_runs(BATCH_DAG,state=['queued','running']))) or []:
+   if b['state'] not in ('queued','running'):continue
+   attempt('MANO 일괄 실행 '+b['dag_run_id'],lambda:fail_airflow_run(BATCH_DAG,b['dag_run_id'],note))
+   for src in b['conf'].get('sources',[]):
+    res=attempt(src['conf'].get('episode_id',''),lambda:worker_action('stop',{'episode':src['conf']['episode_id'],'run_id':src['run_id'],'stages':list(MANO_ALL_STAGES)},DEFAULT_WORKER)) or {}
+    stopped+=[src['conf']['episode_id']+' '+x for x in res.get('stopped',[])]
+   stopped.append('MANO 일괄 실행 '+b['dag_run_id'])
+  for wid,dag,r in attempt('실행 조회',active_runs) or []:
+   if run_waiting(dag,r):continue        # 검수·설정 입력 대기: 계산 중이 아니므로 그대로 두고 업데이트 뒤 새 코드로 이어갑니다
+   ep=(r.get('conf') or {}).get('episode_id','')
+   attempt(ep+' 실행',lambda:fail_airflow_run(dag,r['dag_run_id'],note))
+   res=attempt(ep+' GPU 작업',lambda:worker_action('stop',{'episode':ep,'run_id':r['dag_run_id']},wid)) or {}
+   stopped.append(ep+(' ('+', '.join(res['stopped'])+')' if res.get('stopped') else ''))
+   review_queue_cache.pop(wid,None)
+  # 남은 GPU 작업(다른 PC에서 이관 받은 MANO, 목록에서 다시 실행한 단계 등): Worker의 대기·실행 중 작업 전체
+  for wid in {w for w,_,_ in active_dags()}:
+   res=attempt(wid+' 남은 GPU 작업',lambda:worker_action('stop-all',{},wid)) or {}
+   stopped+=res.get('stopped',[])
+   if res.get('left'):errors.append('종료되지 않은 GPU 작업: '+', '.join(res['left']))
+ return {'stopped':list(dict.fromkeys(stopped)),'errors':errors}
+
+def force_update_stop():
+ try:req=fleet.force_stop_order()
+ except Exception as e:print('강제 업데이트 확인 실패:',e,flush=True);return
+ if not req:return
+ who=req.get('forced_by') or req.get('requested_by') or '관리자'
+ print('강제 업데이트: 진행 중인 작업을 강제 종료합니다 · 요청',who,flush=True)
+ result=stop_for_update('관리자 강제 업데이트: '+who)
+ with access.db() as c:c.execute('INSERT INTO ui_audit VALUES(?,?,?)',(time.time(),who,'force-update stop '+','.join(result['stopped'])[:900]))
+ fleet.force_stop_done(req['id'],result)
+ print('강제 업데이트: 종료',len(result['stopped']),'개 · 오류',result['errors'],flush=True)
+
 def fleet_tick():
  with _fleet_lock:
+  force_update_stop()
   fleet_process()
   snap=fleet_snapshot()
   try:reconcile_raw_claims(snap)
@@ -2131,7 +2173,7 @@ def _raw_frames_scan():
 
 class FleetUpdate(BaseModel):
  pcs:list[str]=Field(min_length=1,max_length=6)
- action:str=Field(pattern=r'^(request|cancel)$')
+ action:str=Field(pattern=r'^(request|force|cancel)$')  # force: 진행 중인 작업을 강제 종료하고 업데이트(걸린 요청도 강제로 전환)
 
 @app.post('/api/fleet/update')
 def fleet_update(data:FleetUpdate,req:Request):
@@ -2143,6 +2185,7 @@ def fleet_update(data:FleetUpdate,req:Request):
  by=admin['name']+'@'+fleet.PC_ID;done=[]
  for pc in pcs:
   if data.action=='request':fleet.update_request(pc,by);done.append(pc)
+  elif data.action=='force':fleet.update_force(pc,by);done.append(pc)
   elif fleet.update_cancel(pc):done.append(pc)
  with access.db() as c:c.execute('INSERT INTO ui_audit VALUES(?,?,?)',(time.time(),admin['name'],f"fleet update {data.action} {','.join(done)}"))
  return {'ok':True,'pcs':done}

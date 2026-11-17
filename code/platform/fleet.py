@@ -356,10 +356,26 @@ def _read(path):
         return None
 
 
-def update_request(pc, by):
+def update_request(pc, by, force=False):
+    """force: 강제 업데이트. 빌드가 끝나면 그 PC의 UI가 진행 중인 작업을 모두 강제 종료하고 바로 재시작합니다."""
     req = {'id': time.strftime('%Y%m%dT%H%M%S_') + secrets.token_hex(3), 'requested_by': by, 'at': time.time(), 'sent_from': PC_ID}
+    if force:
+        req['force'] = True
     d = _update_dir(pc)
     d.mkdir(parents=True, exist_ok=True)
+    tmp = d / ('.request.' + secrets.token_hex(4) + '.tmp')
+    tmp.write_text(json.dumps(req, ensure_ascii=False, indent=2))
+    os.replace(tmp, d / 'request.json')
+    return req
+
+
+def update_force(pc, by):
+    """걸려 있는 요청을 강제 업데이트로 바꿉니다(같은 요청 id 유지 → 받아 둔 코드·빌드를 그대로 이어감). 요청이 없으면 새로 겁니다."""
+    d = _update_dir(pc)
+    req = _read(d / 'request.json')
+    if not req:
+        return update_request(pc, by, force=True)
+    req.update(force=True, forced_by=by, forced_at=time.time())
     tmp = d / ('.request.' + secrets.token_hex(4) + '.tmp')
     tmp.write_text(json.dumps(req, ensure_ascii=False, indent=2))
     os.replace(tmp, d / 'request.json')
@@ -377,6 +393,27 @@ def update_cancel(pc):
 def update_info(pc):
     d = _update_dir(pc)
     return {'request': _read(d / 'request.json'), 'status': _read(d / 'status.json')}
+
+
+# 강제 업데이트: updater가 빌드를 마치면 stop.json({id})을 쓰고, 그 PC의 UI가 작업을 강제 종료한 뒤 stopped.json({id, stopped, errors})을 씁니다.
+def force_stop_order():
+    """이 PC에 걸린 강제 업데이트의 '작업 강제 종료' 지시(요청 id가 같을 때만). 없으면 None."""
+    if not MACHINE_PC:
+        return None
+    d = _update_dir(MACHINE_PC)
+    req, order, done = _read(d / 'request.json'), _read(d / 'stop.json'), _read(d / 'stopped.json')
+    if not (req and req.get('force') and order and order.get('id') == req.get('id')):
+        return None
+    if done and done.get('id') == order['id']:
+        return None
+    return req
+
+
+def force_stop_done(req_id, result):
+    d = _update_dir(MACHINE_PC)
+    tmp = d / ('.stopped.' + secrets.token_hex(4) + '.tmp')
+    tmp.write_text(json.dumps({'id': req_id, 'at': time.time(), **result}, ensure_ascii=False, indent=2))
+    os.replace(tmp, d / 'stopped.json')
 
 
 def update_pending():

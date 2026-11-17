@@ -185,6 +185,43 @@ def stop(req):
    stopped.append(stage)
  return {'stopped':stopped}
 
+GATE_STAGES=('sam_settings_ready','mask_approved','tracking_approved')  # 검수·설정 확인(몇 초): 강제 업데이트도 건드리지 않습니다
+def stop_all(req):
+ """강제 업데이트: 이 Worker의 대기·실행 중인 단계 작업을 모두 종료하고 '사용자 강제 종료'(interrupted)로 기록합니다.
+ 모든 프로세스에 한꺼번에 SIGTERM → 8초 → SIGKILL 하므로 작업 수와 관계없이 약 11초 안에 끝납니다.
+ 단계 초기화(_reset)·NAS 업로드(_nas_sync)는 재시작이 끊습니다(다시 하면 이어서/처음부터 안전하게 진행)."""
+ import signal
+ found=[]
+ for p in JOBS.iterdir() if JOBS.is_dir() else []:
+  if not p.is_dir() or p.name.startswith('_') or not (p/'status.json').exists():continue
+  st=status(p)
+  if st['state'] not in ('queued','running') or st.get('stage') in GATE_STAGES:continue
+  pid=st.get('pid')
+  if not pid and (p/'pid').exists():pid=int((p/'pid').read_text())
+  try:mine=bool(pid and str(p).encode() in (Path('/proc')/str(pid)/'cmdline').read_bytes())
+  except (OSError,ValueError):mine=False
+  found.append((p,_tree(int(pid)) if mine else []))
+ procs=[q for _,tree in found for q in tree]
+ for sig,wait in ((signal.SIGTERM,8),(signal.SIGKILL,3)):
+  for q in procs:
+   try:os.kill(q,sig)
+   except ProcessLookupError:pass
+  deadline=time.time()+wait
+  while time.time()<deadline and any(_alive(q) for q in procs):time.sleep(0.2)
+  procs=[q for q in procs if _alive(q)]
+  if not procs:break
+ stopped=[];left=[]
+ for p,tree in found:
+  req_=json.loads((p/'request.json').read_text()) if (p/'request.json').exists() else {}
+  name=f"{req_.get('episode',p.name)} {req_.get('stage','')}".strip()
+  if any(_alive(q) for q in tree):left.append(name);continue
+  with (p/'launch.lock').open('a') as lock:
+   fcntl.flock(lock,fcntl.LOCK_EX)
+   write(p/'status.json',{**status(p),'state':'interrupted','error':STOP_MARK+' (강제 업데이트)','stopped_by_user':True,'finished':time.time()})
+  with (p/'job.log').open('a') as log:log.write('\n[강제 종료] '+time.strftime('%Y-%m-%d %H:%M:%S')+' 관리자 강제 업데이트\n')
+  stopped.append(name)
+ return {'stopped':stopped,'left':left}
+
 def skip(req):
  """아직 시작 전인 단계를 '사용자 강제 종료'로 기록합니다(MANO 일괄 실행이 이 에피소드를 건너뜀).
  기존 다시 실행(retry)으로 되돌릴 수 있도록 request.json도 같은 형식으로 남깁니다."""
@@ -368,6 +405,7 @@ if __name__=='__main__':
   elif action=='reset':print(json.dumps(reset_start(req),ensure_ascii=False))
   elif action=='reset-status':print(json.dumps(reset_status(req),ensure_ascii=False))
   elif action=='drift':print(json.dumps(drift(req),ensure_ascii=False))
+  elif action=='stop-all':print(json.dumps(stop_all(req),ensure_ascii=False))
   else:
    p=folder(req)
    print(json.dumps(start(req) if action=='start' else retry(req) if action=='retry' else rewind(req) if action=='rewind' else status(p)))
