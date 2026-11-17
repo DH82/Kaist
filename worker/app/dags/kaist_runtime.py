@@ -190,6 +190,7 @@ OBJECT_MODES = ('text', 'bbox_track', 'point_track')
 OBJECT_TRACKER = Path(__file__).resolve().with_name('sam_object_track.py')
 # point_track 전용. sam_object_track.py(진행 중 bbox 실행의 체크섬 고정 대상)는 그대로 두고 별도 파일로 둡니다.
 OBJECT_POINT_TRACKER = Path(__file__).resolve().with_name('sam_object_point_track.py')
+OBJECT_MULTI = Path(__file__).resolve().with_name('sam_object_multi.py')
 
 
 def parse_object_points(value):
@@ -290,6 +291,23 @@ def object_bbox_track(scripts, project, episode, prompt, bboxes, gpu_uuid, point
     started = time.monotonic()
     records = {}
     mode = 'point_track' if points else 'bbox_track'
+    def install(cam, work):
+        rec = read(work / 'record.json')
+        rec['mask_sha256'] = mask_digest(work / '0')
+        (work / 'record.json').write_text(json.dumps(rec, indent=2, ensure_ascii=False))
+        home = candidate / 'object_track' / str(cam)
+        target = candidate / f'mask/{cam}/0'
+        if home.exists():
+            steps.preserve(home, dest)
+        home.parent.mkdir(exist_ok=True)
+        work.rename(home)
+        if target.is_symlink():
+            target.unlink()
+        elif target.exists():
+            steps.preserve(target, dest)
+        (home / '0').rename(target)
+
+    pending = []
     for cam in range(4):
         box = points[str(cam)] if points else bboxes[str(cam)]
         home = candidate / 'object_track' / str(cam)
@@ -311,24 +329,30 @@ def object_bbox_track(scripts, project, episode, prompt, bboxes, gpu_uuid, point
             (home / '0').rename(target)
             print(f'[bbox 물체 추적] camera {cam + 1}: 보관된 추적 결과 재사용', flush=True)
         else:
-            with tempfile.TemporaryDirectory(prefix='.object-track-', dir=candidate) as tmp:
-                work = Path(tmp) / 'run'
+            pending.append(cam)
+    if pending:
+        # 카메라마다 프로세스를 새로 띄우면 SAM3 모델을 매번(약 8초) 다시 읽습니다. 고정된 추적기 파일은
+        # 그대로 두고, sam_object_multi.py가 한 프로세스에서 카메라별 main()을 차례로 호출합니다.
+        with tempfile.TemporaryDirectory(prefix='.object-track-', dir=candidate) as tmp:
+            jobs = []
+            for cam in pending:
+                box = points[str(cam)] if points else bboxes[str(cam)]
                 seed_args = ['--points', json.dumps(box)] if points else ['--bbox', *map(str, box)]
-                live.execute([str(sam_python), str(OBJECT_POINT_TRACKER if points else OBJECT_TRACKER), '--case', str(dest),
-                              '--cam', str(cam), *seed_args, '--text', prompt, '--out', str(work)],
-                             dest / '05_object.log', source, env)
-                rec = read(work / 'record.json')
-                rec['mask_sha256'] = mask_digest(work / '0')
-                (work / 'record.json').write_text(json.dumps(rec, indent=2, ensure_ascii=False))
-                if home.exists():
-                    steps.preserve(home, dest)
-                home.parent.mkdir(exist_ok=True)
-                work.rename(home)
-            if target.is_symlink():
-                target.unlink()
-            elif target.exists():
-                steps.preserve(target, dest)
-            (home / '0').rename(target)
+                jobs.append({'cam': cam, 'out': str(Path(tmp) / f'cam{cam}' / 'run'),
+                             'args': [*seed_args, '--text', prompt]})
+            for job in jobs:
+                Path(job['out']).parent.mkdir()
+            try:
+                live.execute([str(sam_python), str(OBJECT_MULTI), '--tracker',
+                              str(OBJECT_POINT_TRACKER if points else OBJECT_TRACKER), '--case', str(dest),
+                              '--jobs', json.dumps(jobs)], dest / '05_object.log', source, env)
+            finally:
+                # 실패해도 끝난 카메라 결과는 설치해 두어 재시도 때 재사용합니다.
+                for job in jobs:
+                    if (Path(job['out']) / 'record.json').is_file():
+                        install(job['cam'], Path(job['out']))
+    for cam in range(4):
+        rec = read(candidate / 'object_track' / str(cam) / 'record.json')
         records[str(cam)] = {k: rec[k] for k in ('points_px' if points else 'bbox_px_xyxy', 'seed_attempt_used',
                                                  'selected_candidate', 'nonempty_frames', 'frames', 'wall_s')}
     # Review previews/report must describe the masks that will actually be reviewed.
@@ -339,10 +363,15 @@ def object_bbox_track(scripts, project, episode, prompt, bboxes, gpu_uuid, point
     seconds = round(time.monotonic() - started, 1)
     index = dest / 'index.html'
     marker = '<!-- point_object_track -->' if points else '<!-- bbox_object_track -->'
+    # 손만 계산한 기준선은 sam3_fast가 페이지 위에 따로 안내합니다.
+    baseline_note = ('' if (dest / '_resume/baseline_groups.json').is_file()
+                     and set(read(dest / '_resume/baseline_groups.json').values()) == {'controller'}
+                     else '왼쪽 기준선은 기존 텍스트 방식입니다. ')
     text = index.read_text()
     if points and marker not in text:
         note = (marker + '<p><b>물체 분할 방식: 첫 프레임 포인트 + 텍스트 → 단일 물체 추적 (테스트 옵션).</b> '
-                '오른쪽 후보의 초록(물체)은 포인트로 고른 초기 마스크 하나만 추적한 결과입니다. 왼쪽 기준선은 기존 텍스트 방식입니다. '
+                '오른쪽 후보의 초록(물체)은 포인트로 고른 초기 마스크 하나만 추적한 결과입니다. '
+                + baseline_note +
                 '초기 마스크(초록 점=포함, 빨간 점=제외): '
                 + ' · '.join(f'<a href="roi_candidate/object_track/{c}/seed/selected.jpg">Camera {c + 1}</a>' for c in range(4)) + '. '
                 '첫 프레임, 빠른 움직임, 가림 후 복구, 마지막 프레임과 그림자 혼입을 확인하세요.</p>')
@@ -350,7 +379,8 @@ def object_bbox_track(scripts, project, episode, prompt, bboxes, gpu_uuid, point
         index.write_text(text)
     elif marker not in text:
         note = (marker + '<p><b>물체 분할 방식: 첫 프레임 bbox + 텍스트 → 단일 물체 추적 (테스트 옵션).</b> '
-                '오른쪽 후보의 초록(물체)은 bbox로 고른 초기 마스크 하나만 추적한 결과입니다. 왼쪽 기준선은 기존 텍스트 방식입니다. '
+                '오른쪽 후보의 초록(물체)은 bbox로 고른 초기 마스크 하나만 추적한 결과입니다. '
+                + baseline_note +
                 '초기 후보는 bbox 안 면적 기준으로 자동 선택했습니다. 선택된 초기 마스크: '
                 + ' · '.join(f'<a href="roi_candidate/object_track/{c}/seed/selected.jpg">Camera {c + 1}</a>' for c in range(4)) + '. '
                 '첫 프레임, 빠른 움직임, 가림 후 복구, 마지막 프레임과 그림자 혼입을 확인하세요.</p>')
@@ -510,7 +540,9 @@ def execute(stage, episode, run_id, config_path, sam_prompt='', sam_scene='2d', 
         # 원본 05_sam3.py는 프로젝트 전체 잠금을 잡아 다른 에피소드의 SAM3·검수를 막으므로,
         # 같은 pipeline.sam3()를 에피소드 단위 잠금으로 실행합니다(동시 실행 2개 지원).
         subprocess.run([python, str(Path(__file__).with_name('sam3_episode.py')), str(scripts), str(prepared), str(project),
-                        *(['--new-attempt'] if changed else [])], env=env, cwd=scripts, check=True)
+                        *(['--new-attempt'] if changed else []),
+                        # bbox/포인트 모드는 물체를 추적기로 따로 계산하므로 기준선에서는 손만 계산합니다.
+                        *(['--object-tracked'] if bboxes or points else [])], env=env, cwd=scripts, check=True)
         if bboxes or points:
             object_bbox_track(scripts, project, episode, sam_prompt.strip(), bboxes, cfg['gpu_uuid'], points=points)
     elif stage == 'mask_approved':
