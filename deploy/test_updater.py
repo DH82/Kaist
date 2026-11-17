@@ -252,5 +252,42 @@ class FleetUpdateRequestTests(unittest.TestCase):
                 fleet.update_request('pc9', 'x')
 
 
+class ReconstructFollowupTests(UpdaterTests):
+    """배포 뒤(다음 주기): 3D 결과가 고정한 코드 해시가 배포 코드와 다르면 UI 수신함에 '3D 복원 다시'를 한 번 보냅니다."""
+
+    def setUp(self):
+        super().setUp()
+        import hashlib
+        self.work = self.tmp / 'work'
+        code = self.pc / 'pipeline/current/workspace/kaist-full/PhysTwin/data_process'
+        code.mkdir(parents=True)
+        (code / 'align.py').write_text('new')
+        good = hashlib.sha256(b'new').hexdigest()
+        for ep, h in (('ep_old', hashlib.sha256(b'old').hexdigest()), ('ep_same', good)):
+            c = self.work / '06_reconstruction' / ep / '_resume/contract.json'
+            c.parent.mkdir(parents=True)
+            c.write_text(json.dumps({'code': {'align': h}}))
+        with (self.pc / '.env').open('a') as f:
+            f.write(f"GPU_PROJECT_DIR='{self.work}'\n")
+
+    def inbox(self):
+        return sorted((self.nas / 'control/inbox/pc2').glob('*.json'))
+
+    def test_sends_changed_episodes_once(self):
+        self.tick()
+        cmds = self.inbox()
+        self.assertEqual(len(cmds), 1)
+        cmd = json.loads(cmds[0].read_text())
+        self.assertEqual((cmd['type'], cmd['episodes'], cmd['files']), ('reconstruct_redo', ['ep_old'], ['align.py']))
+        self.tick()
+        self.assertEqual(len(self.inbox()), 1)
+
+    def test_not_while_update_in_progress(self):
+        state = json.loads((us.LOCAL / 'state.json').read_text()); state['prev'] = self.deployed
+        us.write_json(us.LOCAL / 'state.json', state)
+        u = us.Updater(self.pc / '.env'); u.reconstruct_followup()
+        self.assertEqual(self.inbox(), [])
+
+
 if __name__ == '__main__':
     unittest.main()

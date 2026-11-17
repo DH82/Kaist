@@ -389,8 +389,58 @@ class Updater:
         self.save_local(last=dict(last, resolved=time.time()))
         log('지난 실패 해소됨: 이미 GitHub 최신이고 직접 고친 파일이 없습니다')
 
+    # ---------- 배포 뒤: 바뀐 코드로 3D 복원 다시 하기 ----------
+    def reconstruction_drift(self):
+        """3D 복원 결과(06_reconstruction/<ep>/_resume/contract.json)가 고정한 코드 해시가 지금 배포된 코드와 다른 에피소드.
+        그대로 두면 MANO(hands) 단계가 'Code/config changed'로 실패하므로, UI가 3D 복원부터 다시 하게 합니다."""
+        import hashlib
+        work = Path(self.env.get('GPU_PROJECT_DIR') or '')
+        recon = work / '06_reconstruction'
+        phystwin = ROOT / 'pipeline/current/workspace/kaist-full/PhysTwin/data_process'
+        scripts = ROOT / 'pipeline/current/project/00_scripts'
+        if not recon.is_dir() or not phystwin.is_dir():
+            return []
+
+        def digest(path):
+            try:
+                return hashlib.sha256(path.read_bytes()).hexdigest()
+            except OSError:
+                return None
+        cache, drifted = {}, []
+        for contract in sorted(recon.glob('ep_*/_resume/contract.json')):
+            c = read_json(contract) or {}
+            pins = [(phystwin / f'{n}.py', h) for n, h in (c.get('code') or {}).items()]
+            pins += [(scripts / n, h) for n, h in (c.get('adapters') or {}).items()]
+            if c.get('worker'):
+                pins.append((scripts / 'reconstruction_worker.py', c['worker']))
+            changed = sorted(f.name for f, h in pins if cache.setdefault(f, digest(f)) != h)
+            if changed:
+                drifted.append({'episode': contract.parents[1].name, 'files': changed})
+        return drifted
+
+    def reconstruct_followup(self):
+        """배포가 끝난 뒤(다음 실행 주기, 새 코드로) 한 번: 코드가 바뀐 3D 결과의 에피소드를 이 PC UI에 '3D 복원 다시'로 보냅니다.
+        UI(reconstruct_redo)가 MANO 대기 중인 실행만 하나씩 초기화합니다(MANO까지 끝난 결과는 건드리지 않음)."""
+        deployed = self.local.get('deployed')
+        if self.mode != 'docker' or not deployed or self.local.get('prev') is not None:
+            return
+        if self.local.get('recon_checked') == deployed:
+            return
+        drifted = self.reconstruction_drift()
+        if drifted:
+            cid = 'recon_' + time.strftime('%Y%m%dT%H%M%S') + '_' + deployed[:7]
+            inbox = self.control / 'inbox' / self.pc
+            inbox.mkdir(parents=True, exist_ok=True)
+            write_json(inbox / f'{cid}.json', {'id': cid, 'type': 'reconstruct_redo', 'at': time.time(),
+                                                'requested_by': 'updater', 'commit': deployed,
+                                                'episodes': [d['episode'] for d in drifted],
+                                                'files': sorted({f for d in drifted for f in d['files']})})
+            log(f'3D 복원 다시: 코드가 바뀐 에피소드 {len(drifted)}개를 UI에 보냄 ({cid})')
+        self.save_local(recon_checked=deployed)
+
     def tick(self, now=False, auto=False):
         fetch_error = self.fetch()
+        self.reconstruct_followup()
         req = self.request()
         if not req and now:
             req = {'id': 'manual_' + time.strftime('%Y%m%dT%H%M%S'), 'requested_by': 'local'}

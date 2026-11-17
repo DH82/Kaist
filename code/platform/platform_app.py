@@ -1269,6 +1269,10 @@ class ResetJob(BaseModel):
 @app.post('/api/jobs/reset')
 def reset_job(data:ResetJob,req:Request):
  guard(req);update_block()
+ return start_reset(data,req)
+
+def start_reset(data,req=None,who=None):
+ """단계 초기화 본체. req가 없으면 시스템 요청(업데이트 뒤 3D 복원 다시 등): 소유자 확인·감사 기록 대신 who로 남깁니다."""
  start=RESET_START.get(data.stage)
  wid=dag_worker(data.dag_id)
  if not start or data.dag_id not in [d for w,m,d in active_dags()]:raise HTTPException(400,'초기화할 단계를 확인하세요.')
@@ -1276,7 +1280,7 @@ def reset_job(data:ResetJob,req:Request):
   reset_busy(data.run_id)
   base=f'/api/v2/dags/{data.dag_id}/dagRuns/'+quote(data.run_id,safe='')
   run=local_api('GET',base);conf=run.get('conf',{});ep=conf.get('episode_id','')
-  require_owner(req,conf)
+  if req is not None:require_owner(req,conf)
   if run['state'] not in ('success','failed'):raise HTTPException(409,'완료되었거나 실패한 실행만 초기화할 수 있습니다. 진행 중이면 먼저 강제 종료하세요.')
   if active_batch_sources(run_id=data.run_id):raise HTTPException(409,'MANO 일괄 실행에 들어 있는 실행입니다. 일괄 실행이 끝나거나 제거한 뒤 초기화하세요.')
   tasks=[{'task':t['task_id'],'state':t['state']} for t in local_api('GET',base+'/taskInstances')['task_instances']]
@@ -1304,8 +1308,8 @@ def reset_job(data:ResetJob,req:Request):
   st=worker_action('reset',payload,wid)
   if st.get('state')=='failed':raise HTTPException(409,'초기화 실패: '+str(st.get('error','')))
   RESETS[data.run_id]={'state':'running','stage':start,'message':'결과 보관 중','at':time.time()}
-  access.audit(req,'reset '+data.run_id+' '+start)
- spawn_reset(data.dag_id,wid,data.run_id,payload,sorted(rerun,key=JOB_STAGES.index),access.user(req)['name'],skip,defer)
+  if req is not None:access.audit(req,'reset '+data.run_id+' '+start)
+ spawn_reset(data.dag_id,wid,data.run_id,payload,sorted(rerun,key=JOB_STAGES.index),access.user(req)['name'] if req is not None else who,skip,defer)
  return {'ok':True,'stage':start,'requested_stage':data.stage,'airflow':bool(rerun),'until_3d':until_3d}
 
 def spawn_reset(*args):
@@ -1752,7 +1756,40 @@ def fleet_raw_reset(task,p):
  msg=(f'{ep} 시작 전 배정 해제' if ep else f'대기열 초기화: 시작 전 배정 {len(rows)}개 · 제외 기록 {excl}개 해제')+(' (배정 없음)' if not rows else '')
  task_update(task['id'],state='done',message=msg)
 
-FLEET_HANDLERS={'raw_reset':fleet_raw_reset,'run_raw':fleet_run_raw,'mano_export':fleet_mano_export,'mano_import':fleet_mano_import,'mano_release':fleet_mano_release}
+def fleet_reconstruct_redo(task,p):
+ """업데이트(updater)가 보낸 '3D 복원 다시': 3D 결과가 고정한 코드가 새 코드와 달라진 에피소드를 MANO 대기 상태로 다시 만듭니다.
+ MANO 대기(낮 실행·3D까지만 실행) 중인 실행만 3D 복원 단계부터 하나씩 초기화합니다. 동시 실행 자리가 없거나 MANO 일괄
+ 실행에 들어 있으면 다음 주기(20초)에 다시 시도하고, MANO가 이미 시작·완료된 실행은 건너뜁니다."""
+ todo=p.setdefault('todo',list(p.get('episodes') or []));done=p.setdefault('done',[]);skipped=p.setdefault('skipped',{})
+ if any(r.get('state')=='running' for r in RESETS.values()):
+  task_update(task['id'],state='running',message=f"3D 복원 다시: 다른 초기화 진행 중 · 남음 {len(todo)} / 완료 {len(done)}");return
+ runs={}
+ for run in mano_ready_runs():
+  ep=(run.get('conf') or {}).get('episode_id')
+  if ep and ep not in runs:runs[ep]=run
+ waiting=''
+ for ep in list(todo):
+  run=runs.get(ep)
+  if run is None:
+   todo.remove(ep);skipped[ep]='MANO 대기 실행이 아님(진행 중이거나 MANO까지 완료) — 건너뜀';continue
+  conf=run.get('conf') or {}
+  if mano_transfer_of(run['dag_run_id']):
+   todo.remove(ep);skipped[ep]='다른 PC로 MANO 이관됨 — 건너뜀';continue
+  hands=call('POST','/worker/jobs/status',json=request_for('hands',run['dag_run_id'],conf),worker_id=DEFAULT_WORKER,timeout=15).get('state')
+  if hands in ('queued','running','success'):
+   todo.remove(ep);skipped[ep]=f'MANO 단계가 이미 {hands} — 건너뜀';continue
+  try:
+   start_reset(ResetJob(dag_id=run['dag_id'],run_id=run['dag_run_id'],stage='reconstruct',until_3d=True),who='업데이트(코드 변경)')
+  except HTTPException as e:
+   if e.status_code==409 and any(k in str(e.detail) for k in ('작업이 실행 중','일괄 실행','실행 중입니다','초기화 중')):
+    waiting=str(e.detail);break                             # 자리·일괄 실행·같은 에피소드 대기: 다음 주기에 다시
+   todo.remove(ep);skipped[ep]='초기화 실패: '+str(e.detail)[-200:];continue
+  todo.remove(ep);done.append(ep);break                     # 한 주기에 하나씩
+ with fleet_db() as c:c.execute('UPDATE fleet_tasks SET payload=? WHERE id=?',(json.dumps(p,ensure_ascii=False),task['id']))
+ msg=f"3D 복원 다시(코드 변경 {', '.join(p.get('files') or [])}): 시작 {len(done)} · 남음 {len(todo)} · 건너뜀 {len(skipped)}"+(f" · 대기: {waiting}" if waiting else '')
+ task_update(task['id'],state='running' if todo else 'done',message=msg[-400:])
+
+FLEET_HANDLERS={'reconstruct_redo':fleet_reconstruct_redo,'raw_reset':fleet_raw_reset,'run_raw':fleet_run_raw,'mano_export':fleet_mano_export,'mano_import':fleet_mano_import,'mano_release':fleet_mano_release}
 
 def fleet_process():
  for cmd in fleet.claim():

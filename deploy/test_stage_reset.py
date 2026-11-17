@@ -251,6 +251,37 @@ class ResetEndpointTests(unittest.TestCase):
         self.assertEqual(self.ui.RESETS[RUN]['state'], 'failed')
 
 
+class ReconstructRedoTests(ResetEndpointTests):
+    """업데이트가 보낸 reconstruct_redo: MANO 대기 실행만 3D 복원부터 한 주기에 하나씩 초기화합니다."""
+
+    def setUp(self):
+        super().setUp()
+        run = {'dag_id': self.DAG, 'dag_run_id': RUN, 'conf': {'episode_id': EP, 'operator_id': 'PC1'}}
+        for name, fn in [('mano_ready_runs', lambda: iter([run])), ('mano_transfer_of', lambda r: None)]:
+            p = patch.object(self.ui, name, side_effect=fn); p.start(); self.addCleanup(p.stop)
+
+    def redo(self, episodes):
+        task = {'id': 'recon_t1', 'type': 'reconstruct_redo'}
+        payload = {'episodes': episodes, 'files': ['data_process_pcd.py']}
+        with self.ui.fleet_db() as c:
+            c.execute('INSERT INTO fleet_tasks VALUES(?,?,?,?,?,?,?,?)', (task['id'], task['type'], json.dumps(payload), 'received', '', '', 0, 0))
+        self.ui.fleet_reconstruct_redo(task, payload)
+        with self.ui.fleet_db() as c:
+            return dict(c.execute('SELECT state,message,payload FROM fleet_tasks WHERE id=?', (task['id'],)).fetchone())
+
+    def test_waiting_run_is_reset_from_reconstruction(self):
+        row = self.redo([EP])
+        self.assertEqual(row['state'], 'done', row['message'])
+        self.assertIn(('reset', {'episode': EP, 'run_id': RUN, 'start': 'prepare_reconstruction'}), self.worker)
+
+    def test_mano_started_and_unknown_runs_are_skipped(self):
+        self.worker_states['hands'] = 'success'
+        row = self.redo([EP, 'ep_not_waiting'])
+        self.assertEqual(row['state'], 'done')
+        self.assertFalse([w for w in self.worker if w[0] == 'reset'])
+        self.assertEqual(len(json.loads(row['payload'])['skipped']), 2)
+
+
 class ResetUntil3DTests(ResetEndpointTests):
     """전체 파이프라인 실행 초기화(기본): 3D 복원까지만 다시 실행하고 MANO 단계는 skipped → MANO 대기(일괄 실행 후보)."""
     DAG = 'kaist_direct_pipeline_4090'
