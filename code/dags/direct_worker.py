@@ -84,11 +84,15 @@ def mano_cutoff(started):
 
 def poll_mano_batch(**ctx):
     """선택한 순서대로 에피소드마다 hands→validate→publish를 진행합니다.
-    UI에서 강제 종료한 에피소드(stopped_by_user)는 건너뛰고 다음 에피소드를 이어 갑니다."""
+    한 에피소드가 실패하거나(단계 실패·3D 복원 미완료·작업 요청 오류) UI에서 강제 종료되면
+    일괄 실행을 멈추지 않고 그 에피소드만 건너뛰어 다음 에피소드로 넘어갑니다.
+    실패한 작업은 Worker가 다시 시작하지 않으므로(start는 실패 상태를 그대로 돌려줌) 다음 확인에서도 계속 건너뜁니다.
+    GPU PC 연결 오류는 에피소드 문제가 아니므로 건너뛰지 않고 다음 확인 때 다시 시도합니다."""
     import datetime as dt
     sources = ctx['dag_run'].conf['sources']
     run_obj = ctx['dag_run']
     cutoff = mano_cutoff(run_obj.start_date or run_obj.queued_at or run_obj.logical_date)
+    skipped = []
     for n, source in enumerate(sources, 1):
         conf = source['conf']
         run = source['run_id']
@@ -96,37 +100,51 @@ def poll_mano_batch(**ctx):
         def request(stage, action):
             return call('POST', '/worker/jobs/' + action, worker_id=DEFAULT_WORKER,
                         json=request_for(stage, run, conf))
+        def skip(reason):
+            print(tag, reason, '· 이 에피소드는 건너뛰고 다음으로 진행합니다')
+            skipped.append(f"{conf['episode_id']}({reason})")
 
-        if request('publish', 'status')['state'] == 'success':
-            print(tag, '완료')
-            continue
-        if request('reconstruct', 'status')['state'] != 'success':
-            raise RuntimeError(f"{conf['episode_id']} 3D 복원 완료 기록을 확인하세요.")
-        # 아직 MANO를 시작하지 않은 에피소드: 평일 오전 8시가 지났으면 여기서 멈추고 나머지는 대기로 남깁니다.
-        if request('hands', 'status')['state'] == 'not_started' and dt.datetime.now(cutoff.tzinfo) >= cutoff:
-            left = [s['conf']['episode_id'] for s in sources[n - 1:]]
-            print(f"평일 오전 {MANO_CUTOFF_HOUR}시({cutoff:%m-%d %H:%M}) 이후라 새 에피소드를 시작하지 않습니다. "
-                  f"대기로 남김 {len(left)}개: {', '.join(left)}")
-            return True
-        stopped = False
-        for stage in MANO_STAGES:
-            current = request(stage, 'status')
-            if current['state'] == 'interrupted' and current.get('stopped_by_user'):
-                print(tag, MANO_LABELS[stage], '강제 종료됨 · 이 에피소드는 건너뜁니다')
-                stopped = True
+        try:
+            if request('publish', 'status')['state'] == 'success':
+                print(tag, '완료')
+                continue
+            if request('reconstruct', 'status')['state'] != 'success':
+                skip('3D 복원 완료 기록 없음')
+                continue
+            # 아직 MANO를 시작하지 않은 에피소드: 평일 오전 8시가 지났으면 여기서 멈추고 나머지는 대기로 남깁니다.
+            # 앞에서 실패해 건너뛴 에피소드는 대기 목록에 넣지 않습니다(이미 실패로 표시됨).
+            if request('hands', 'status')['state'] == 'not_started' and dt.datetime.now(cutoff.tzinfo) >= cutoff:
+                left = [s['conf']['episode_id'] for s in sources[n - 1:]]
+                print(f"평일 오전 {MANO_CUTOFF_HOUR}시({cutoff:%m-%d %H:%M}) 이후라 새 에피소드를 시작하지 않습니다. "
+                      f"대기로 남김 {len(left)}개: {', '.join(left)}")
                 break
-            result = request(stage, 'start')
-            state = result['state']
-            progress = result.get('progress') or {}
-            detail = f" · {progress.get('label')} {progress.get('done')}/{progress.get('total')}" if progress.get('total') else ''
-            print(tag, MANO_LABELS[stage], state + detail)
-            if state in ('failed', 'interrupted'):
-                if result.get('stopped_by_user'):
-                    stopped = True
+            outcome = 'success'
+            for stage in MANO_STAGES:
+                current = request(stage, 'status')
+                if current['state'] == 'interrupted' and current.get('stopped_by_user'):
+                    skip(MANO_LABELS[stage] + ' 강제 종료됨')
+                    outcome = 'skipped'
                     break
-                raise RuntimeError(f"{conf['episode_id']} {stage} {state}")
-            if state != 'success':
+                result = request(stage, 'start')
+                state = result['state']
+                progress = result.get('progress') or {}
+                detail = f" · {progress.get('label')} {progress.get('done')}/{progress.get('total')}" if progress.get('total') else ''
+                print(tag, MANO_LABELS[stage], state + detail)
+                if state in ('failed', 'interrupted'):
+                    skip(MANO_LABELS[stage] + (' 강제 종료됨' if result.get('stopped_by_user') else ' ' + state))
+                    outcome = 'skipped'
+                    break
+                if state != 'success':
+                    outcome = 'pending'
+                    break
+            if outcome == 'pending':
                 return False
-        if stopped:
-            continue
+        except httpx.TransportError as e:
+            # GPU PC 연결 문제는 에피소드 탓이 아니므로 건너뛰지 않고, 일괄 실행도 끝내지 않은 채 다음 확인 때 다시 시도합니다.
+            print(tag, 'GPU PC 연결 오류 · 다음 확인 때 다시 시도합니다:', str(e)[:200])
+            return False
+        except (httpx.HTTPStatusError, ValueError, KeyError) as e:
+            skip('작업 요청 오류: ' + str(e)[:200])
+    if skipped:
+        print(f"건너뛴 에피소드 {len(skipped)}개: {', '.join(skipped)}")
     return True

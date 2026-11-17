@@ -1521,7 +1521,7 @@ def mano_line(n,total,episode,states,waiting=''):
  if states['publish']['state']=='success':return head+'  ✔ 전체 완료'
  for stage in MANO_STAGES:
   st=states[stage];label=MANO_LABELS[stage]
-  if st['state'] in ('failed','interrupted'):return head+'  ✖ '+label+(' · 강제 종료(건너뜀)' if st.get('stopped_by_user') else ' · 실패')
+  if st['state'] in ('failed','interrupted'):return head+'  ✖ '+label+(' · 강제 종료(건너뜀)' if st.get('stopped_by_user') else ' · 실패(건너뜀)')
   if st['state'] in ('running','queued'):
    p=st.get('progress') or {}
    extra=f" · {p.get('label')} {p.get('done')}/{p.get('total')} {p.get('unit','')} ({p.get('percent')}%)" if p.get('total') else (' · '+p['label'] if p.get('label') else '')
