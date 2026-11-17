@@ -9,6 +9,7 @@ import re
 import socket
 import subprocess
 import sys
+import time
 
 from prepare_pc import DEFAULT_WEIGHTS, cuda_arch
 from weights import resolve_weights
@@ -39,6 +40,33 @@ def read_env(path):
 def phase(name):
     """진행 단계 표시. repro/update_stack.py가 이 줄을 읽어 관리자 대시보드에 단계를 보여줍니다."""
     print(f'==> [phase] {name}', flush=True)
+
+
+def gpu_jobs_busy(jobs):
+    """GPU Worker 단계 작업 중 queued/running인 것. (_nas_sync·_reset 같은 '_' 폴더는 GPU를 쓰지 않음)"""
+    busy = []
+    for d in sorted(jobs.iterdir()) if jobs.is_dir() else []:
+        if d.name.startswith('_') or not d.is_dir():
+            continue
+        try:
+            st = json.loads((d / 'status.json').read_text())
+        except (OSError, ValueError):
+            continue
+        if st.get('state') in ('queued', 'running'):
+            busy.append(d.name)
+    return busy
+
+
+def gpu_check(compose, env, jobs):
+    """GPU 자체 점검은 SAM3·CUDA 확장·모델을 실제로 GPU에 올립니다. 작업 중에 돌리면 메모리가 모자라 점검이 실패하고
+    (2026-11-17 PC5: 10/12) 돌던 작업까지 망칠 수 있으므로, 이 PC의 GPU 작업이 모두 끝날 때까지 기다린 뒤 실행합니다."""
+    while True:
+        busy = gpu_jobs_busy(jobs)
+        if not busy:
+            break
+        print(f'GPU 점검 대기: 작업 {len(busy)}개 진행 중 ({", ".join(busy[:3])}) — 끝나면 점검합니다', flush=True)
+        time.sleep(60)
+    run(compose + ['run', '--rm', '--no-deps', 'gpu-worker', 'check'], env=env)
 
 
 def record_deployed():
@@ -74,6 +102,9 @@ def main():
     # Used by repro/update_stack.py: build while the old containers keep running, restart later when idle.
     parser.add_argument('--build-only', action='store_true', help='Build images and run the GPU self-check; do not restart services')
     parser.add_argument('--skip-build', action='store_true', help='Restart services from already-built images and verify the UI')
+    # 점검은 GPU를 실제로 씁니다. 업데이터는 빌드(--no-gpu-check)와 점검(--gpu-check-only)을 나눠 PC가 쉴 때만 점검합니다.
+    parser.add_argument('--no-gpu-check', action='store_true', help='With --build-only: build images without the GPU self-check')
+    parser.add_argument('--gpu-check-only', action='store_true', help='Run only the GPU self-check on already-built images')
     args = parser.parse_args()
     os.chdir(ROOT)
     env_file = args.env_file.resolve()
@@ -188,12 +219,18 @@ def main():
     if args.configure_only:
         print(f'Configuration ready: {env_file}')
         return
+    if args.gpu_check_only:
+        phase('check')
+        gpu_check(compose, env, worker_state / 'worker/jobs')
+        print('GPU self-check passed.')
+        return
     if not args.skip_build:
         phase('build')
         run(compose + ['build'], env=env)
-        # Exercise GPU packages, model assets, rendering and NAS before bringing the UI online.
-        phase('check')
-        run(compose + ['run', '--rm', '--no-deps', 'gpu-worker', 'check'], env=env)
+        if not args.no_gpu_check:
+            # Exercise GPU packages, model assets, rendering and NAS before bringing the UI online.
+            phase('check')
+            gpu_check(compose, env, worker_state / 'worker/jobs')
     if args.build_only:
         print('Images built and checked. Running services were not restarted.')
         return
