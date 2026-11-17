@@ -11,11 +11,14 @@ Docker PC 순서 (한 번에 끝나지 않으면 다음 타이머 실행에서 �
      이 PC에서 직접 고친 파일·GitHub와 갈라진 커밋이 있어도 멈추지 않고, state/updater/discarded/<시각>/ 에
      패치(local.patch)와 백업 브랜치(updater-backup/<시각>)로 보관한 뒤 GitHub 최신 코드로 덮어씁니다.
      GitHub보다 앞선(아직 올리지 않은) 커밋만 있으면 그대로 둡니다.
-  2) 새 이미지 빌드 + GPU 자체 점검 (기존 서비스는 계속 동작)
+  2) 새 이미지 빌드 (기존 서비스는 계속 동작)
   3) 이 PC가 쉴 때까지 대기: Worker 단계 작업·NAS 업로드·Airflow 실행 중 태스크·MANO 일괄 실행이 없을 것.
      파이프라인 코드(pipeline/)가 바뀌면 진행 중인 실행이 "Code/config changed during run"으로 실패하므로
      진행 중(queued/running) 실행이 모두 끝날 때까지 기다립니다.
-  4) 서비스 재시작 + UI 연결 검사. 실패하면 이전 커밋으로 되돌려 다시 빌드·기동합니다.
+  4) GPU 자체 점검. SAM3·CUDA 확장·모델을 실제로 GPU에 올리므로 작업 중에 돌리면 메모리가 모자라 점검이
+     실패하고(2026-11-17 PC5 10/12) 돌던 작업까지 망칠 수 있어, 쉴 때만 합니다.
+  5) 서비스 재시작 + UI 연결 검사. 실패하면 이전 커밋으로 되돌려 다시 빌드·기동합니다.
+  자동 업데이트(--auto)가 실패한 커밋은 GitHub에 새 커밋이 올라오거나 관리자가 요청할 때까지 다시 시도하지 않습니다.
 Native PC(Docker 없이 systemd --user kaist-ui/kaist-airflow, 예: PC1)는 fast-forward 후 code/가 바뀌면
 kaist-ui만 재시작합니다. GPU Worker·파이프라인 사본(~/Desktop/worker1)은 자동 배포하지 않습니다.
 
@@ -41,12 +44,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from start_stack import read_env  # noqa: E402
 
 BRANCH = 'main'
-PINNED = ('pipeline/',)          # 실행 시작 때 해시를 고정하는 파이프라인 코드
+PINNED = ('pipeline/',)          # 실행이 해시를 고정하는 파이프라인 코드(아래 두 범위로 나눠 판단)
+# 실행 시작(prepare_raw) 때 identity.json에 고정되는 코드: 바뀌면 진행 중인 실행 전부를 기다립니다.
+RUN_PINNED = ('pipeline/current/project/', 'pipeline/current/workspace/kaist-full/PhysTwin/Mono/data_process/',
+              'pipeline/current/workspace/kaist-full/config.env',
+              'worker/app/dags/sam_object_track.py', 'worker/app/dags/sam_object_point_track.py')
+# 그 밖의 pipeline/ 코드(예: PhysTwin/data_process)는 3D 복원 단계에서 고정됩니다. 그 전 단계(마스크·추적 검수 대기 등)의
+# 실행은 나중에 새 코드로 복원하므로 기다리지 않고, 3D 복원 이후 단계에 있는 실행만 기다립니다.
+LATE_STAGES = ('prepare_reconstruction', 'reconstruct', 'hands', 'validate', 'publish')
 STALE = 120                      # UI 상태 파일이 이보다 오래되면 '쉬는지 모름'으로 봅니다
 LOCAL = ROOT / 'state' / 'updater'
 REPORT_EVERY = 5                 # 빌드·재시작 중 NAS 상태 갱신 간격(초)
 # 관리자 대시보드에 보이는 단계. rollback은 실패했을 때만 나타납니다.
-PHASES = {'docker': [['fetch', '코드 받기'], ['build', '이미지 빌드'], ['check', 'GPU 점검'], ['wait', '작업 종료 대기'],
+PHASES = {'docker': [['fetch', '코드 받기'], ['build', '이미지 빌드'], ['wait', '작업 종료 대기'], ['check', 'GPU 점검'],
                      ['restart', '서비스 재시작'], ['verify', 'UI 확인']],
           'native': [['fetch', '코드 받기'], ['restart', 'UI 재시작']]}
 
@@ -290,12 +300,15 @@ class Updater:
             c = sqlite3.connect(f'file:{path}?mode=ro&immutable=1', uri=True)
             meta = {k: json.loads(v) for k, v in c.execute('SELECT key,value FROM meta')}
             runs = c.execute("SELECT count(*) FROM runs WHERE state IN ('queued','running')").fetchone()[0]
+            # 3D 복원 이후 단계(또는 단계를 모르는 실행 중) — 3D 복원 코드만 바뀐 업데이트가 기다릴 실행
+            late = c.execute("SELECT count(*) FROM runs WHERE (state='running' AND (stage IS NULL OR stage IN (%s)))"
+                             % ','.join('?' * len(LATE_STAGES)), LATE_STAGES).fetchone()[0]
             c.close()
         except (sqlite3.Error, ValueError, OSError):
             return None
         if time.time() - float(meta.get('updated_at') or 0) > STALE or 'update_busy' not in meta:
             return None
-        return dict(meta['update_busy'] or {}, inflight=runs)
+        return dict(meta['update_busy'] or {}, inflight=runs, inflight_late=late)
 
     def idle_reasons(self, pinned):
         reasons = []
@@ -312,7 +325,10 @@ class Updater:
             reasons.append(f"Airflow 태스크 {ui['running_tis']}개 실행 중")
         if ui.get('batch'):
             reasons.append('MANO 일괄 실행 진행 중')
-        if pinned and ui.get('inflight'):
+        if pinned == 'late':
+            if ui.get('inflight_late', ui.get('inflight')):
+                reasons.append(f"3D 복원 코드가 바뀌어 3D 복원 이후 단계의 실행 {ui.get('inflight_late', ui.get('inflight'))}개가 끝날 때까지 대기")
+        elif pinned and ui.get('inflight'):
             reasons.append(f"파이프라인 코드가 바뀌어 진행 중인 실행 {ui['inflight']}개가 끝날 때까지 대기")
         return reasons
 
@@ -327,9 +343,11 @@ class Updater:
             out.flush()
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                     env=env, text=True, errors='replace', bufsize=1)
-            last = 0
+            last, failed = 0, []
             for line in proc.stdout:
                 out.write(line)
+                if line.startswith('✘'):   # gpu/selfcheck.py의 실패 항목
+                    failed.append(line.strip()[:160])
                 phase = self.progress.feed(line)
                 if phase:
                     self.set_phase(phase)
@@ -344,7 +362,8 @@ class Updater:
             self.save_local(run=run)
         if returncode:
             tail = (LOCAL / 'last_run.log').read_text(errors='replace').strip().splitlines()[-3:]
-            raise RuntimeError(f'start_stack {" ".join(flags)} 실패: ' + ' / '.join(tail)[-400:])
+            detail = ' / '.join(failed)[:600] + ' / ' if failed else ''
+            raise RuntimeError(f'start_stack {" ".join(flags)} 실패: ' + detail + ' / '.join(tail)[-400:])
 
     def rollback(self, prev, restart):
         if not prev or prev == git('rev-parse', 'HEAD'):
@@ -354,8 +373,8 @@ class Updater:
         git('reset', '--hard', '--quiet', prev)
         self.save_local(built=None)
         try:
-            self.start_stack() if restart else self.start_stack('--build-only')
-            self.save_local(built=prev, **({'deployed': prev} if restart else {}))
+            self.start_stack() if restart else self.start_stack('--build-only', '--no-gpu-check')
+            self.save_local(built=prev, checked=prev, **({'deployed': prev} if restart else {}))
             return f' → 이전 커밋 {prev[:7]}로 되돌림'
         except RuntimeError as e:
             return f' → 이전 커밋 {prev[:7]}로 되돌렸지만 재기동 실패: {e}'
@@ -445,7 +464,11 @@ class Updater:
         if not req and now:
             req = {'id': 'manual_' + time.strftime('%Y%m%dT%H%M%S'), 'requested_by': 'local'}
         if not req and auto and not fetch_error and git('rev-parse', 'HEAD') != git('rev-parse', f'origin/{BRANCH}'):
-            req = {'id': 'auto_' + git('rev-parse', '--short', f'origin/{BRANCH}'), 'requested_by': 'auto'}
+            auto_id = 'auto_' + git('rev-parse', '--short', f'origin/{BRANCH}')
+            last = self.local.get('last') or {}
+            # 같은 커밋으로 자동 업데이트가 이미 실패했으면 3분마다 빌드·되돌리기를 반복하지 않습니다.
+            if self.local.get('prev') is not None or last.get('ok', True) or last.get('request') != auto_id:
+                req = {'id': auto_id, 'requested_by': 'auto'}
         in_progress = self.local.get('prev') is not None
         if not req and not in_progress:
             self.clear_resolved_failure(fetch_error)
@@ -491,19 +514,28 @@ class Updater:
     def docker(self, req, prev, head, changed):
         if self.local.get('built') != head:
             self.set_phase('build')
-            self.report('building', f'{head[:7]} 이미지 빌드·GPU 점검 중 (기존 서비스는 계속 동작)')
+            self.report('building', f'{head[:7]} 이미지 빌드 중 (기존 서비스는 계속 동작)')
             try:
-                self.start_stack('--build-only')
+                self.start_stack('--build-only', '--no-gpu-check')
             except RuntimeError as e:
                 return self.fail(req, str(e) + self.rollback(prev, restart=False))
-            self.save_local(built=head)
+            self.save_local(built=head, checked=None)
         if self.local.get('deployed') == head and not changed:
             return self.done(req, '이미 최신입니다')
-        pinned = any(f.startswith(PINNED) for f in changed)
+        pinned = (True if any(f.startswith(RUN_PINNED) for f in changed)
+                  else 'late' if any(f.startswith(PINNED) for f in changed) else False)
         self.set_phase('wait')
         reasons = self.idle_reasons(pinned)
         if reasons:
-            return self.report('waiting', '빌드 완료 · 이 PC가 쉬면 재시작합니다: ' + ' · '.join(reasons))
+            return self.report('waiting', '빌드 완료 · 이 PC가 쉬면 GPU 점검 후 재시작합니다: ' + ' · '.join(reasons))
+        if self.local.get('checked') != head:
+            self.set_phase('check')
+            self.report('building', f'{head[:7]} GPU 점검 중 (작업 없음 확인됨)')
+            try:
+                self.start_stack('--gpu-check-only')
+            except RuntimeError as e:
+                return self.fail(req, str(e) + self.rollback(prev, restart=False))
+            self.save_local(checked=head)
         self.set_phase('restart')
         self.report('restarting', f'{head[:7]}로 서비스 재시작 중')
         try:

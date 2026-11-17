@@ -40,7 +40,7 @@ class UpdaterTests(unittest.TestCase):
         f = self.dev / name; f.parent.mkdir(parents=True, exist_ok=True); f.write_text(text)
         sh(self.dev, 'git', 'add', '-A'); sh(self.dev, 'git', 'commit', '-qm', f'{name}={text}'); sh(self.dev, 'git', 'push', '-q', 'origin', 'main')
 
-    def ui(self, busy, inflight=0, age=0):
+    def ui(self, busy, inflight=0, age=0, stages=()):
         """이 PC UI가 NAS에 쓰는 상태 파일(필요한 부분만)."""
         path = self.nas / 'control/status/pc2.sqlite'; path.parent.mkdir(parents=True, exist_ok=True)
         if path.exists():
@@ -49,6 +49,7 @@ class UpdaterTests(unittest.TestCase):
         c.executescript(fleet.SCHEMA)
         c.executemany('INSERT INTO meta VALUES(?,?)', [('updated_at', json.dumps(time.time() - age)), ('update_busy', json.dumps(busy))])
         c.executemany('INSERT INTO runs (run_id,state) VALUES(?,?)', [(f'r{i}', 'running') for i in range(inflight)])
+        c.executemany('INSERT INTO runs (run_id,state,stage) VALUES(?,?,?)', [(f's{i}', 'running', st) for i, st in enumerate(stages)])
         c.commit(); c.close()
 
     def job(self, state):
@@ -85,12 +86,12 @@ class UpdaterTests(unittest.TestCase):
         self.commit('code/a.py', '1'); self.request(); self.job('running')
         st = self.tick()
         self.assertEqual(st['state'], 'waiting'); self.assertIn('GPU 작업 1개', st['message'])
-        self.assertEqual(self.calls, [('--build-only',)])
+        self.assertEqual(self.calls, [('--build-only', '--no-gpu-check')])
         self.assertNotEqual(self.head(), self.deployed)
         self.assertTrue((self.nas / 'control/update/pc2/request.json').exists())
         self.job('success')
         st = self.tick()
-        self.assertEqual(st['state'], 'done'); self.assertEqual(self.calls, [('--build-only',), ('--skip-build',)])  # 다시 빌드하지 않음
+        self.assertEqual(st['state'], 'done'); self.assertEqual(self.calls, [('--build-only', '--no-gpu-check'), ('--gpu-check-only',), ('--skip-build',)])  # 다시 빌드하지 않음
         self.assertFalse((self.nas / 'control/update/pc2/request.json').exists())
         self.assertEqual(json.loads((us.LOCAL / 'state.json').read_text())['deployed'], self.head())
 
@@ -103,13 +104,28 @@ class UpdaterTests(unittest.TestCase):
         self.ui(busy={'running_tis': 0, 'batch': False}, inflight=0)
         self.assertEqual(self.tick()['state'], 'done')
 
+    def test_reconstruction_code_change_waits_only_for_late_runs(self):
+        # PhysTwin/data_process는 3D 복원 때 고정 → 마스크 검수 대기 실행은 기다리지 않음
+        self.commit('pipeline/current/workspace/kaist-full/PhysTwin/data_process/data_process_pcd.py', '1'); self.request()
+        self.ui(busy={'running_tis': 0, 'batch': False}, stages=['mask_approved', 'reconstruct'])
+        st = self.tick()
+        self.assertEqual(st['state'], 'waiting'); self.assertIn('3D 복원 이후 단계의 실행 1개', st['message'])
+        self.ui(busy={'running_tis': 0, 'batch': False}, stages=['mask_approved', 'tracking_approved'])
+        self.assertEqual(self.tick()['state'], 'done')
+
+    def test_run_pinned_code_change_waits_for_review_runs(self):
+        self.commit('pipeline/current/workspace/kaist-full/PhysTwin/Mono/data_process/x.py', '1'); self.request()
+        self.ui(busy={'running_tis': 0, 'batch': False}, stages=['mask_approved'])
+        st = self.tick()
+        self.assertEqual(st['state'], 'waiting'); self.assertIn('진행 중인 실행 1개', st['message'])
+
     def test_stale_ui_status_blocks_restart(self):
         self.commit('code/a.py', '1'); self.request(); self.ui(busy={}, age=600)
         st = self.tick()
         self.assertEqual(st['state'], 'waiting'); self.assertIn('UI 상태를 확인할 수 없습니다', st['message'])
 
     def test_build_failure_rolls_back(self):
-        self.commit('code/a.py', '1'); self.request(); self.fail_on = {('--build-only',)}
+        self.commit('code/a.py', '1'); self.request(); self.fail_on = {('--build-only', '--no-gpu-check')}
         st = self.tick()
         self.assertEqual(st['state'], 'failed'); self.assertIn('되돌', st['message'])
         self.assertEqual(self.head(), self.deployed)
@@ -128,7 +144,7 @@ class UpdaterTests(unittest.TestCase):
         self.assertEqual(st['state'], 'done'); self.assertIn('직접 고친 파일 1개', st['message'])
         self.assertEqual(self.head(), sh(self.dev, 'git', 'rev-parse', 'HEAD'))
         self.assertEqual((self.pc / 'README.md').read_text(), 'v2'); self.assertFalse(st['dirty'])
-        self.assertEqual(self.calls, [('--build-only',), ('--skip-build',)])
+        self.assertEqual(self.calls, [('--build-only', '--no-gpu-check'), ('--gpu-check-only',), ('--skip-build',)])
         backup = next((us.LOCAL / 'discarded').iterdir())
         self.assertIn('local edit', (backup / 'local.patch').read_text())
         self.assertEqual(json.loads((backup / 'info.json').read_text())['files'], ['README.md'])
@@ -138,7 +154,7 @@ class UpdaterTests(unittest.TestCase):
         (self.pc / 'README.md').write_text('local edit')
         st = self.tick()
         self.assertEqual(st['state'], 'done'); self.assertEqual((self.pc / 'README.md').read_text(), 'v1')
-        self.assertEqual(self.calls, [('--build-only',), ('--skip-build',)])
+        self.assertEqual(self.calls, [('--build-only', '--no-gpu-check'), ('--gpu-check-only',), ('--skip-build',)])
 
     def test_diverged_commit_is_backed_up_and_reset(self):
         self.commit('README.md', 'v2'); self.request()
@@ -159,7 +175,7 @@ class UpdaterTests(unittest.TestCase):
             self.assertTrue(fleet.update_cancel('pc2'))
         self.job('success')
         self.assertEqual(self.tick()['state'], 'paused')
-        self.assertEqual(self.calls, [('--build-only',)])
+        self.assertEqual(self.calls, [('--build-only', '--no-gpu-check')])
 
     def test_up_to_date_request_finishes_without_restart(self):
         self.request()
@@ -168,6 +184,29 @@ class UpdaterTests(unittest.TestCase):
 
     def test_auto_mode(self):
         self.commit('code/a.py', '1')
+        self.assertEqual(self.tick(auto=True)['state'], 'done')
+
+    def test_gpu_check_waits_for_idle(self):
+        # 2026-11-17 PC5: 작업 중에 GPU 점검을 돌려 10/12로 실패 → 점검은 쉬는 동안에만
+        self.commit('code/a.py', '1'); self.request(); self.job('running')
+        self.assertEqual(self.tick()['state'], 'waiting')
+        self.assertNotIn(('--gpu-check-only',), self.calls)
+        self.job('success')
+        self.assertEqual(self.tick()['state'], 'done')
+        self.assertEqual(self.calls, [('--build-only', '--no-gpu-check'), ('--gpu-check-only',), ('--skip-build',)])
+
+    def test_gpu_check_failure_rolls_back_without_check(self):
+        self.commit('code/a.py', '1'); self.request(); self.fail_on = {('--gpu-check-only',)}
+        st = self.tick()
+        self.assertEqual(st['state'], 'failed'); self.assertEqual(self.head(), self.deployed)
+        self.assertEqual(self.calls[-1], ('--build-only', '--no-gpu-check'))
+
+    def test_failed_auto_commit_is_not_retried(self):
+        self.commit('code/a.py', '1'); self.fail_on = {('--gpu-check-only',)}
+        self.assertEqual(self.tick(auto=True)['state'], 'failed')
+        n = len(self.calls)
+        self.assertEqual(self.tick(auto=True)['state'], 'idle'); self.assertEqual(len(self.calls), n)
+        self.commit('code/a.py', '2'); self.fail_on = set()   # 새 커밋이 오면 다시 시도
         self.assertEqual(self.tick(auto=True)['state'], 'done')
 
     def test_native_mode_pulls_without_docker(self):
@@ -207,7 +246,9 @@ class StreamingTests(UpdaterTests):
     """실제 start_stack 호출 경로: 가짜 repro/start_stack.py의 출력을 읽어 단계·빌드 진행을 NAS 상태에 기록합니다."""
     def fake_stack(self, fail=False):
         script = self.pc / 'repro/start_stack.py'; script.parent.mkdir(exist_ok=True)
-        script.write_text('import sys\nprint(%r)\nprint("==> [phase] check", flush=True)\nprint("selfcheck 10/10")\nsys.exit(%d)\n' % (PLAIN, 1 if fail else 0))
+        script.write_text('import sys\na = sys.argv\nif "--gpu-check-only" not in a: print(%r)\n'
+                          'if "--no-gpu-check" not in a: print("==> [phase] check", flush=True); print("selfcheck 10/10")\n'
+                          'sys.exit(%d)\n' % (PLAIN, 1 if fail else 0))
 
     def real_tick(self):
         u = us.Updater(self.pc / '.env'); u.tick(); return u
@@ -218,8 +259,8 @@ class StreamingTests(UpdaterTests):
         st = json.loads((self.nas / 'control/update/pc2/status.json').read_text())
         self.assertEqual(st['state'], 'waiting')
         run = st['run']
-        self.assertEqual(list(run['phases']), ['fetch', 'build', 'check', 'wait'])
-        self.assertTrue(all('end' in run['phases'][k] for k in ('fetch', 'build', 'check')))
+        self.assertEqual(list(run['phases']), ['fetch', 'build', 'wait'])
+        self.assertTrue(all('end' in run['phases'][k] for k in ('fetch', 'build')))
         self.assertEqual(run['phase'], 'wait')
         self.assertEqual({g['label'] for g in run['build']['groups']}, {'gpu-worker envs', 'ui airflow'})
         self.assertEqual(st['phases'][1], ['build', '이미지 빌드'])
@@ -228,7 +269,7 @@ class StreamingTests(UpdaterTests):
         st = json.loads((self.nas / 'control/update/pc2/status.json').read_text())
         self.assertEqual(st['state'], 'done'); self.assertIsNone(st['run'])
         last = st['last']['run']
-        self.assertTrue(last['ok']); self.assertIn('restart', last['phases']); self.assertEqual(last['to'], self.head())
+        self.assertTrue(last['ok']); self.assertIn('check', last['phases']); self.assertIn('restart', last['phases']); self.assertEqual(last['to'], self.head())
 
     def test_failed_build_keeps_failed_phase(self):
         self.commit('code/a.py', '1'); self.request(); self.fake_stack(fail=True)
