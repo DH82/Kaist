@@ -240,7 +240,104 @@ def tracking_video(project, ep, group):
     return {'path': str(path.resolve())}
 
 
+# ---- 검수 대기열 전용 해시 캐시 ----
+# 대기열(queue)은 모든 에피소드의 승인·추적 상태를 원래 검증 코드 그대로 확인합니다. 그 검증이 매번 수십만 개 파일을
+# sha256으로 다시 읽어 16초 이상 걸렸습니다(UI 대기 한도 15초 초과 → 작업 현황이 멈춤).
+# 파일의 크기·수정 시각·inode·ctime이 그대로면 지난번 sha256을 다시 씁니다. 검증 로직 자체는 바꾸지 않고,
+# 실제 단계 진행(승인 확인·추적·복원)은 이 캐시를 쓰지 않습니다.
+def queue_digest_cache():
+    import os, sqlite3, stat as stat_mod
+    import resume_steps
+    folder = Path(os.environ.get('KAIST_REVIEW_CACHE_DIR') or Path(__file__).resolve().parent.parent/'worker/review_cache')
+    known, seen, fresh = {}, set(), {}
+    db = None
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        db = sqlite3.connect(folder/'queue_digests.sqlite', timeout=5)
+        db.execute('CREATE TABLE IF NOT EXISTS digests (path TEXT PRIMARY KEY,size INTEGER,mtime INTEGER,ino INTEGER,ctime INTEGER,sha TEXT)')
+        known = {r[0]: r[1:] for r in db.execute('SELECT path,size,mtime,ino,ctime,sha FROM digests')}
+    except (OSError, sqlite3.Error):
+        db = None
+    original_digest, original_snapshot = resume_steps.digest, resume_steps.snapshot
+
+    def digest_stat(name, st):
+        key = (st.st_size, st.st_mtime_ns, st.st_ino, st.st_ctime_ns)
+        seen.add(name)
+        hit = known.get(name)
+        if hit and tuple(hit[:4]) == key:
+            return hit[4]
+        with open(name, 'rb') as f:
+            sha = hashlib.file_digest(f, 'sha256').hexdigest()
+        # 읽는 동안 바뀐 파일은 기록하지 않습니다.
+        after = os.stat(name)
+        if (after.st_size, after.st_mtime_ns, after.st_ino, after.st_ctime_ns) == key:
+            known[name] = fresh[name] = (*key, sha)
+        return sha
+
+    def digest(p):
+        name = os.fspath(p)
+        return digest_stat(name, os.stat(name))
+
+    def snapshot(paths, root):
+        # resume_steps.snapshot과 같은 결과(상대 경로 → sha256)를 돌려줍니다.
+        base = str(Path(root)); prefix = base.rstrip('/') + '/'
+        result = {}
+        def add(name):
+            try:
+                st = os.stat(name)
+            except OSError:
+                return
+            if not stat_mod.S_ISREG(st.st_mode):
+                return
+            rel = name[len(prefix):] if name.startswith(prefix) else str(Path(name).relative_to(root))
+            result[rel] = digest_stat(name, st)
+        for p in paths:
+            p = Path(p)
+            if not p.exists():
+                raise ValueError('Missing checkpoint output: ' + str(p))
+            if p.is_dir():
+                for folder_name, dirs, files in os.walk(str(p), followlinks=True):
+                    for name in sorted(files):
+                        add(os.path.join(folder_name, name))
+            else:
+                add(str(p))
+        return result
+
+    resume_steps.digest, resume_steps.snapshot = digest, snapshot
+    for module in list(sys.modules.values()):
+        if getattr(module, 'digest', None) is original_digest:
+            module.digest = digest
+        if getattr(module, 'snapshot', None) is original_snapshot:
+            module.snapshot = snapshot
+
+    def save():
+        if db is None:
+            return
+        try:
+            stale = [(name,) for name in known if name not in seen]
+            if fresh or stale:
+                with db:
+                    db.executemany('INSERT OR REPLACE INTO digests VALUES(?,?,?,?,?,?)', [(name, *row) for name, row in fresh.items()])
+                    db.executemany('DELETE FROM digests WHERE path=?', stale)
+            db.close()
+        except sqlite3.Error:
+            pass
+    return save
+
+
 def queue_items(review, project):
+    try:
+        save_digests = queue_digest_cache()
+    except Exception:
+        save_digests = None  # 캐시를 못 쓰면 예전처럼 전부 다시 읽습니다.
+    try:
+        return scan_queue(review, project)
+    finally:
+        if save_digests:
+            save_digests()
+
+
+def scan_queue(review, project):
     items = []
     for prepared in sorted((project/'03_prepared').glob('ep_*')):
         ep = prepared.name

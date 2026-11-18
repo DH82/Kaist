@@ -54,7 +54,41 @@ def active_dags():
 def review_queue_lock(worker_id):
  return threading.Lock()
 
+# worker_id → (새로 확인할 시각, 항목, 받은 시각). 화면 요청은 이 값을 바로 받고, 오래된 값은 뒤에서 새로 받아 옵니다.
 review_queue_cache = {}
+review_queue_state = {'gen':{}, 'refreshing':set(), 'failed':{}}
+review_refresh_lock = threading.Lock()
+REVIEW_QUEUE_FRESH=15     # 이 시간(초) 안에는 Worker에 다시 묻지 않음
+REVIEW_QUEUE_STALE=120    # 이보다 오래된 값은 쓰지 않고 새로 받아 올 때까지 기다림
+REVIEW_QUEUE_TIMEOUT=60
+
+def invalidate_review_queue(worker_id):
+ """검수 결정·마스크 수정 등으로 대기열이 바뀌었을 때: 다음 요청은 Worker에서 새로 받아 옵니다."""
+ state=review_queue_state
+ state['gen'][worker_id]=state['gen'].get(worker_id,0)+1
+ state['failed'].pop(worker_id,None)
+ review_queue_cache.pop(worker_id,None)
+
+def fetch_review_queue(pc):
+ worker_id=pc['id']
+ result=call('GET','/kaist-review/dags/'+pc['review_dag']+'/queue',worker_id=worker_id,timeout=REVIEW_QUEUE_TIMEOUT)
+ return [dict(row,worker_id=worker_id,worker_label=pc['label']) for row in result['reviews']
+         if access.execution_worker(row['episode'])==worker_id]
+
+def refresh_review_queue(pc,gen):
+ worker_id=pc['id'];state=review_queue_state
+ try:
+  items=fetch_review_queue(pc)
+  if state['gen'].get(worker_id,0)==gen:
+   now=time.monotonic();review_queue_cache[worker_id]=(now+REVIEW_QUEUE_FRESH,items,now)
+ except Exception as exc:
+  # 실패하면 지금 값을 조금 더 쓰고, REVIEW_QUEUE_STALE이 지나면 '연결 불가'로 바뀝니다.
+  print('검수 대기열 갱신 실패:',worker_id,type(exc).__name__,flush=True)
+  cached=review_queue_cache.get(worker_id)
+  if cached and state['gen'].get(worker_id,0)==gen:
+   review_queue_cache[worker_id]=(time.monotonic()+10,cached[1],cached[2])
+ finally:
+  state['refreshing'].discard(worker_id)
 
 def nudge_gate(worker_id,episode,stage):
  """검수 승인 직후 그 에피소드 실행의 승인 대기 센서(mask_approved/tracking_approved)를 바로 다시 확인하게 합니다.
@@ -75,18 +109,28 @@ def nudge_gate(worker_id,episode,stage):
  return nudged
 
 def worker_review_queue(pc):
- worker_id=pc['id']
+ worker_id=pc['id'];state=review_queue_state
+ unavailable=[{'worker_id':worker_id,'unavailable':True}]
+ cached=review_queue_cache.get(worker_id);now=time.monotonic()
+ if cached and now-cached[2]<REVIEW_QUEUE_STALE:
+  if now>=cached[0]:
+   with review_refresh_lock:
+    start=worker_id not in state['refreshing']
+    if start:state['refreshing'].add(worker_id)
+   if start:threading.Thread(target=refresh_review_queue,args=(pc,state['gen'].get(worker_id,0)),daemon=True).start()
+  return cached[1]
  with review_queue_lock(worker_id):
-  cached=review_queue_cache.get(worker_id)
-  if cached and time.monotonic()<cached[0]:
-   return cached[1]
-  try:
-   result=call('GET','/kaist-review/dags/'+pc['review_dag']+'/queue',worker_id=worker_id,timeout=15)
-   items=[dict(row,worker_id=worker_id,worker_label=pc['label']) for row in result['reviews']
-          if access.execution_worker(row['episode'])==worker_id]
+  cached=review_queue_cache.get(worker_id);now=time.monotonic()
+  if cached and now<cached[0]:return cached[1]
+  if now<state['failed'].get(worker_id,0):return unavailable
+  gen=state['gen'].get(worker_id,0)
+  try:items=fetch_review_queue(pc)
   except (httpx.HTTPError,OSError,ValueError,subprocess.SubprocessError):
-   return [{'worker_id':worker_id,'unavailable':True}]
-  review_queue_cache[worker_id]=(time.monotonic()+15,items)
+   # 실패도 잠깐 기억해, 줄 선 요청들이 차례로 다시 기다리지 않게 합니다.
+   state['failed'][worker_id]=time.monotonic()+10
+   return unavailable
+  if state['gen'].get(worker_id,0)==gen:
+   now=time.monotonic();review_queue_cache[worker_id]=(now+REVIEW_QUEUE_FRESH,items,now)
   return items
 
 def all_review_items(worker_id=None):
@@ -963,7 +1007,7 @@ async def review_proxy(path:str,req:Request):
  if req.method=='POST' and r.status_code<400:
   def record_change():
    with review_queue_lock(wid):
-    review_queue_cache.pop(wid,None)
+    invalidate_review_queue(wid)
    access.audit(req,'review '+path)
   await asyncio.to_thread(record_change)
   gate=re.search(r'/episodes/(ep_[A-Za-z0-9_]+)/(tracking/)?decision$',path)
@@ -1630,7 +1674,7 @@ def stop_episode(data:StopRequest,req:Request):
      worker_action('skip',skip,DEFAULT_WORKER)
    runs.append(b['dag_run_id']+' (MANO 일괄)')
   access.audit(req,'force-stop '+data.episode+' '+','.join(runs))
-  for wid in {t[0] for t in targets}:review_queue_cache.pop(wid,None)
+  for wid in {t[0] for t in targets}:invalidate_review_queue(wid)
   return {'ok':True,'runs':runs,'stages':stages}
 
 class EpisodeRef(BaseModel):
@@ -2161,7 +2205,7 @@ def stop_for_update(note):
    attempt(ep+' 실행',lambda:fail_airflow_run(dag,r['dag_run_id'],note))
    res=attempt(ep+' GPU 작업',lambda:worker_action('stop',{'episode':ep,'run_id':r['dag_run_id']},wid)) or {}
    stopped.append(ep+(' ('+', '.join(res['stopped'])+')' if res.get('stopped') else ''))
-   review_queue_cache.pop(wid,None)
+   invalidate_review_queue(wid)
   # 남은 GPU 작업(다른 PC에서 이관 받은 MANO, 목록에서 다시 실행한 단계 등): Worker의 대기·실행 중 작업 전체
   for wid in {w for w,_,_ in active_dags()}:
    res=attempt(wid+' 남은 GPU 작업',lambda:worker_action('stop-all',{},wid)) or {}
