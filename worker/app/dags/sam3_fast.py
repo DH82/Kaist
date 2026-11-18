@@ -28,7 +28,7 @@ import time
 from pathlib import Path
 
 PINNED = {
-    'pipeline.py': '6f955c9bacf5a664a7379691d598643e0b95456596ad462134eb9d8d164ab06a',
+    'pipeline.py': 'b86800764bbc0a7c21196f663bb3271638d0d509aa55819ae9466c47f04795e6',
     'roi_workflow.py': 'a4f13cf4bdde04e90a22bb7130d487c5e507b9bbf5afcb2885e54b71d5071e4f',
     'roi_camera.py': 'dbce8ec5277fd90bc6a7f133f88270ff76372202ad43bfeed30d4ef026677ac9',
     'run_hand_roi.py': '19c631afc30d4c678f4948832c962e88013ec51517df16fd5d8020a5cf9e4a87',
