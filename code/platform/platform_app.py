@@ -751,7 +751,7 @@ def mano_progress(run,history):
 class ManoSelection(BaseModel):
  runs:list[str]=Field(min_length=1,max_length=100)
  # 업데이트 전 대기열: 업데이트 전 코드로 고정된 에피소드만 3D 복원부터 다시 한 뒤 MANO 진행(그 밖의 에피소드는 MANO만)
- redo_3d:bool=False
+ redo_3d:bool=True  # 기본값: 업데이트 전 결과는 3D 복원부터 다시(그대로 MANO만 하면 'Code/config changed'로 실패)
 
 @app.get('/api/pc1/mano')
 def mano_candidates(req:Request):

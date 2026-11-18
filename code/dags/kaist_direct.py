@@ -51,7 +51,7 @@ with DAG(BATCH_DAG, schedule=None, catchup=False, max_active_runs=1,
          start_date=datetime(2026,1,1,tzinfo=timezone.utc), tags=['kaist', DEFAULT_WORKER],
          params={'sources': Param(type='array', minItems=1, maxItems=100),
                  # 이미 3D 복원까지 끝난 에피소드 중 업데이트 전 코드로 만든 것도 3D 복원부터 다시 함
-                 'redo_3d': Param(False, type='boolean')},
+                 'redo_3d': Param(True, type='boolean')},
          default_args={'pool':worker(DEFAULT_WORKER,False)['pool'],'retries':0}) as mano_batch:
     PythonSensor(task_id='process_in_order', python_callable=poll_mano_batch,
                  mode='reschedule', poke_interval=20, timeout=7*24*3600)
