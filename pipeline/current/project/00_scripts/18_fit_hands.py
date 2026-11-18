@@ -147,6 +147,7 @@ def run(case,side=None,check=False,new=False,open_view=True):
   save(cp,contract);save(out/'settings.json',settings)
   work,runmono=prepare_view(out,prepared,mono,case.name);display=Display();started=time.monotonic()
   hamba_out=out/'hamba'/case.name;hamba_out.mkdir(parents=True,exist_ok=True)
+  validated=set()  # 이번 실행에서 방금 만든 결과를 이미 검사한 구간(같은 파일을 연달아 두 번 검사하지 않음)
   def validate(action):subprocess.run([python,str(HERE/'hand_stage_worker.py'),action,'--out',str(out),'--case',str(work),'--frames',str(T),'--side',side],cwd=runmono,env=env,check=True)
   try:
    save(out/'state.json',{'status':'running','side':side})
@@ -164,17 +165,23 @@ def run(case,side=None,check=False,new=False,open_view=True):
       except (OSError,ValueError,KeyError):valid=False
       if not valid:preserve(folder,out)
     cmd=[python,'-u','script_hand_recon.py','--img_folder',str(work.parent),'--out_folder',str(out/'hamba')]
-    try:recon.logged(cmd,mono/'data_process/Hamba',env,out/'logs/18_hamba.log','18 · HaMBA 손 복원',display)
-    finally:
+    def keep_valid_cameras():
      # Save only individually validated completed cameras, even on interruption.
      for c in range(4):
       if not (hamba_out/str(c)/'results.pt').exists():continue
       result=subprocess.run([python,str(HERE/'hand_stage_worker.py'),'camera','--camera',str(c),'--out',str(out),'--case',str(work),'--frames',str(T),'--side',side],cwd=runmono,env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
       if result.returncode==0:save(out/'_resume'/f'hamba_camera_{c}.json',{'files':snapshot([hamba_out/str(c)/'results.pt']+[hamba_out/str(c)/f'{f}_all.jpg' for f in range(T)],out)})
-    validate('hamba')
+    # 전체 검사(validate 'hamba')가 통과하면 4개 카메라 기록을 모두 남기므로, 카메라별 개별 검사는
+    # 중단·실패했을 때만 합니다(예전에는 성공해도 같은 파일을 카메라별로 한 번 더 검사·해시했음).
+    try:
+     recon.logged(cmd,mono/'data_process/Hamba',env,out/'logs/18_hamba.log','18 · HaMBA 손 복원',display)
+     validate('hamba')
+    except BaseException:
+     keep_valid_cameras();raise
     for c in range(4):save(out/'_resume'/f'hamba_camera_{c}.json',{'files':snapshot([hamba_out/str(c)/'results.pt']+[hamba_out/str(c)/f'{f}_all.jpg' for f in range(T)],out)})
+    validated.add('hamba')
    step(out,'18',hamba,[f'hamba/{case.name}/{c}' for c in range(4)])
-   validate('hamba')
+   if 'hamba' not in validated:validate('hamba')  # 재개로 18을 건너뛴 경우에만 다시 검사
    def fit():
     preserve(out/'_resume/preview.json',out)
     cmd=[python,'-u',str(runmono/'data_process/data_process_hands.py'),'--hamba_base_path',str(out/'hamba'),'--phystwin_base_path',str(work.parent),'--case_name',case.name,'--temp_weight','500000','--hamba_weight','0.01','--log','hand_v1','--seed','1027','--num_iters','1500','--num_hands','1' if side=='right' else '2','--num_cams','4','--resume','--observations-cache',str(out/'observations.pkl')]
@@ -186,11 +193,11 @@ def run(case,side=None,check=False,new=False,open_view=True):
      cmd += ['--shared_shape']
      for key in ('shape_frames','shape_frame_count','shape_iters','shape_lr','shape_prior_weight','shape_max_delta'):
       cmd += ['--'+key,str(settings[key])]
-    recon.logged(cmd,runmono,env,out/'logs/19_mano.log','19 · MANO 시간축 피팅 (프레임 체크포인트 재개)',display);validate('fit')
+    recon.logged(cmd,runmono,env,out/'logs/19_mano.log','19 · MANO 시간축 피팅 (프레임 체크포인트 재개)',display);validate('fit');validated.add('fit')
    fit_outputs=['hand_v1/hand_reg.pkl','hand_v1/hand_reg_params.pkl','hand_v1/hand_reg_cidx.pkl','hand_v1/integrity.json','observations.pkl']
    if settings['shared_shape']:fit_outputs += ['hand_v1/shared_shape.pkl','hand_v1/shared_shape.json']
    step(out,'19',fit,fit_outputs)
-   validate('fit')
+   if 'fit' not in validated:validate('fit')  # 재개로 19를 건너뛴 경우에만 다시 검사
    step(out,'preview',lambda:validate('preview'),['review/mano_review.mp4','review/frames','review/validation.json'])
    recon.verify_outputs(case);save(out/'state.json',{'status':'review_pending','seconds':round(time.monotonic()-started,2),'side':side})
    print(f'손 복원 완료 · 이번 실행 {time.monotonic()-started:.1f}초\n결과: {out}\n검수: python3 {HERE/"19_review_hands.py"} {out}')

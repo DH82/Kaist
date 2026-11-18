@@ -42,6 +42,7 @@ def main():
     processed = pickle.load(open(f"{case}/mask/processed_masks.pkl", "rb"))
 
     all_pts, all_col, all_vis = [], [], []
+    per_cam = []
     for cam in range(num_cam):
         hp = f"{case}/{args.hand_dir}/{cam}.npz"
         if not os.path.isfile(hp):
@@ -60,13 +61,22 @@ def main():
                 y, x = tracks[f, j, 0], tracks[f, j, 1]
                 if not (0 <= y < m.shape[0] and 0 <= x < m.shape[1] and m[y, x]):
                     vis[f, j] = False
-        # lift to 3D via per-frame pcd (original RGB)
-        pts = np.zeros((T, N, 3)); col = np.zeros((T, N, 3))
-        for f in range(T):
-            z = np.load(f"{pcd_path}/{f}.npz")
+        per_cam.append((cam, tracks, vis, np.zeros((T, N, 3)), np.zeros((T, N, 3))))
+    # lift to 3D via per-frame pcd (original RGB).
+    # pcd/<frame>.npz holds every camera, so each frame is loaded once and all cameras
+    # gather from it (it used to be reloaded once per camera: same values).
+    for f in range(max([c[2].shape[0] for c in per_cam], default=0)):
+        z = np.load(f"{pcd_path}/{f}.npz")
+        z_points = z_colors = None
+        for cam, tracks, vis, pts, col in per_cam:
+            if f >= vis.shape[0]:
+                continue
+            if z_points is None:
+                z_points, z_colors = z["points"], z["colors"]
             on = np.where(vis[f])[0]
-            pts[f, on] = z["points"][cam][tracks[f, on, 0], tracks[f, on, 1]]
-            col[f, on] = z["colors"][cam][tracks[f, on, 0], tracks[f, on, 1]]
+            pts[f, on] = z_points[cam][tracks[f, on, 0], tracks[f, on, 1]]
+            col[f, on] = z_colors[cam][tracks[f, on, 0], tracks[f, on, 1]]
+    for cam, tracks, vis, pts, col in per_cam:
         all_pts.append(pts); all_col.append(col); all_vis.append(vis)
 
     hand_points = np.concatenate(all_pts, 1)

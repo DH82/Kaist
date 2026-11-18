@@ -50,6 +50,7 @@ def filter_track(track_path, pcd_path, mask_path, frame_num, num_cam):
     controller_points = []
     controller_colors = []
     controller_visibilities = []
+    per_cam = []
     for i in range(num_cam):
         current_track_data = np.load(f"{track_path}/{i}.npz")
         # Filter out the track data
@@ -103,23 +104,30 @@ def filter_track(track_path, pcd_path, mask_path, frame_num, num_cam):
                     ]:
                         visibility[frame_idx, j] = 0
 
-        # Get the track point cloud
-        track_points = np.zeros((frame_num, num_points, 3))
-        track_colors = np.zeros((frame_num, num_points, 3))
-        for frame_idx in range(frame_num):
-            data = np.load(f"{pcd_path}/{frame_idx}.npz")
-            points = data["points"]
-            colors = data["colors"]
+        per_cam.append((tracks, visibility, track_object_idx, track_controller_idx, num_points))
 
-            track_points[frame_idx][np.where(visibility[frame_idx])] = points[i][
+    # Get the track point cloud.
+    # pcd/<frame>.npz holds every camera, so each frame is loaded once and all cameras
+    # gather from it (it used to be reloaded once per camera: 4x the reads, same values).
+    all_track_points = [np.zeros((frame_num, cam[4], 3)) for cam in per_cam]
+    all_track_colors = [np.zeros((frame_num, cam[4], 3)) for cam in per_cam]
+    for frame_idx in range(frame_num):
+        data = np.load(f"{pcd_path}/{frame_idx}.npz")
+        points = data["points"]
+        colors = data["colors"]
+        for i, (tracks, visibility, _, _, _) in enumerate(per_cam):
+            all_track_points[i][frame_idx][np.where(visibility[frame_idx])] = points[i][
                 tracks[frame_idx, np.where(visibility[frame_idx])[0], 0],
                 tracks[frame_idx, np.where(visibility[frame_idx])[0], 1],
             ]
-            track_colors[frame_idx][np.where(visibility[frame_idx])] = colors[i][
+            all_track_colors[i][frame_idx][np.where(visibility[frame_idx])] = colors[i][
                 tracks[frame_idx, np.where(visibility[frame_idx])[0], 0],
                 tracks[frame_idx, np.where(visibility[frame_idx])[0], 1],
             ]
 
+    for i, (tracks, visibility, track_object_idx, track_controller_idx, num_points) in enumerate(per_cam):
+        track_points = all_track_points[i]
+        track_colors = all_track_colors[i]
         object_points.append(track_points[:, np.where(track_object_idx)[0], :])
         object_colors.append(track_colors[:, np.where(track_object_idx)[0], :])
         object_visibilities.append(visibility[:, np.where(track_object_idx)[0]])

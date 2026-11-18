@@ -22,8 +22,9 @@ def validate(case,stage,T):
  elif stage=='12':
   for frame in range(T):
    with np.load(case/f'pcd/{frame}.npz') as d:
-    if d['points'].shape[0]!=4 or d['points'].shape[-1]!=3 or d['masks'].shape!=d['points'].shape[:-1]:raise ValueError('Invalid RGB-D cloud')
-    if not np.isfinite(d['points'][d['masks'].astype(bool)]).all():raise ValueError('Nonfinite depth points')
+    points,masks=d['points'],d['masks']  # 한 번만 읽습니다(d[...]는 접근할 때마다 파일에서 다시 읽음).
+    if points.shape[0]!=4 or points.shape[-1]!=3 or masks.shape!=points.shape[:-1]:raise ValueError('Invalid RGB-D cloud')
+    if not np.isfinite(points[masks.astype(bool)]).all():raise ValueError('Nonfinite depth points')
  elif stage=='13':
   d=pickle.load((case/'processed_masks.pkl').open('rb'))
   if len(d)!=T or any(len(d[i])!=4 for i in range(T)):raise ValueError('Incomplete processed masks')
