@@ -308,19 +308,19 @@ function hcAlertShow({key,title,episode,meta,kind,stage}){
  box.prepend(el);while(box.children.length>HC_ALERT_MAX)box.lastElementChild.remove();
 }
 async function hcAlertPoll(){
- if(currentUser&&currentUser.role==='admin'){$('hcAlerts').innerHTML='';return}
+ if(currentUser&&currentUser.role==='admin'){$('hcAlerts').querySelectorAll('.hcAlert:not(.fail)').forEach(hcAlertClose);return}  // 실패 알림(.fail)은 index.html의 failAlertPoll이 관리
  if(hcAlertBusy||!currentUser||document.hidden)return;
  hcAlertBusy=true;
  try{
   if(hcAlertUser!==currentUser.name+'/'+currentUser.role){
-   hcAlertUser=currentUser.name+'/'+currentUser.role;$('hcAlerts').innerHTML='';
+   hcAlertUser=currentUser.name+'/'+currentUser.role;$('hcAlerts').querySelectorAll('.hcAlert:not(.fail)').forEach(hcAlertClose);
    try{hcAlertSeen=new Set(JSON.parse(sessionStorage.getItem('kaistAlertSeen:'+hcAlertUser)||'null')||[])}catch(e){hcAlertSeen=null}
   }
   const d=await hcRequest(HC_BASE+'/queue');if(!currentUser||currentUser.role==='admin')return;
   const pending=(d.reviews||[]).filter(x=>x.status!=='approved'&&(x.stage==='mask'||x.stage==='tracking'));
   const keys=new Set(pending.map(hcAlertKey));
   // 검수가 끝나 대기 목록에서 빠진 항목의 알림은 닫습니다.
-  $('hcAlerts').querySelectorAll('.hcAlert[data-key]').forEach(el=>{if(!keys.has(el.dataset.key))hcAlertClose(el)});
+  $('hcAlerts').querySelectorAll('.hcAlert[data-key]:not(.fail)').forEach(el=>{if(!keys.has(el.dataset.key))hcAlertClose(el)});
   if(hcAlertSeen===null){
    // 이 세션의 첫 확인: 이미 대기 중인 것은 한 번에 요약해서 알려 줍니다.
    hcAlertSeen=new Set(keys);hcAlertStore();

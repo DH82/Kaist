@@ -589,7 +589,8 @@ def mano_candidates(req:Request):
   conf=run['conf']
   if not access.allowed(req,conf['episode_id']):continue
   label,ready=mano_progress(run,history)
-  if ready:rows.append({'run':run['dag_run_id'],'episode':conf['episode_id'],'status':label})
+  # ready_at: MANO 대기가 된 시각(3D 복원까지 끝난 실행의 종료 시각) · UI가 날짜별로 나눠 보여 줍니다.
+  if ready:rows.append({'run':run['dag_run_id'],'episode':conf['episode_id'],'status':label,'ready_at':run.get('end_date') or run.get('start_date')})
  return list(reversed(rows))
 
 @app.post('/api/pc1/mano')
