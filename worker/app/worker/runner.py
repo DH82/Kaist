@@ -5,6 +5,9 @@ ROOT=Path(__file__).resolve().parent
 JOBS=ROOT/'jobs'
 CONFIG=ROOT.parent/'config/gpu_4090_a.json'
 ADAPTER=ROOT.parent/'dags/kaist_runtime.py'
+# GPU를 쓰지 않는 단계: 검수·설정 확인, 결과 검사(파일 해시), 최종 저장·이관 받기(NAS 복사).
+# GPU 슬롯을 잡지 않으므로 SAM3·추적·3D 복원·MANO가 도는 동안에도 바로 실행됩니다.
+NO_GPU_STAGES={'adopt','sam_settings_ready','mask_approved','tracking_approved','validate','publish'}
 STAGES={'adopt','prepare_raw','sam_settings_ready','sam3','mask_approved','preflight','track','tracking_approved','prepare_reconstruction','reconstruct','hands','validate','publish'}
 def write(path,data):
  tmp=path.with_name(path.name+'.'+uuid.uuid4().hex+'.tmp');tmp.write_text(json.dumps(data,indent=2));os.replace(tmp,path)
@@ -92,9 +95,13 @@ def run(p):
  req=json.loads((p/'request.json').read_text());initial=status(p)
  try:
   # GPU 슬롯(기본 2개) 중 빈 곳을 기다렸다가 잡습니다. 3번째 작업부터는 queued로 대기합니다.
-  from gpu_slots import acquire
-  lock,slot=acquire(ROOT/'gpu_4090_a.lock')
-  with lock:
+  # GPU를 쓰지 않는 단계(NO_GPU_STAGES)는 슬롯 없이 바로 실행합니다(gpu_slot=None).
+  import contextlib
+  if req['stage'] in NO_GPU_STAGES:lock,slot=None,None
+  else:
+   from gpu_slots import acquire
+   lock,slot=acquire(ROOT/'gpu_4090_a.lock')
+  with lock or contextlib.nullcontext():
    write(p/'status.json',{**initial,'state':'running','started':time.time(),'pid':os.getpid(),'gpu_slot':slot})
    cmd=['/usr/bin/python3',str(ADAPTER),req['stage'],req['episode'],req['run_id'],'--config',str(CONFIG),'--sam-prompt',req.get('sam_prompt',''),'--sam-scene',req.get('sam_scene','2d')]
    if req.get('raw_episode'):cmd.extend(['--raw-episode',req['raw_episode']])
@@ -102,13 +109,15 @@ def run(p):
    if req.get('transfer_from'):cmd.extend(['--transfer-from',req['transfer_from'],'--transfer-key',req['transfer_key']])
    if req.get('sam_confirmed',False):cmd.append('--sam-confirmed')
    if req.get('target_fps'):cmd.extend(['--fps',str(req['target_fps'])])
+   # 최종 저장: NAS results 저장까지만 이 작업에서 하고, 작업 폴더 전체 미러링(수 GB)은 끝난 뒤 백그라운드 업로드로 넘깁니다.
+   if req['stage']=='publish':cmd.append('--defer-work-sync')
    if req.get('sam_object_mode')=='point_track':cmd.extend(['--object-mode','point_track','--object-points',json.dumps(req['sam_object_points'])])
    elif req.get('sam_object_mode'):cmd.extend(['--object-mode',req['sam_object_mode'],'--object-bboxes',json.dumps(req['sam_object_bboxes'])])
-   print('WORKER stage='+req['stage']+' episode='+req['episode']+' run='+req['run_id']+' gpu_slot='+str(slot),flush=True)
+   print('WORKER stage='+req['stage']+' episode='+req['episode']+' run='+req['run_id']+' gpu_slot='+('-' if slot is None else str(slot)),flush=True)
    sys.path.insert(0,str(ADAPTER.parent))
    from pipeline_progress import parse
    env=os.environ.copy();env['PYTHONUNBUFFERED']='1'
-   with subprocess.Popen(cmd,pass_fds=(lock.fileno(),),env=env,stdout=subprocess.PIPE,
+   with subprocess.Popen(cmd,pass_fds=(lock.fileno(),) if lock else (),env=env,stdout=subprocess.PIPE,
                          stderr=subprocess.STDOUT,text=True,errors='replace',bufsize=1) as proc:
     last_update=0;previous=None
     for line in proc.stdout:
@@ -125,6 +134,12 @@ def run(p):
     result=proc
     proc.wait()
    write(p/'status.json',{**status(p),'state':{0:'success',75:'waiting'}.get(result.returncode,'failed'),'returncode':result.returncode,'finished':time.time()})
+   if req['stage']=='publish' and result.returncode==0:
+    # 최종 결과는 이미 NAS results에 검증 저장됐습니다. 작업 폴더 미러링·로컬 정리는 별도 프로세스가 이어서 합니다(상태: jobs/_nas_sync/<ep>).
+    try:
+     sync_start({'episode':req['episode']},auto=True)
+     print('작업 폴더 NAS 업로드를 백그라운드로 시작했습니다(끝나면 로컬 작업 파일 정리). 상태: '+str(SYNC/req['episode']/'sync.log'),flush=True)
+    except Exception as e:print('작업 폴더 NAS 업로드를 시작하지 못했습니다. 목록의 NAS 올리기로 다시 올려 주세요:',e,flush=True)
  except Exception:
   traceback.print_exc();write(p/'status.json',{**status(p),'state':'failed','finished':time.time(),'error':'Worker execution failed; inspect job.log'})
 
@@ -256,17 +271,30 @@ def sync_status(req):
   if not alive and time.time()-st.get('started',0)>20:
    st={**st,'state':'failed','error':'업로드 프로세스가 중단되었습니다. 다시 올려 주세요.'};write(d/'status.json',st)
  return st
-def sync_start(req):
+SYNC_AUTO_TRIES=3  # 최종 저장 뒤 자동 업로드가 실패·중단됐을 때 다시 시도하는 최대 횟수
+def sync_start(req,auto=False,tries=1):
+ """auto=True: 최종 저장(publish)이 끝난 뒤 자동으로 시작한 업로드. 실패·중단되면 다음 자동 업로드가 시작될 때 다시 시도합니다."""
  d=_sync_dir(req);d.mkdir(parents=True,exist_ok=True)
  with (d/'launch.lock').open('a') as lock:
   fcntl.flock(lock,fcntl.LOCK_EX)
   st=sync_status(req)
   if st['state']=='running':return st
-  write(d/'status.json',{'state':'running','episode':req['episode'],'started':time.time()})
+  base={'state':'running','episode':req['episode'],'started':time.time(),**({'auto':True,'tries':tries} if auto else {})}
+  write(d/'status.json',base)
   with (d/'sync.log').open('ab') as log:
    proc=subprocess.Popen(['/usr/bin/python3',str(__file__),'sync-run',req['episode']],stdin=subprocess.DEVNULL,stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
-  write(d/'status.json',{'state':'running','episode':req['episode'],'started':time.time(),'pid':proc.pid})
+  write(d/'status.json',{**base,'pid':proc.pid})
  return sync_status(req)
+def _sync_resume_auto(skip):
+ """실패·중단된 자동 업로드(최종 저장은 끝났지만 작업 폴더가 로컬에 남은 에피소드)를 다시 시작합니다."""
+ for d in sorted(SYNC.iterdir()) if SYNC.is_dir() else []:
+  if d.name==skip or not (d/'status.json').is_file():continue
+  try:
+   st=sync_status({'episode':d.name})
+   if st.get('auto') and st['state']=='failed' and st.get('tries',1)<SYNC_AUTO_TRIES:
+    sync_start({'episode':d.name},auto=True,tries=st.get('tries',1)+1)
+    print('이전에 끝내지 못한 자동 업로드를 다시 시작:',d.name,flush=True)
+  except (OSError,ValueError) as e:print('자동 업로드 다시 시작 건너뜀:',d.name,e,flush=True)
 def _active_jobs():
  """실행 중(queued/running)인 단계 작업들의 {'episode','state'}. 업로드 후 로컬 삭제 전 확인용."""
  for p in JOBS.iterdir() if JOBS.is_dir() else []:
@@ -276,12 +304,20 @@ def _active_jobs():
    yield {'episode':json.loads((p/'request.json').read_text()).get('episode'),'state':status(p)['state']}
   except (OSError,ValueError):continue
 def sync_run(episode):
- d=_sync_dir({'episode':episode});started=json.loads((d/'status.json').read_text()).get('started',time.time())
+ d=_sync_dir({'episode':episode});first=json.loads((d/'status.json').read_text());started=first.get('started',time.time())
+ keep={k:first[k] for k in ('auto','tries') if k in first}
  print('NAS 업로드 시작:',episode,time.strftime('%Y-%m-%d %H:%M:%S'),flush=True)
  try:
   sys.path.insert(0,str(ADAPTER.parent))
   import sync_work
   cfg=json.loads(CONFIG.read_text())
+  if keep.get('auto'):_sync_resume_auto(episode)
+  # 업로드는 한 번에 하나씩: 여러 에피소드가 동시에 올리면 NAS 회선을 나눠 쓸 뿐 빨라지지 않습니다. 기다리는 동안에도 상태는 running입니다.
+  queue=(SYNC/'upload.lock').open('a')
+  try:fcntl.flock(queue,fcntl.LOCK_EX|fcntl.LOCK_NB)
+  except BlockingIOError:
+   print('다른 에피소드 업로드가 끝나기를 기다립니다.',flush=True);fcntl.flock(queue,fcntl.LOCK_EX)
+   print('업로드 차례:',episode,time.strftime('%Y-%m-%d %H:%M:%S'),flush=True)
   rec=sync_work.sync_episode(cfg,episode,lambda m:print(m,flush=True))
   # 최종 저장까지 끝난 에피소드면 업로드 후 로컬 사본을 지웁니다(진행 중인 단계 작업이 있으면 유지).
   deleted=[]
@@ -290,11 +326,11 @@ def sync_run(episode):
   else:
    try:deleted=sync_work.purge_local(cfg,episode,rec,lambda m:print(m,flush=True))
    except Exception as e:print('로컬 작업 파일 삭제 건너뜀:',e,flush=True)
-  write(d/'status.json',{'state':'success','episode':episode,'started':started,'pid':os.getpid(),'finished':time.time(),
+  write(d/'status.json',{**keep,'state':'success','episode':episode,'started':started,'pid':os.getpid(),'finished':time.time(),
                          'bytes':rec.get('bytes'),'paths':rec.get('paths'),'destination':rec.get('destination'),'local_deleted':deleted})
  except Exception as e:
   traceback.print_exc()
-  write(d/'status.json',{'state':'failed','episode':episode,'started':started,'pid':os.getpid(),'finished':time.time(),'error':str(e)[-600:]})
+  write(d/'status.json',{**keep,'state':'failed','episode':episode,'started':started,'pid':os.getpid(),'finished':time.time(),'error':str(e)[-600:]})
 
 # ---- 단계 초기화 (UI '단계 초기화 · 다시 실행'): 끝난 실행의 한 단계부터 결과를 보관하고 작업을 시작 전으로 되돌립니다 ----
 # NAS에서 작업 폴더를 되돌려 받을 수 있어(수 GB) 업로드처럼 별도 프로세스로 실행하고 reset-status로 확인합니다.

@@ -445,7 +445,7 @@ def resume_review_identity(pinned, identity, stage):
 
 def execute(stage, episode, run_id, config_path, sam_prompt='', sam_scene='2d', sam_confirmed=False, raw_episode=None,
             object_mode='text', object_bboxes=None, object_points=None, result_pc=None,
-            transfer_from=None, transfer_key=None, target_fps=30):
+            transfer_from=None, transfer_key=None, target_fps=30, defer_work_sync=False):
     # 처리 fps: 30(모든 프레임, 이 옵션이 생기기 전 실행과 같음) 또는 15(동기화된 프레임을 하나 걸러 하나 사용).
     if target_fps not in (15, 30):
         raise ValueError('Unsupported target fps')
@@ -616,7 +616,11 @@ def execute(stage, episode, run_id, config_path, sam_prompt='', sam_scene='2d', 
     elif stage == 'publish':
         result = publish_result(recon, cfg, episode, key, identity, receipt, result_pc,
                                 sam_target(project, scripts, episode, sam_prompt))
-        if check_project_mount(cfg):
+        if defer_work_sync:
+            # Worker(runner.py)가 이 작업이 끝난 직후 작업 폴더 미러링·로컬 정리를 백그라운드 업로드로 이어서 합니다.
+            # 최종 결과(results)는 위에서 이미 검증 저장됐으므로, 수 GB 미러링을 기다리지 않고 다음 에피소드로 넘어갑니다.
+            print('작업 폴더 NAS 미러링은 백그라운드 업로드로 넘깁니다.', flush=True)
+        elif check_project_mount(cfg):
             # 예전(NAS 작업 폴더) 방식과 같게: 이 에피소드의 단계별 작업 폴더 전체를 NAS work/<pc>에 미러링
             sys.path.insert(0, str(Path(__file__).resolve().parent))
             import sync_work
@@ -648,9 +652,12 @@ if __name__ == '__main__':
     p.add_argument('--object-bboxes', default=None, help='JSON {"0".."3": [x,y,w,h]} normalized')
     p.add_argument('--object-points', default=None, help='JSON {"0".."3": [[x,y,label],...]} normalized')
     p.add_argument('--fps', type=int, choices=[15, 30], default=30, help='처리 fps (30fps 촬영을 15fps로 줄여 처리)')
+    p.add_argument('--defer-work-sync', action='store_true',
+                   help='publish: 작업 폴더 NAS 미러링을 하지 않고 끝냄(Worker가 백그라운드 업로드로 이어서 함)')
     a = p.parse_args()
     result = execute(a.stage, a.episode, a.run_id, a.config, a.sam_prompt, a.sam_scene, a.sam_confirmed, a.raw_episode,
-                     a.object_mode, a.object_bboxes, a.object_points, a.result_pc, a.transfer_from, a.transfer_key, a.fps)
+                     a.object_mode, a.object_bboxes, a.object_points, a.result_pc, a.transfer_from, a.transfer_key, a.fps,
+                     a.defer_work_sync)
     print(json.dumps(result))
     if result is False:
         sys.exit(75)
