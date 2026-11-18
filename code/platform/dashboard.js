@@ -160,18 +160,19 @@ function dashRawRows(){
  const day=$('dashDate').value,pc=$('dashPc').value,all=$('dashRawAll').checked,q=$('dashRawText').value.trim().toLowerCase();
  return d.raws.filter(r=>(all||dashDay(r.at)===day)&&(!pc||r.pc===pc)&&(!q||r.episode.toLowerCase().includes(q)||String(r.object||'').toLowerCase().includes(q)));
 }
-const DASH_FPS=30;
+const DASH_FPS=30;   // 촬영(RAW) fps. 동기화 이후 단계는 실행의 처리 fps(15 또는 30)로 길이를 계산합니다.
+function dashStageSec(st,k){return st[k]==null?null:st[k]/(k==='raw'?DASH_FPS:(st.fps||DASH_FPS))}
 function dashSec(n){return n.toLocaleString(undefined,{maximumFractionDigits:1})+'초'}
 function dashRawStats(r){const v=r.cameras.map(c=>r.frames[c]).filter(n=>n!=null);return {min:v.length?Math.min(...v):null,max:v.length?Math.max(...v):null,missing:r.cameras.length-v.length}}
 function renderDashRaws(){
  if(dashData&&dashData.raws===null){$('dashRawHead').innerHTML='';$('dashRawInfo').textContent='';$('dashRawSum').innerHTML='';$('dashRaws').innerHTML='<tr><td class="dbEmpty">NAS RAW 폴더를 읽는 중입니다. 잠시 후 자동으로 표시됩니다.</td></tr>';clearTimeout(dashRawRetry);dashRawRetry=setTimeout(()=>{if(dashTimer)loadDash(true)},5000);return}
  const rows=dashRawRows(),idx=dashRunIndex(),pc=$('dashPc').value;
  const every=dashData.raws.filter(r=>!pc||r.pc===pc);
- const sum=(list,k)=>{let f=0,n=0;for(const r of list){const v=dashRawStages(r,idx)[k];if(v!=null){f+=v;n++}}return [f,n]};
+ const sum=(list,k)=>{let f=0,n=0,s=0;for(const r of list){const st=dashRawStages(r,idx),v=st[k];if(v!=null){f+=v;n++;s+=dashStageSec(st,k)}}return [f,n,s]};
  const scope=$('dashRawAll').checked?'모든 날짜':$('dashDate').value.slice(5).replace('-','/')+' 촬영';
- // 단계별 합계 카드: 큰 숫자 = 선택한 날짜(또는 모든 날짜)의 30fps 길이, 아래 = 프레임 · RAW 수 · 전체 누적
- $('dashRawSum').innerHTML=DASH_FSTAGES.map(([k,label])=>{const [f,n]=sum(rows,k),[af]=sum(every,k);
-  return '<div class="dbKpi"><span>'+label+'</span><b>'+dashSec(f/DASH_FPS)+'</b><small>'+f.toLocaleString()+'프레임 · '+n+'개<br>전체 누적 '+dashSec(af/DASH_FPS)+(af/DASH_FPS>=60?' ('+dashDur(af/DASH_FPS)+')':'')+'</small></div>'}).join('');
+ // 단계별 합계 카드: 큰 숫자 = 선택한 날짜(또는 모든 날짜)의 영상 길이(실행별 처리 fps 기준), 아래 = 프레임 · RAW 수 · 전체 누적
+ $('dashRawSum').innerHTML=DASH_FSTAGES.map(([k,label])=>{const [f,n,s]=sum(rows,k),as=sum(every,k)[2];
+  return '<div class="dbKpi"><span>'+label+'</span><b>'+dashSec(s)+'</b><small>'+f.toLocaleString()+'프레임 · '+n+'개<br>전체 누적 '+dashSec(as)+(as>=60?' ('+dashDur(as)+')':'')+'</small></div>'}).join('');
  const warn=rows.filter(r=>r.failed.length||dashRawStats(r).missing).length;
  $('dashRawInfo').textContent=rows.length+'개 RAW · '+scope+(pc?' · '+dashPcName(pc):'')+(warn?' · 카메라 누락 '+warn+'개':'');
  $('dashRawHead').innerHTML='<tr><th>촬영</th><th>RAW</th><th>대상</th>'+DASH_FSTAGES.map(([,label])=>'<th class="dbR">'+label+'</th>').join('')+'<th>PC</th></tr>';
@@ -179,7 +180,7 @@ function renderDashRaws(){
   const st=dashRawStages(r,idx),s=dashRawStats(r);
   const cams=r.cameras.map(c=>{const n=r.frames[c],bad=r.failed.includes(c)||n==null;return '<span'+(bad?' class="bad" title="'+escape(dashCamName(c))+': 촬영 실패 또는 프레임 정보 없음"':' title="'+escape(dashCamName(c))+'"')+'>'+(n==null?'×':n)+'</span>'}).join(' / ');
   const cell=(k)=>{const v=st[k];if(v==null)return '<td class="dbR zero">—</td>';
-   let sub=dashSec(v/DASH_FPS);
+   let sub=dashSec(dashStageSec(st,k))+(k==='synced'&&st.fps&&st.fps!==DASH_FPS?' · '+st.fps+'fps':'');
    if(k==='raw')sub+=(s.max!==s.min?' · 최대 '+s.max:'')+'<br>'+cams;
    if(k==='masks'&&st.object!=null&&st.object<v)sub+='<br>물체 '+st.object;
    return '<td class="dbR"><b>'+v.toLocaleString()+'</b><span class="dbSub">'+sub+'</span></td>'};
@@ -199,7 +200,7 @@ function dashRunIndex(){
  // 출력 에피소드(실행)별: 단계 프레임 수(여러 PC 기록 합침) + 성공한 단계 + 실행한 PC
  const d=dashData,runs=new Map();
  const get=ep=>{let x=runs.get(ep);if(!x){x={episode:ep,raw:dashRawOf(ep),done:new Set(),pc:null,at:0};runs.set(ep,x)}return x};
- for(const f of d.frames||[]){const x=get(f.episode);if(f.raw_episode)x.raw=f.raw_episode;for(const k of ['synced','prepared','masks','object_frames'])if(f[k]!=null)x[k]=f[k];x.pc=x.pc||f.pc}
+ for(const f of d.frames||[]){const x=get(f.episode);if(f.raw_episode)x.raw=f.raw_episode;for(const k of ['synced','prepared','masks','object_frames','fps'])if(f[k]!=null)x[k]=f[k];x.pc=x.pc||f.pc}
  for(const j of d.jobs||[]){if(!j.episode)continue;const x=get(j.episode);if(j.state==='success')x.done.add(j.stage);x.at=Math.max(x.at,j.started||0);if(j.stage==='prepare_raw')x.pc=j.pc}
  for(const p of d.published||[]){if(p.episode&&runs.has(p.episode))runs.get(p.episode).done.add('publish')}
  const byRaw=new Map();
@@ -212,7 +213,7 @@ function dashRawStages(r,idx){
  // 가장 멀리 진행한 실행을 보여 줍니다(같으면 최근 실행).
  const reach=x=>{let n=x.prepared!=null?3:x.synced!=null?2:0;if(x.masks!=null)n=4;['track','reconstruct','hands','publish'].forEach((k,i)=>{if(x.done.has(k))n=Math.max(n,5+i)});return n};
  const best=[...list].sort((a,b)=>reach(b)-reach(a)||b.at-a.at)[0];
- Object.assign(out,{synced:best.synced,prepared:best.prepared,masks:best.masks,object:best.object_frames,run:best.episode,pc:best.pc});
+ Object.assign(out,{synced:best.synced,prepared:best.prepared,masks:best.masks,object:best.object_frames,fps:best.fps||DASH_FPS,run:best.episode,pc:best.pc});
  for(const [k,stage] of Object.entries(DASH_FDONE))if(best.done.has(stage)&&best.prepared!=null)out[k]=best.prepared;
  return out;
 }
@@ -350,10 +351,10 @@ $('dashRawCsv').onclick=()=>{
  const rows=dashRawRows();if(!rows.length)return;
  const cams=[...new Set(rows.flatMap(r=>r.cameras))].sort((a,b)=>(+String(a).replace(/\D/g,'')||0)-(+String(b).replace(/\D/g,'')||0));
  const cell=v=>{v=v==null?'':String(v);return /[",\n]/.test(v)?'"'+v.replace(/"/g,'""')+'"':v};
- const idx=dashRunIndex(),sec=v=>v==null?'':Math.round(v/DASH_FPS*100)/100;
- const head=['episode','captured','object','interaction',...cams,'raw_max','duration_sec','failed_cameras',...DASH_FSTAGES.flatMap(([k])=>[k+'_frames',k+'_sec_30fps']),'mask_object_frames','run','pc','source'];
+ const idx=dashRunIndex(),sec=(st,k)=>st[k]==null?'':Math.round(dashStageSec(st,k)*100)/100;
+ const head=['episode','captured','object','interaction',...cams,'raw_max','duration_sec','failed_cameras',...DASH_FSTAGES.flatMap(([k])=>[k+'_frames',k+'_sec']),'mask_object_frames','process_fps','run','pc','source'];
  const lines=[head.join(',')].concat(rows.map(r=>{const s=dashRawStats(r),st=dashRawStages(r,idx);return [r.episode,new Date(r.at*1000).toLocaleString('sv-SE'),r.object,r.interaction,...cams.map(c=>r.frames[c]),
-  s.max,r.duration!=null?Math.round(r.duration*10)/10:'',r.failed.join(' '),...DASH_FSTAGES.flatMap(([k])=>[st[k],sec(st[k])]),st.object,st.run,st.pc||r.pc,r.source].map(cell).join(',')}));
+  s.max,r.duration!=null?Math.round(r.duration*10)/10:'',r.failed.join(' '),...DASH_FSTAGES.flatMap(([k])=>[st[k],sec(st,k)]),st.object,st.runs?st.fps:'',st.run,st.pc||r.pc,r.source].map(cell).join(',')}));
  const a=document.createElement('a');a.href=URL.createObjectURL(new Blob(['﻿'+lines.join('\n')],{type:'text/csv'}));a.download='kaist_raw_frames_'+($('dashRawAll').checked?'all':$('dashDate').value)+'.csv';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),5000);
 };
 document.querySelectorAll('[data-dash-tab]').forEach(b=>b.onclick=()=>dashSetTab(b.dataset.dashTab));

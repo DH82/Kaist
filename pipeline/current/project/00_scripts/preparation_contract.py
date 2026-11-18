@@ -9,10 +9,18 @@ def sha(p):
   for block in iter(lambda:f.read(1024*1024),b''):h.update(block)
  return h.hexdigest()
 
-def contract(raw_fingerprint,scripts,source):
+FPS_CHOICES=(15.,30.)
+def prepared_fps(case):
+ """Target fps recorded for an existing prepared case (30 for cases made before the option existed)."""
+ try:return float(json.loads((Path(case)/'preparation.json').read_text())['contract']['settings']['fps'])
+ except (OSError,ValueError,KeyError,TypeError):return SETTINGS['fps']
+
+def contract(raw_fingerprint,scripts,source,fps=None):
+ fps=SETTINGS['fps'] if fps is None else float(fps)
+ if fps not in FPS_CHOICES:raise ValueError('Unsupported target fps: '+str(fps))
  files=[(scripts/n) for n in ['pipeline.py','raw_io.py','process_input_worker.py','preparation_contract.py','sync_mapping.py']]+[source/'data_process'/n for n in ['preprocess_rgbd.py','trim_exposure.py','sync_mapping.py']]
  if (scripts/'sync_mapping.py').read_bytes()!=(source/'data_process/sync_mapping.py').read_bytes():raise ValueError('QC/preprocess mapping code differs')
- return {'schema_version':2,'raw_fingerprint':raw_fingerprint,'settings':SETTINGS,'code':{('operator/' if f.parent==scripts else 'data_process/')+f.name:sha(f) for f in files}}
+ return {'schema_version':2,'raw_fingerprint':raw_fingerprint,'settings':{**SETTINGS,'fps':fps},'code':{('operator/' if f.parent==scripts else 'data_process/')+f.name:sha(f) for f in files}}
 
 def outputs(case):
  records=[]

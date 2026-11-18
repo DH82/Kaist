@@ -1,4 +1,4 @@
-import base64,hashlib,json,os,secrets,subprocess,sys,threading,time
+import base64,hashlib,json,os,secrets,sqlite3,subprocess,sys,threading,time
 from contextlib import asynccontextmanager
 import asyncio
 from functools import lru_cache
@@ -372,6 +372,7 @@ class Launch(BaseModel):
  sam_object_mode:str='text'
  sam_object_bboxes:dict|None=None
  sam_object_points:dict|None=None
+ target_fps:int=15  # 처리 fps: 15(기본 · 30fps 촬영에서 프레임을 하나 걸러 하나 사용) 또는 30(모든 프레임)
  prep:bool=False  # True: RAW 전처리만 하고 'SAM3 설정 대기'에서 멈춤(분할 대상은 나중에 입력)
 
 gpu_cache={}
@@ -586,6 +587,7 @@ def _launch(data,req,bypass_limit=False):
    if data.mode=='pipeline' and not data.prep and data.preview_episode!=data.episode_id:raise HTTPException(400,'선택한 에피소드 이미지를 먼저 확인하세요.')
    if data.mode=='pipeline' and not data.prep and (not data.episode_id or not data.sam_prompt.strip() or not data.confirmed):raise HTTPException(400,'에피소드와 SAM3 대상을 입력하고 설정을 확인하세요.')
    if data.sam_object_mode not in ('text','bbox_track','point_track'):raise HTTPException(400,'물체 분할 방식을 확인하세요.')
+   if data.target_fps not in (15,30):raise HTTPException(400,'처리 fps는 15 또는 30만 선택할 수 있습니다.')
    bboxes=object_bboxes(data.sam_object_bboxes) if data.mode=='pipeline' and data.sam_object_mode=='bbox_track' else None
    points=object_points(data.sam_object_points) if data.mode=='pipeline' and data.sam_object_mode=='point_track' else None
    # Validate against live server episode list; no arbitrary path input.
@@ -603,7 +605,7 @@ def _launch(data,req,bypass_limit=False):
     if json.loads(assignment['metadata']).get('source')=='manual_nas_copy':
      actual=call('GET','/worker/intake/fingerprint',params={'episode':data.episode_id},worker_id=data.worker_id,timeout=600)['fingerprint']
     if actual!=expected:raise HTTPException(409,'GPU PC가 같은 NAS 에피소드를 읽는지 확인되지 않았습니다. Worker 업데이트와 NAS 마운트를 확인하세요.')
-   conf={'episode_id':data.episode_id,'operator_id':access.user(req)['name'],'worker_id':data.worker_id}
+   conf={'episode_id':data.episode_id,'operator_id':access.user(req)['name'],'worker_id':data.worker_id,'target_fps':data.target_fps}
    if data.mode=='pipeline' and data.prep:conf.update(sam_prompt='',sam_scene='2d',sam_settings_confirmed=False)
    elif data.mode=='pipeline':conf.update(sam_prompt=data.sam_prompt.strip(),sam_scene='2d',sam_settings_confirmed=True)
    if bboxes:conf.update(sam_object_mode='bbox_track',sam_object_bboxes=bboxes)
@@ -2073,10 +2075,12 @@ def _read_json(p):
 def _int(v):return v if isinstance(v,int) and not isinstance(v,bool) and v>=0 else None
 
 def stage_frames(root,ep):
- """{synced,prepared,masks,object_frames} 중 작업 폴더에서 확인된 값만."""
+ """{synced,prepared,masks,object_frames,fps} 중 작업 폴더에서 확인된 값만. fps=처리 fps(전처리 기록, 15 또는 30)."""
  out={}
  trim=_read_json(root/'03_prepared'/ep/'trim.json') or {}
  prep=_read_json(root/'03_prepared'/ep/'preparation.json') or {}
+ try:out['fps']=int(prep['contract']['settings']['fps'])
+ except (KeyError,TypeError,ValueError):pass
  if _int(trim.get('before')) is not None:out['synced']=trim['before']
  if _int(prep.get('frames')) is not None:out['prepared']=prep['frames']
  elif _int(trim.get('after')) is not None:out['prepared']=trim['after']
@@ -2094,6 +2098,9 @@ def stage_frames(root,ep):
 def frames_db():
  c=access.db()
  c.execute('CREATE TABLE IF NOT EXISTS episode_frames (episode TEXT PRIMARY KEY,raw_episode TEXT,synced INTEGER,prepared INTEGER,masks INTEGER,object_frames INTEGER,at REAL)')
+ if 'fps' not in {r[1] for r in c.execute('PRAGMA table_info(episode_frames)')}:
+  try:c.execute('ALTER TABLE episode_frames ADD COLUMN fps INTEGER')   # 처리 fps. 없으면(이전 기록) 30
+  except sqlite3.OperationalError:pass
  return c
 
 def episode_frame_rows(job_eps=()):
@@ -2110,12 +2117,12 @@ def episode_frame_rows(job_eps=()):
    for ep,raw in runs.items():
     if not ep or not re.fullmatch(r'ep_[A-Za-z0-9_]+',ep):continue
     f=stage_frames(root,ep)
-    if not f:continue
+    if not set(f)-{'fps'}:continue
     # 값이 없어진 단계(작업 폴더 정리)는 이전 기록을 유지합니다.
-    c.execute('INSERT INTO episode_frames VALUES(?,?,?,?,?,?,?) ON CONFLICT(episode) DO UPDATE SET raw_episode=COALESCE(excluded.raw_episode,raw_episode),'
+    c.execute('INSERT INTO episode_frames(episode,raw_episode,synced,prepared,masks,object_frames,at,fps) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(episode) DO UPDATE SET raw_episode=COALESCE(excluded.raw_episode,raw_episode),'
               'synced=COALESCE(excluded.synced,synced),prepared=COALESCE(excluded.prepared,prepared),masks=COALESCE(excluded.masks,masks),'
-              'object_frames=COALESCE(excluded.object_frames,object_frames),at=excluded.at',
-              (ep,raw,f.get('synced'),f.get('prepared'),f.get('masks'),f.get('object_frames'),time.time()))
+              'object_frames=COALESCE(excluded.object_frames,object_frames),at=excluded.at,fps=COALESCE(excluded.fps,fps)',
+              (ep,raw,f.get('synced'),f.get('prepared'),f.get('masks'),f.get('object_frames'),time.time(),f.get('fps')))
  with frames_db() as c:
   return [dict(r) for r in c.execute('SELECT * FROM episode_frames')]
 
@@ -2486,6 +2493,7 @@ class BatchPrep(BaseModel):
  worker_id:str=DEFAULT_WORKER
  episodes:list[str]=Field(min_length=1,max_length=30)
  defer_mano:bool=False
+ target_fps:int=15
 
 @app.post('/api/run/batch-prep')
 def batch_prep(data:BatchPrep,req:Request):
@@ -2495,7 +2503,7 @@ def batch_prep(data:BatchPrep,req:Request):
  for ep in dict.fromkeys(data.episodes):
   if not re.fullmatch(r'ep_[A-Za-z0-9_]+',ep):failed.append({'episode':ep,'error':'에피소드 이름이 잘못되었습니다.'});continue
   try:
-   r=launch(Launch(worker_id=data.worker_id,mode='pipeline',episode_id=ep,prep=True,defer_mano=data.defer_mano),req)
+   r=launch(Launch(worker_id=data.worker_id,mode='pipeline',episode_id=ep,prep=True,defer_mano=data.defer_mano,target_fps=data.target_fps),req)
    started.append({'raw':ep,'episode':r['episode'],'run_id':r['run_id'],'dag_id':r['dag_id']})
   except HTTPException as e:failed.append({'episode':ep,'error':str(e.detail)})
  access.audit(req,'batch-prep '+','.join(x['raw'] for x in started))
@@ -2559,6 +2567,10 @@ def cont_db():
  c.execute('CREATE TABLE IF NOT EXISTS sam_queue (id INTEGER PRIMARY KEY AUTOINCREMENT,raw_episode TEXT NOT NULL,operator TEXT NOT NULL,worker_id TEXT NOT NULL,'
            'sam_prompt TEXT NOT NULL,points TEXT NOT NULL,defer_mano INTEGER NOT NULL DEFAULT 0,created REAL NOT NULL,state TEXT NOT NULL,'
            'run_id TEXT,dag_id TEXT,episode TEXT,error TEXT,started REAL)')
+ # 처리 fps(15/30). 이 열이 생기기 전에 넣어 둔 대기 항목은 기본값 15로 실행됩니다.
+ if 'target_fps' not in {r[1] for r in c.execute('PRAGMA table_info(sam_queue)')}:
+  try:c.execute('ALTER TABLE sam_queue ADD COLUMN target_fps INTEGER NOT NULL DEFAULT 15')
+  except sqlite3.OperationalError:pass   # 다른 스레드가 방금 추가함
  return c
 
 def my_distributed():
@@ -2585,16 +2597,22 @@ def raw_object(ep,cache=None):
  obj=meta.get('object') or {}
  return obj.get('name') or obj.get('label') or obj.get('prompt') or (meta.get('task') or {}).get('taskName')
 
-def cont_busy(c):
- """연속 모드로 시작한 실행 중 RAW 전처리~SAM3 단계에 있는 것이 있으면 True(확인할 수 없어도 기다림)."""
- for r in c.execute("SELECT run_id,dag_id FROM sam_queue WHERE state='started' AND started>?",(time.time()-2*86400,)).fetchall():
+def cont_settle(c):
+ """연속 모드로 시작한 실행(state='started')을 확인해, 연속 모드가 맡은 구간(RAW 전처리~SAM3)이 끝났거나 실행이 끝난 것은
+ 'done'으로 바꿔 대기열 목록에서 내립니다(이후 진행은 작업 현황·검수 목록에서 봅니다).
+ 반환: 아직 그 구간에 있는 실행이 있으면 True(확인할 수 없어도 True → 다음 실행을 시작하지 않고 기다림)."""
+ busy=False;done=[]
+ for r in c.execute("SELECT id,run_id,dag_id,started FROM sam_queue WHERE state='started'").fetchall():
+  if (r['started'] or 0)<time.time()-2*86400:done.append(r['id']);continue   # 오래된 기록은 조회 없이 정리
   try:
    run=local_api('GET',f"/api/v2/dags/{r['dag_id']}/dagRuns/"+quote(r['run_id'],safe=''))
-   if run['state'] not in ('queued','running'):continue
+   if run['state'] not in ('queued','running'):done.append(r['id']);continue
    stage,state=current_stage(r['dag_id'],r['run_id'])
-  except Exception:return True
-  if stage in CONT_BUSY_STAGES and state not in ('failed','upstream_failed'):return True
- return False
+  except Exception:busy=True;continue
+  if stage in CONT_BUSY_STAGES and state not in ('failed','upstream_failed'):busy=True
+  else:done.append(r['id'])
+ if done:c.executemany("UPDATE sam_queue SET state='done' WHERE id=? AND state='started'",[(i,) for i in done])
+ return busy
 
 def cont_fail(row_id,msg):
  with cont_db() as c:c.execute("UPDATE sam_queue SET state='failed',error=? WHERE id=?",(str(msg)[:500],row_id))
@@ -2603,8 +2621,9 @@ def cont_tick():
  if not _cont_lock.acquire(blocking=False):return
  try:
   with cont_db() as c:
+   busy=cont_settle(c)   # 대기 항목이 없어도 끝난 실행은 목록에서 내립니다.
    nxt=c.execute("SELECT * FROM sam_queue WHERE state='waiting' AND worker_id=? ORDER BY created,id LIMIT 1",(DEFAULT_WORKER,)).fetchone()
-   if not nxt or cont_busy(c):return
+   if not nxt or busy:return
   try:update_block()
   except HTTPException:return   # 업데이트 대기 중: 끝나면 이어서 시작
   ep,op=nxt['raw_episode'],nxt['operator']
@@ -2618,7 +2637,8 @@ def cont_tick():
   tok=access.login(op,'admin')
   try:
    res=_launch(Launch(mode='pipeline',worker_id=nxt['worker_id'],episode_id=ep,sam_prompt=nxt['sam_prompt'],confirmed=True,preview_episode=ep,
-                      defer_mano=bool(nxt['defer_mano']),sam_object_mode='point_track',sam_object_points=json.loads(nxt['points'])),
+                      defer_mano=bool(nxt['defer_mano']),sam_object_mode='point_track',sam_object_points=json.loads(nxt['points']),
+                      target_fps=nxt['target_fps']),
                internal_request(tok),bypass_limit=True)
   except HTTPException as e:
    if e.status_code==503:return
@@ -2645,8 +2665,10 @@ def cont_status(req:Request):
  if wid!=DEFAULT_WORKER:return {'available':False}
  me=u['name'];own=access.owners();assigned=access.assignments();dist=my_distributed();excluded=access.excluded_raw(me,wid)
  with cont_db() as c:
-  rows=[dict(r) for r in c.execute("SELECT id,raw_episode,operator,sam_prompt,state,run_id,dag_id,episode,error,created,started FROM sam_queue "
-                                  "WHERE worker_id=? AND (state IN ('waiting','failed') OR (state='started' AND started>?)) ORDER BY created,id",(wid,time.time()-86400))]
+  rows=[dict(r) for r in c.execute("SELECT id,raw_episode,operator,sam_prompt,state,run_id,dag_id,episode,error,created,started,target_fps FROM sam_queue "
+                                  "WHERE worker_id=? AND state IN ('waiting','failed','started') ORDER BY created,id",(wid,))]
+  # 목록에는 대기·시작 실패·RAW 전처리~SAM3 진행 중인 것만 둡니다. SAM3까지 끝난 실행(state='done')은 개수만 셉니다.
+  started_today=c.execute("SELECT COUNT(*) FROM sam_queue WHERE worker_id=? AND state IN ('started','done') AND started>?",(wid,time.time()-86400)).fetchone()[0]
  active={r['raw_episode'] for r in rows if r['state'] in ('waiting','failed')}
  try:raws=set(call('GET','/worker/info',worker_id=wid)['episodes'])
  except Exception:raws=None
@@ -2658,7 +2680,7 @@ def cont_status(req:Request):
  for r in rows:
   if r['state']=='waiting':n+=1;r['position']=n
   r['mine']=r['operator']==me or u['role']=='admin'
- # 오늘 시작한 실행은 최근 8개만 현재 단계를 붙입니다(Airflow 조회 수 제한).
+ # 진행 중인 실행에 현재 단계를 붙입니다(최근 8개까지 · Airflow 조회 수 제한).
  for r in reversed(rows):
   if r['state']!='started' or shown>=8:continue
   shown+=1
@@ -2671,7 +2693,7 @@ def cont_status(req:Request):
     r['stage']=(JOB_STAGE_LABELS.get(stage,stage or '실행 대기'))+(' · 검수 대기' if stage in WAIT_STAGES[1:] else ' · 실패' if state=='failed' else '')
   except Exception:r['stage']=None
  return {'available':True,'me':me,'todo':[{'episode':ep,'object':raw_object(ep,cache) if i<1 or ep in cache else None} for i,ep in enumerate(todo)],
-         'queue':rows,'distributed':len(dist),'busy_stages':list(CONT_BUSY_STAGES)}
+         'queue':rows,'started_today':started_today,'distributed':len(dist),'busy_stages':list(CONT_BUSY_STAGES)}
 
 JOB_STAGE_LABELS={'prepare_raw':'RAW 전처리','sam_settings_ready':'분할 설정 확인','sam3':'SAM3','mask_approved':'마스크 검수','preflight':'추적 사전 검사','track':'추적',
                   'tracking_approved':'추적 검수','prepare_reconstruction':'복원 준비','reconstruct':'3D 복원','hands':'MANO 피팅','validate':'결과 검사','publish':'최종 저장'}
@@ -2687,11 +2709,13 @@ class ContSubmit(BaseModel):
  sam_prompt:str=Field(min_length=1,max_length=200)
  points:dict
  defer_mano:bool=False
+ target_fps:int=15
 
 @app.post('/api/continuous/submit')
 def cont_submit(data:ContSubmit,req:Request):
  guard(req);u=access.user(req);wid=DEFAULT_WORKER;ep=data.episode
  points=object_points(data.points)
+ if data.target_fps not in (15,30):raise HTTPException(400,'처리 fps는 15 또는 30만 선택할 수 있습니다.')
  if data.defer_mano and wid!=DEFAULT_WORKER:raise HTTPException(400,'MANO 나중에 실행은 이 PC에서만 선택할 수 있습니다.')
  if access.owners().get(ep):raise HTTPException(409,'이미 실행을 시작한 RAW입니다.')
  if not raw_startable(req,ep,wid):raise HTTPException(403,'나에게 분배·배정된 RAW가 아닙니다. 목록을 새로고침하세요.')
@@ -2702,8 +2726,8 @@ def cont_submit(data:ContSubmit,req:Request):
  with cont_db() as c:
   c.execute('BEGIN IMMEDIATE')
   if c.execute("SELECT 1 FROM sam_queue WHERE raw_episode=? AND state IN ('waiting','failed')",(ep,)).fetchone():raise HTTPException(409,'이미 연속 모드 대기열에 있는 RAW입니다.')
-  c.execute("INSERT INTO sam_queue(raw_episode,operator,worker_id,sam_prompt,points,defer_mano,created,state) VALUES(?,?,?,?,?,?,?,'waiting')",
-            (ep,u['name'],wid,data.sam_prompt.strip(),json.dumps(points),int(data.defer_mano),time.time()))
+  c.execute("INSERT INTO sam_queue(raw_episode,operator,worker_id,sam_prompt,points,defer_mano,created,state,target_fps) VALUES(?,?,?,?,?,?,?,'waiting',?)",
+            (ep,u['name'],wid,data.sam_prompt.strip(),json.dumps(points),int(data.defer_mano),time.time(),data.target_fps))
  access.audit(req,'continuous submit '+ep+' '+data.sam_prompt.strip())
  cont_kick()
  return {'ok':True}

@@ -31,7 +31,7 @@ CREATE TABLE commands (id TEXT PRIMARY KEY, type TEXT, episode TEXT, run_id TEXT
 CREATE TABLE assignments (episode TEXT PRIMARY KEY, operator TEXT);
 CREATE TABLE jobs (run_id TEXT, episode TEXT, stage TEXT, state TEXT, operator TEXT, sam_prompt TEXT,
                    created REAL, started REAL, finished REAL, attempt INTEGER);
-CREATE TABLE frames (episode TEXT, raw_episode TEXT, synced INTEGER, prepared INTEGER, masks INTEGER, object_frames INTEGER, at REAL);
+CREATE TABLE frames (episode TEXT, raw_episode TEXT, synced INTEGER, prepared INTEGER, masks INTEGER, object_frames INTEGER, at REAL, fps INTEGER);
 """
 TABLES = ('gpu', 'runs', 'mano_waiting', 'published', 'commands', 'assignments', 'jobs', 'frames')
 

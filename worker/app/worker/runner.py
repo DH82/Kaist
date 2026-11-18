@@ -21,6 +21,8 @@ def folder(req):
  if (req['stage']=='adopt')!=('transfer_from' in req) or ('transfer_from' in req)!=('transfer_key' in req):raise ValueError('Invalid transfer request')
  if 'transfer_from' in req and (not re.fullmatch('pc[1-6]',str(req['transfer_from'])) or not re.fullmatch('[0-9a-f]{24}',str(req['transfer_key']))):raise ValueError('Invalid transfer source')
  if 'result_pc' in req and (req['stage']!='publish' or not re.fullmatch('pc[1-6]',str(req['result_pc']))):raise ValueError('Invalid result PC')
+ # 처리 fps: 15fps 실행만 target_fps=15를 함께 보냅니다. 키가 없으면 30fps(기존 요청·작업 폴더 그대로).
+ if 'target_fps' in req and req['target_fps']!=15:raise ValueError('Invalid target fps')
  if 'sam_object_bboxes' in req and len(json.dumps(req['sam_object_bboxes']))>1000:raise ValueError('Invalid SAM object bbox')
  if 'sam_object_points' in req and len(json.dumps(req['sam_object_points']))>6000:raise ValueError('Invalid SAM object points')
  return JOBS/hashlib.sha256((req['run_id']+'\0'+req['episode']+'\0'+req['stage']).encode()).hexdigest()[:32]
@@ -99,6 +101,7 @@ def run(p):
    if req.get('result_pc'):cmd.extend(['--result-pc',req['result_pc']])
    if req.get('transfer_from'):cmd.extend(['--transfer-from',req['transfer_from'],'--transfer-key',req['transfer_key']])
    if req.get('sam_confirmed',False):cmd.append('--sam-confirmed')
+   if req.get('target_fps'):cmd.extend(['--fps',str(req['target_fps'])])
    if req.get('sam_object_mode')=='point_track':cmd.extend(['--object-mode','point_track','--object-points',json.dumps(req['sam_object_points'])])
    elif req.get('sam_object_mode'):cmd.extend(['--object-mode',req['sam_object_mode'],'--object-bboxes',json.dumps(req['sam_object_bboxes'])])
    print('WORKER stage='+req['stage']+' episode='+req['episode']+' run='+req['run_id']+' gpu_slot='+str(slot),flush=True)

@@ -72,8 +72,16 @@ def copy_raw(p,inputs):
    else:raw.stage_copy(src,dest,rec)
    save(manifest(p,src.name),rec);print('RAW:',dest)
  overview(p)
-def run_qc(p,ep,new=False,open_setup=True):
+DEFAULT_FPS=15.  # 30fps 촬영을 15fps로 줄여 처리(동기화된 프레임을 하나 걸러 하나 사용). 30을 주면 모든 프레임을 씁니다.
+def target_fps(p,ep,fps=None,new=False):
+ """요청한 처리 fps. 지정하지 않으면 이미 전처리된 결과의 fps를 따르고, 처음이면 DEFAULT_FPS입니다."""
+ from preparation_contract import prepared_fps
+ dest=p/'03_prepared'/ep
+ if fps is None:return prepared_fps(dest) if (dest/'preparation.json').exists() and not new else DEFAULT_FPS
+ return float(fps)
+def run_qc(p,ep,new=False,open_setup=True,fps=None):
  from qc_review_ui import page as qc_page
+ fps=target_fps(p,ep,fps,new)
  rec=verify_raw(p,ep);out=p/'02_qc'/ep
  if (out/'operator_review.json').exists() and load(out/'operator_review.json')['decision']=='reject':raise ValueError('Operator hold: resolve the review before rerunning')
  archive(p,out);out.mkdir(parents=True)
@@ -86,7 +94,7 @@ def run_qc(p,ep,new=False,open_setup=True):
  # Keep the existing QC thresholds; record the exact preprocessing timeline separately.
  from sync_mapping import source_mapping
  try:
-  mapping=source_mapping(source,[f'cam_{c}' for c in range(1,5)])
+  mapping=source_mapping(source,[f'cam_{c}' for c in range(1,5)],fps=fps)
   save(out/'source_frames_pretrim.json',mapping)
   res['timeline']={'policy':mapping['policy'],'reference_camera':mapping['reference_camera'],'frames':len(mapping['frames']),'mapping':'source_frames_pretrim.json','sync_tol_ms':mapping['sync_tol_ms'],'exposure_semantics':mapping['exposure_semantics']}
   res['sync_gate_semantics']='Legacy sampled host-offset diagnostic; thresholds unchanged. See shared preprocessing mapping for exported frame identities. PASS does not certify simultaneous exposure.'
@@ -94,7 +102,7 @@ def run_qc(p,ep,new=False,open_setup=True):
  save(out/'qc.json',res);save(out/'provenance.json',{'episode':ep,'mode':'raw','root_relative':'../..','case_relative':f'01_raw/{ep}','project_relative':'../..','qc_sha256':sha(out/'qc.json'),'input_fingerprint':rec})
  (out/'report.html').write_text(qc_page(ep,source,out,res));overview(p);print('QC:',res['overall'],out/'report.html')
  if res['overall'] not in ('PASS','WARN'):raise ValueError('QC failed. Preprocessing not started.')
- prepare(p,ep,new)
+ prepare(p,ep,new,fps)
  if not open_setup:return
  command=['/usr/bin/python3',str(HERE/'sam_local_setup.py'),str(p/'03_prepared'/ep),'--confirm-only']
  result=subprocess.run(command)
@@ -108,18 +116,19 @@ def prepared_page(p,ep):
  review_page(p/'03_prepared'/ep,settings)
  print(f'다음 작업(사람): python3 {HERE}/sam_local_setup.py {p}/03_prepared/{ep}')
  d=p/'03_prepared'/ep;r=load(d/'preparation.json');tr=load(d/'trim.json')
- (d/'index.html').write_text(page(ep+' · 전처리 완료',f'<p>{r["frames"]}프레임 · SAM3 실행 전</p><p>앞 {tr["trim_start"]} / 뒤 {tr["trim_end"]} 제거. 중간 후보 {tr["middle_bad"]} 유지.</p><p><a href="sam3_setup.html">다음: 대표 RGB 확인 · 물체 프롬프트 / 장면 유형 설정</a></p><a href="trim.json">노출 처리 기록</a> · <a href="preparation.json">전처리 기록</a>'))
-def prepare(p,ep,new=False):
+ (d/'index.html').write_text(page(ep+' · 전처리 완료',f'<p>{r["frames"]}프레임 · {r["contract"]["settings"]["fps"]:g}fps · SAM3 실행 전</p><p>앞 {tr["trim_start"]} / 뒤 {tr["trim_end"]} 제거. 중간 후보 {tr["middle_bad"]} 유지.</p><p><a href="sam3_setup.html">다음: 대표 RGB 확인 · 물체 프롬프트 / 장면 유형 설정</a></p><a href="trim.json">노출 처리 기록</a> · <a href="preparation.json">전처리 기록</a>'))
+def prepare(p,ep,new=False,fps=None):
+ fps=target_fps(p,ep,fps,new)
  fp=gate(p,ep);dest=p/'03_prepared'/ep
  root,source,env=runtime()
  from preparation_contract import contract,outputs,verify
- expected=contract(fp,HERE,source)
+ expected=contract(fp,HERE,source,fps)
  if (dest/'preparation.json').exists() and not new:
   verify(dest,expected)
   prepared_page(p,ep);print('Existing prepared:',dest);return
  root,source,env=runtime();P=str(root/'phystwin-env/bin/python');job=stamp();stage=p/'99_history/staging'/job;case=stage/ep;stage.mkdir(parents=True)
  try:
-  execute([P,'data_process/preprocess_rgbd.py','--src',str(p/'01_raw'/ep),'--out',str(stage),'--case_name',ep],stage/'03.log',source,env)
+  execute([P,'data_process/preprocess_rgbd.py','--src',str(p/'01_raw'/ep),'--out',str(stage),'--case_name',ep,'--fps',format(fps,'g')],stage/'03.log',source,env)
   execute([P,str(HERE/'process_input_worker.py'),'trim',str(case),'--source',str(source),'--out',str(case)],stage/'04.log',source,env)
   execute([P,str(HERE/'process_input_worker.py'),'validate',str(case)],stage/'04.log',source,env)
   save(case/'preparation.json',{'status':'preprocessed','episode':ep,'input_fingerprint':fp,'job':job,'frames':load(case/'metadata.json')['frame_num'],'contract':expected,'outputs':outputs(case)})
@@ -132,8 +141,8 @@ def sam3(p,ep,new=False):
  started=time.monotonic()
  fp=gate(p,ep);prepared=p/'03_prepared'/ep;rec=load(prepared/'preparation.json')
  if rec['status']!='preprocessed' or rec['input_fingerprint']!=fp:raise ValueError('Prepared data not valid')
- from preparation_contract import contract,verify
- _,source,_=runtime();verify(prepared,contract(fp,HERE,source))
+ from preparation_contract import contract,verify,prepared_fps
+ _,source,_=runtime();verify(prepared,contract(fp,HERE,source,prepared_fps(prepared)))
  dest=episode_root(p,ep)
  if (dest/'review/approved.json').exists() and not new:
   print('이미 승인된 에피소드입니다. 다음 단계: 07_track.py',dest);return
@@ -190,7 +199,7 @@ def targets(p,values,stage):
  return found
 
 def main(stage):
- parser=argparse.ArgumentParser(description={'01':'RAW 보존 복사','02':'QC 후 전처리까지만 실행','03':'전처리만 실행','05':'SAM3.1 별도 실행'}[stage]);parser.add_argument('input',nargs='*',type=Path);parser.add_argument('--project',type=Path,default=PROJECT);parser.add_argument('--new-attempt',action='store_true');parser.add_argument('--list-only',action='store_true');a=parser.parse_args();p=a.project.expanduser().resolve()
+ parser=argparse.ArgumentParser(description={'01':'RAW 보존 복사','02':'QC 후 전처리까지만 실행','03':'전처리만 실행','05':'SAM3.1 별도 실행'}[stage]);parser.add_argument('input',nargs='*',type=Path);parser.add_argument('--project',type=Path,default=PROJECT);parser.add_argument('--new-attempt',action='store_true');parser.add_argument('--fps',type=float,choices=[15.,30.],default=None,help='처리 fps (02·03 단계). 기본: 기존 전처리 결과의 값, 처음이면 15');parser.add_argument('--list-only',action='store_true');a=parser.parse_args();p=a.project.expanduser().resolve()
  try:
   if a.list_only:
    if stage=='01':
@@ -205,6 +214,6 @@ def main(stage):
     if not a.input:raise ValueError('RAW input required')
     copy_raw(p,a.input)
    else:
-    for ep in targets(p,a.input,stage):{'02':run_qc,'03':prepare,'05':sam3}[stage](p,ep,a.new_attempt)
+    for ep in targets(p,a.input,stage):{'02':run_qc,'03':prepare,'05':sam3}[stage](p,ep,a.new_attempt,**({'fps':a.fps} if stage in ('02','03') else {}))
   return 0
  except (ValueError,OSError,KeyError,subprocess.SubprocessError) as ex:print('중단:',ex,file=sys.stderr);return 1

@@ -289,9 +289,9 @@ def sam3(pipeline, p, ep, new=False, object_tracked=False):
     rec = load(prepared / 'preparation.json')
     if rec['status'] != 'preprocessed' or rec['input_fingerprint'] != fp:
         raise ValueError('Prepared data not valid')
-    from preparation_contract import contract as prep_contract, verify
+    from preparation_contract import contract as prep_contract, verify, prepared_fps
     _, source, _ = pipeline.runtime()
-    verify(prepared, prep_contract(fp, here, source))
+    verify(prepared, prep_contract(fp, here, source, prepared_fps(prepared)))
     dest = pipeline.episode_root(p, ep)
     if (dest / 'review/approved.json').exists() and not new:
         print('이미 승인된 에피소드입니다. 다음 단계: 07_track.py', dest)

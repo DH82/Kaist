@@ -33,6 +33,8 @@ def request_for(stage,run_id,params):
  # NAS 결과 폴더(results/pc1~pc6): 실행한 사용자(PC1~PC6)의 폴더. publish 단계에만 넣어 다른 단계의 작업 요청은 그대로 둡니다.
  pc=re.sub(r'[\s_-]+','',str(params.get('operator_id') or '')).lower()
  if stage=='publish' and re.fullmatch(r'pc[1-6]',pc):req['result_pc']=pc
+ # 처리 fps: 15fps 실행만 키를 넣습니다. 30fps(옵션이 생기기 전 실행 포함)는 작업 요청이 그대로입니다.
+ if params.get('target_fps')==15:req['target_fps']=15
  # Optional SAM3 object mode. Default text mode adds no keys, so existing job requests are unchanged.
  if params.get('sam_object_mode','text')=='point_track':
   req.update(sam_object_mode='point_track',sam_object_points=params.get('sam_object_points'))

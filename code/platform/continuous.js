@@ -67,7 +67,7 @@ $('contDone').onclick=async()=>{
  if(!contReady()||contSubmitting)return;contSubmitting=true;contButtons();
  const ep=contEp,points={};for(const c of [1,2,3,4])points[String(c-1)]=contPoints[c].map(([x,y,l])=>[Math.round(x*10000)/10000,Math.round(y*10000)/10000,l]);
  try{
-  await api('/api/continuous/submit',{method:'POST',body:JSON.stringify({episode:ep,sam_prompt:$('contPrompt').value.trim(),points,defer_mano:!$('contDeferBox').hidden&&$('contDefer').checked})});
+  await api('/api/continuous/submit',{method:'POST',body:JSON.stringify({episode:ep,sam_prompt:$('contPrompt').value.trim(),points,defer_mano:!$('contDeferBox').hidden&&$('contDefer').checked,target_fps:targetFps()})});
   const i=contSkipped.indexOf(ep);if(i>=0)contSkipped.splice(i,1);
   if(contData)contData.todo=contData.todo.filter(t=>t.episode!==ep);
   notice(ep+' · 연속 모드 대기열에 넣었습니다. 순서대로 RAW 전처리 → SAM3를 실행합니다.');
@@ -79,11 +79,11 @@ window.addEventListener('resize',()=>[1,2,3,4].forEach(contPaint));
 function contQueueHtml(q){
  if(!q.length)return '<p class="help">대기열이 비어 있습니다.</p>';
  return q.map(r=>{
-  const head='<b>'+escape(r.raw_episode)+'</b> <span class="help">· '+escape(r.sam_prompt)+'</span>';
+  const head='<b>'+escape(r.raw_episode)+'</b> <span class="help">· '+escape(r.sam_prompt)+(r.target_fps?' · '+r.target_fps+'fps':'')+'</span>';
   let st='',act='';
   if(r.state==='waiting'){st='<span class="badge">대기 '+r.position+'번째</span>';if(r.mine)act='<button type="button" class="smallbtn" data-cont-cancel="'+r.id+'" title="대기열에서 빼고 포인트를 다시 찍습니다">빼기</button>'}
   else if(r.state==='failed'){st='<span class="badge failed">시작 실패</span> <span class="help">'+escape(r.error||'')+'</span>';if(r.mine)act='<button type="button" class="smallbtn" data-cont-retry="'+r.id+'">다시 시도</button><button type="button" class="smallbtn" data-cont-cancel="'+r.id+'">빼기</button>'}
-  else st='<span class="badge running">시작됨</span> <span class="help">'+escape((r.episode&&r.episode!==r.raw_episode?r.episode+' · ':'')+(r.stage||'작업 현황에서 확인'))+'</span>';
+  else st='<span class="badge running">진행 중</span> <span class="help">'+escape((r.episode&&r.episode!==r.raw_episode?r.episode+' · ':'')+(r.stage||'작업 현황에서 확인'))+'</span>';
   return '<div class="contQRow"><div>'+head+'<div>'+st+'</div></div><div class="contQAct">'+act+'</div></div>';
  }).join('');
 }
@@ -93,7 +93,7 @@ async function loadContinuous(force=false){
   const d=await api('/api/continuous?worker_id='+encodeURIComponent(selectedWorker()));
   $('contCard').hidden=!d.available;if(!d.available){contData=null;return}
   contData=d;
-  const q=d.queue||[],wait=q.filter(r=>r.state==='waiting').length,fail=q.filter(r=>r.state==='failed').length,started=q.filter(r=>r.state==='started').length;
+  const q=d.queue||[],wait=q.filter(r=>r.state==='waiting').length,fail=q.filter(r=>r.state==='failed').length,started=d.started_today||0;
   $('contSummary').textContent='포인트 찍기 남음 '+d.todo.length+'개 · 실행 대기 '+wait+'개 · 오늘 시작 '+started+'개'+(fail?' · 시작 실패 '+fail+'개':'')+(d.distributed?' · 이 PC 분배 '+d.distributed+'개':'');
   const html=contQueueHtml(q);if($('contQueue').dataset.snap!==html){$('contQueue').dataset.snap=html;$('contQueue').innerHTML=html}
   $('contDeferBox').hidden=$('pc1DayOption').hidden;
@@ -178,7 +178,7 @@ async function loadContMano(force=false){
   else if(s){const b=(st.batches||[]).find(x=>x.run_id===s.run_id)||{};state='마지막 일괄 실행: '+(b.start?new Date(b.start).toLocaleString('ko-KR'):'—')+' · '+(b.count||0)+'개 · '+escape(stateName(b.state))}
   else state='아직 일괄 실행 기록이 없습니다.';
   $('contManoState').innerHTML=state+'<br>일괄 실행 대기: 오늘 자 <b>'+todayRows.length+'개</b> · 전체 '+rows.length+'개';
-  const started=(contData&&contData.queue||[]).filter(r=>r.state==='started').length;
+  const started=(contData&&contData.started_today)||0;
   $('contManoFlow').textContent=started?'오늘 연속 모드로 시작 '+started+'개 → 마스크·추적 검수를 마치면 3D 복원 대기(오늘 자)로 들어옵니다.':'';
   $('contManoToday').disabled=running||contManoStarting||!todayRows.length;$('contManoAll').disabled=running||contManoStarting||!rows.length;
   $('contManoToday').textContent='▶ 오늘 자 3D 복원 일괄 실행 ('+todayRows.length+'개)';$('contManoAll').textContent='▶ 대기 전체 실행 ('+rows.length+'개)';

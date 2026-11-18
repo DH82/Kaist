@@ -14,6 +14,19 @@ def read_rows(src, cam):
     if any(b<a for a,b in zip(times,times[1:])):raise ValueError('Non-monotonic host timestamps: '+cam)
     return {int(r['frame_idx']):r for r in rows}
 
+def frame_stride(frame_times, fps):
+    """How many synced frames to step over so the capture is exported at `fps`.
+
+    The cameras record at ~30fps. A lower target (15) keeps every 2nd synced
+    frame; the capture rate is measured from the reference timeline (median
+    frame gap), so a target equal to the capture rate keeps every frame.
+    """
+    gaps = sorted(b - a for a, b in zip(frame_times, frame_times[1:]) if b > a)
+    if not gaps or not fps or fps <= 0:
+        return 1
+    return max(1, round(1.0 / gaps[len(gaps) // 2] / fps))
+
+
 def sync_frames(cam_ts, fps, tol_s):
     """Align cameras using the reference camera's real frame timeline.
 
@@ -22,6 +35,8 @@ def sync_frames(cam_ts, fps, tol_s):
     times of the reference camera (the one with the most frames inside the
     overlap window) as the timeline, and snap every other camera to its nearest
     frame. This preserves full framerate over the whole overlap window.
+    When `fps` is lower than the capture rate, every k-th synced frame is kept
+    (see frame_stride), so 30fps captures are processed at e.g. 15fps.
 
     cam_ts: list (per camera) of dict local_idx -> host_time_s
     Returns: list of tuples (one local frame idx per camera), and the frame times.
@@ -55,13 +70,16 @@ def sync_frames(cam_ts, fps, tol_s):
         if ok:
             synced.append(tuple(picks))
             frame_times.append(t_ref)
-    return synced, frame_times
+    step = frame_stride(frame_times, fps)
+    return synced[::step], frame_times[::step]
 
 
 def source_mapping(src,cams,tol_s=DEFAULT_TOL_S,fps=30):
     rows=[read_rows(src,c) for c in cams]
     times=[{i:float(r['host_time_s']) for i,r in rs.items()} for rs in rows]
-    picks,anchors=sync_frames(times,fps,tol_s)
+    picks,anchors=sync_frames(times,None,tol_s)
+    step=frame_stride(anchors,fps)
+    picks,anchors=picks[::step],anchors[::step]
     lo=max(min(t.values()) for t in times);hi=min(max(t.values()) for t in times)
     ref=max(range(len(times)),key=lambda k:sum(lo-1e-9<=t<=hi+1e-9 for t in times[k].values()))
     seen=[set() for _ in cams];frames=[]
@@ -72,7 +90,10 @@ def source_mapping(src,cams,tol_s=DEFAULT_TOL_S,fps=30):
             views.append({'camera':c,'raw_camera':cams[c],'raw_idx':i,'host_time_s':host,'hw_timestamp_ms':float(hw) if hw else None,'residual_ms':(host-t)*1000,'duplicate_source':i in seen[c]})
             seen[c].add(i)
         frames.append({'output_idx':f,'pretrim_idx':f,'pretrim_frame':f,'frame':f,'reference_time_s':t,'reference_host_s':t,'raw_indices':list(indices),'host_ms':[v['host_time_s']*1000 for v in views],'hardware_ms':[v['hw_timestamp_ms'] for v in views],'cameras':views})
-    return {'schema_version':1,'raw_indices':[list(ids) for ids in picks],'hardware_common_clock_verified':False,'policy':POLICY,'sync_tol_ms':tol_s*1000,'reference_camera':ref,'timestamp_basis':'host_time_s','clock_domain':'unknown','exposure_semantics':'unknown; host timestamps do not certify simultaneous exposures','overlap_start':lo,'overlap_end':hi,'frames':frames}
+    out={'schema_version':1,'raw_indices':[list(ids) for ids in picks],'hardware_common_clock_verified':False,'policy':POLICY,'sync_tol_ms':tol_s*1000,'reference_camera':ref,'timestamp_basis':'host_time_s','clock_domain':'unknown','exposure_semantics':'unknown; host timestamps do not certify simultaneous exposures','overlap_start':lo,'overlap_end':hi,'frames':frames}
+    # Recorded only when frames were dropped, so full-rate mappings stay byte-identical to earlier runs.
+    if step>1:out.update(target_fps=float(fps),frame_stride=step)
+    return out
 
 def trim_mapping(mapping,ts,te,n):
     if len(mapping['frames'])!=n or ts<0 or te<0 or ts+te>=n:raise ValueError('Invalid source mapping/trim')

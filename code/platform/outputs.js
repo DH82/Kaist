@@ -308,10 +308,10 @@ $('rawPickMine').onclick=()=>{const me=rawTeam&&rawTeam.me;rawEpisodes.filter(e=
 $('rawBatchPrep').onclick=async()=>{
  if(rawBatchBusy||!rawBatchPicked.size)return;
  const eps=[...rawBatchPicked].sort();
- if(!confirm('RAW '+eps.length+'개를 전처리 일괄 실행합니다.\n\n'+eps.join('\n')+'\n\n· 각 RAW마다 복사·QC·준비까지 실행하고 \'SAM3 설정 대기\'에서 멈춥니다.\n· 분할 대상은 아래 \'SAM3 설정 대기\'에서 에피소드별로 입력하면 SAM3부터 이어집니다.\n· GPU 작업은 PC의 GPU 슬롯 순서대로 진행됩니다. 진행할까요?'))return;
+ if(!confirm('RAW '+eps.length+'개를 전처리 일괄 실행합니다.\n\n'+eps.join('\n')+'\n\n· 각 RAW마다 복사·QC·준비까지 실행하고 \'SAM3 설정 대기\'에서 멈춥니다.\n· 분할 대상은 아래 \'SAM3 설정 대기\'에서 에피소드별로 입력하면 SAM3부터 이어집니다.\n· GPU 작업은 PC의 GPU 슬롯 순서대로 진행됩니다.\n· 처리 fps: '+targetFps()+'fps (실행 설정의 \'처리 fps\'에서 바꿉니다)\n\n진행할까요?'))return;
  rawBatchBusy=true;rawBatchControls();$('rawBatchInfo').textContent='시작하는 중…';
  try{
-  const r=await api('/api/run/batch-prep',{method:'POST',body:JSON.stringify({worker_id:selectedWorker(),episodes:eps,defer_mano:selectedWorker()==='gpu_4090_a'&&$('deferMano').checked})});
+  const r=await api('/api/run/batch-prep',{method:'POST',body:JSON.stringify({worker_id:selectedWorker(),episodes:eps,defer_mano:selectedWorker()==='gpu_4090_a'&&$('deferMano').checked,target_fps:targetFps()})});
   r.started.forEach(x=>rawBatchPicked.delete(x.raw));
   $('rawBatchInfo').textContent='시작 '+r.started.length+'개'+(r.failed.length?' · 실패 '+r.failed.length+'개':'');
   notice('RAW 전처리 일괄 실행: '+r.started.length+'개 시작'+(r.failed.length?' · 실패: '+r.failed.map(x=>x.episode+' ('+x.error+')').join(', '):''),r.failed.length>0);

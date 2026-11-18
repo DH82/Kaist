@@ -445,7 +445,10 @@ def resume_review_identity(pinned, identity, stage):
 
 def execute(stage, episode, run_id, config_path, sam_prompt='', sam_scene='2d', sam_confirmed=False, raw_episode=None,
             object_mode='text', object_bboxes=None, object_points=None, result_pc=None,
-            transfer_from=None, transfer_key=None):
+            transfer_from=None, transfer_key=None, target_fps=30):
+    # 처리 fps: 30(모든 프레임, 이 옵션이 생기기 전 실행과 같음) 또는 15(동기화된 프레임을 하나 걸러 하나 사용).
+    if target_fps not in (15, 30):
+        raise ValueError('Unsupported target fps')
     if result_pc is not None and not re.fullmatch(r'pc[1-6]', result_pc):
         raise ValueError('Invalid result PC')
     if (stage == 'adopt') != bool(transfer_from) or bool(transfer_from) != bool(transfer_key):
@@ -492,6 +495,9 @@ def execute(stage, episode, run_id, config_path, sam_prompt='', sam_scene='2d', 
                                        object_point_tracker_sha256=digest(OBJECT_POINT_TRACKER))
     if raw_episode:
         identity['raw_episode'] = raw_episode
+    if target_fps != 30:
+        # 30fps 실행은 키를 넣지 않아, 옵션이 생기기 전에 시작한 실행의 고정 내용이 그대로 유지됩니다.
+        identity['target_fps'] = target_fps
     pinned = receipt / 'identity.json'
     if stage == 'adopt':
         # 이관 받은 실행: 가져오기·코드 확인이 끝난 뒤에만 이 PC의 실행으로 고정합니다(MANO 단계만 이어서 실행).
@@ -538,9 +544,9 @@ def execute(stage, episode, run_id, config_path, sam_prompt='', sam_scene='2d', 
             pipeline.copy_raw(project, [Path(cfg['raw_root']) / episode])
         if (project / '02_qc' / episode / 'qc.json').exists():
             pipeline.gate(project, episode)
-            pipeline.prepare(project, episode)
+            pipeline.prepare(project, episode, fps=target_fps)
         else:
-            pipeline.run_qc(project, episode, open_setup=False)
+            pipeline.run_qc(project, episode, open_setup=False, fps=target_fps)
     elif stage == 'sam_settings_ready':
         settings_module = module(scripts / 'sam_settings.py')
         changed = sam_confirmed and sam_settings_changed(project, scripts, episode, sam_prompt, sam_scene)
@@ -641,9 +647,10 @@ if __name__ == '__main__':
     p.add_argument('--object-mode', choices=OBJECT_MODES, default='text')
     p.add_argument('--object-bboxes', default=None, help='JSON {"0".."3": [x,y,w,h]} normalized')
     p.add_argument('--object-points', default=None, help='JSON {"0".."3": [[x,y,label],...]} normalized')
+    p.add_argument('--fps', type=int, choices=[15, 30], default=30, help='처리 fps (30fps 촬영을 15fps로 줄여 처리)')
     a = p.parse_args()
     result = execute(a.stage, a.episode, a.run_id, a.config, a.sam_prompt, a.sam_scene, a.sam_confirmed, a.raw_episode,
-                     a.object_mode, a.object_bboxes, a.object_points, a.result_pc, a.transfer_from, a.transfer_key)
+                     a.object_mode, a.object_bboxes, a.object_points, a.result_pc, a.transfer_from, a.transfer_key, a.fps)
     print(json.dumps(result))
     if result is False:
         sys.exit(75)

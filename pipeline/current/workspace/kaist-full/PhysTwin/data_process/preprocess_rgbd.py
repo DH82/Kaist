@@ -17,6 +17,8 @@
 #
 # Cameras are NOT hardware-synced, so frames are aligned across cameras by
 # host wall-clock timestamps onto a common fps grid before export.
+# --fps below the capture rate (e.g. 15 for 30fps captures) keeps every k-th
+# synced frame; every later stage then works on that reduced frame set.
 
 import os
 import re
@@ -351,7 +353,7 @@ def main():
     synced, grid_times = sync_frames(cam_ts, args.fps, args.sync_tol_ms / 1000.0)
     N = len(synced)
     if not N:raise ValueError("No synchronized frames inside tolerance")
-    print(f"[sync] {N} aligned frames over {grid_times[-1]-grid_times[0]:.2f}s")
+    print(f"[sync] {N} aligned frames over {grid_times[-1]-grid_times[0]:.2f}s (target {args.fps:g}fps)")
 
     mapping = source_mapping(src, cams, args.sync_tol_ms / 1000.0, args.fps)
     with open(os.path.join(case_dir, 'source_frames.json'), 'w') as f:
@@ -428,6 +430,9 @@ def main():
         "frame_num": N,
         "serial_numbers": serials,
     }
+    # Readers default to 30 when the key is absent, so full-rate cases keep their earlier metadata.
+    if mapping.get("frame_stride", 1) > 1:
+        metadata["fps"] = args.fps
     with open(os.path.join(case_dir, "metadata.json"), "w") as f:
         json.dump(metadata, f, indent=2)
 

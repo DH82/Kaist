@@ -74,6 +74,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('episode', help='NAS rgbd_raw 아래 RAW 에피소드 이름 (ep_…)')
     ap.add_argument('--prompt', help='SAM3 물체 프롬프트 (새 실행에 필요)')
+    ap.add_argument('--fps', type=int, choices=[15, 30], help='처리 fps (새 실행 기본 15 · 30fps 촬영을 15fps로 줄여 처리)')
     ap.add_argument('--resume', action='store_true', help='이 에피소드의 마지막 실행을 이어서 진행')
     ap.add_argument('--run-id', help='이어서 실행할 run id (--resume 대신 직접 지정)')
     ap.add_argument('--output-episode', help='같은 RAW를 새 이름으로 다시 처리할 때 (예: ep_X_2)')
@@ -99,12 +100,15 @@ def main():
             if base.get('run_id') != a.run_id:
                 if not a.prompt:
                     ap.error('기록에 없는 --run-id는 --prompt도 함께 지정하세요.')
-                base = {'run_id': a.run_id, 'prompt': a.prompt}
+                base = {'run_id': a.run_id, 'prompt': a.prompt, 'target_fps': a.fps or 30}
         else:
             if not record.exists():
                 ap.error(f'{out_ep}의 이전 실행 기록이 없습니다. --prompt로 새로 실행하세요.')
             base = json.loads(record.read_text())
         run_id, prompt = base['run_id'], base['prompt']
+        fps = base.get('target_fps', 30)  # 이 옵션이 생기기 전 기록은 30fps로 처리한 실행입니다.
+        if a.fps and a.fps != fps:
+            ap.error('이어서 실행할 때는 처리 fps를 바꿀 수 없습니다. 바꾸려면 --resume 없이 새로 실행하세요.')
         if a.prompt and a.prompt != prompt:
             ap.error('이어서 실행할 때는 프롬프트를 바꿀 수 없습니다. 바꾸려면 --resume 없이 새로 실행하세요.')
     else:
@@ -112,16 +116,19 @@ def main():
             ap.error('새 실행에는 --prompt "물체 이름"이 필요합니다.')
         prompt = a.prompt.strip()
         run_id = f"cli_{datetime.now():%Y%m%dT%H%M%S}_{uuid.uuid4().hex[:6]}"
-    record.write_text(json.dumps({'run_id': run_id, 'prompt': prompt, 'raw_episode': a.episode,
+        fps = a.fps or 15
+    record.write_text(json.dumps({'run_id': run_id, 'prompt': prompt, 'raw_episode': a.episode, 'target_fps': fps,
                                   'updated': datetime.now().astimezone().isoformat()}, ensure_ascii=False, indent=2))
 
-    log(f"에피소드 {out_ep} (RAW {a.episode}) · run {run_id} · 프롬프트 '{prompt}'")
+    log(f"에피소드 {out_ep} (RAW {a.episode}) · run {run_id} · 프롬프트 '{prompt}' · 처리 {fps}fps")
     log(f"작업 폴더 {cfg['project_dir']} → 결과 {cfg['nas_mount']}/{cfg['nas_results_subdir']}/{out_ep}/")
     stages = STAGES[:STAGES.index(a.until) + 1] if a.until else STAGES
     for stage in stages:
         # 요청 내용은 매번 같아야 합니다 (runner가 같은 작업의 요청 변경을 거부).
         req = {'stage': stage, 'episode': out_ep, 'run_id': run_id, 'sam_prompt': prompt,
                'sam_scene': '2d', 'sam_confirmed': True}
+        if fps == 15:
+            req['target_fps'] = 15
         if out_ep != a.episode:
             req['raw_episode'] = a.episode
         while True:

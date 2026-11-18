@@ -17,7 +17,8 @@ for worker_id,mode,dag_id in dag_entries():
     pc=worker(worker_id,require_enabled=False)
     raw=mode=='raw'
     # 특정 촬영 에피소드를 기본값으로 고정하지 않고 실행할 때 반드시 받습니다.
-    params={'episode_id':Param(type='string',pattern='^ep_[A-Za-z0-9_]+$')}
+    # target_fps: 처리 fps. UI는 기본 15를 보냅니다. 값이 없는 실행(옵션이 생기기 전)은 30으로 처리된 실행입니다.
+    params={'episode_id':Param(type='string',pattern='^ep_[A-Za-z0-9_]+$'),'target_fps':Param(30,enum=[15,30])}
     if not raw:
         # 빈 sam_prompt = RAW 전처리만 하고 sam_settings_ready에서 분할 대상 저장을 기다립니다(UI 'SAM3 설정 대기').
         params.update(sam_prompt=Param(type='string',minLength=0,maxLength=200),
