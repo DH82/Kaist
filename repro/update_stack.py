@@ -18,6 +18,10 @@ Docker PC 순서 (한 번에 끝나지 않으면 다음 타이머 실행에서 �
   4) GPU 자체 점검. SAM3·CUDA 확장·모델을 실제로 GPU에 올리므로 작업 중에 돌리면 메모리가 모자라 점검이
      실패하고(2026-11-17 PC5 10/12) 돌던 작업까지 망칠 수 있어, 쉴 때만 합니다.
   5) 서비스 재시작 + UI 연결 검사. 실패하면 이전 커밋으로 되돌려 다시 빌드·기동합니다.
+  범위 줄이기(update_scope): 바뀐 파일이 UI 코드(code/platform/)뿐이면 UI 이미지만 빌드하고 3)·4) 없이 UI 컨테이너만,
+     code/·deploy/뿐이면 3)에서 Airflow 쪽만 기다리고 4) 없이 Airflow·UI만 재시작합니다. 이미지에 안 들어가는 파일
+     (업데이터·문서)뿐이면 재시작하지 않습니다. 전체 범위라도 GPU 이미지가 지난 점검 때와 같으면(캐시) 4)를 건너뜁니다.
+     업데이터 자신(update_stack.py·start_stack.py)이 바뀌면 받은 직후 새 코드로 다시 실행해 이번 업데이트부터 적용합니다.
   강제 업데이트(관리자 '⚡ 강제 업데이트', request.json의 force): 1)~2)는 같고, 3)에서 기다리지 않습니다.
      stop.json을 써서 이 PC의 UI에 작업 강제 종료를 맡기고(파이프라인 실행·MANO 일괄 실행·GPU 작업, 검수·설정 입력 대기는 유지),
      UI가 stopped.json을 쓰면(또는 FORCE_UI_TIMEOUT 뒤) GPU 점검·재시작합니다. 종료된 실행은 '실패 단계 다시 실행'으로 잇습니다.
@@ -56,6 +60,38 @@ RUN_PINNED = ('pipeline/current/project/', 'pipeline/current/workspace/kaist-ful
 # 실행은 나중에 새 코드로 복원하므로 기다리지 않고, 3D 복원 이후 단계에 있는 실행만 기다립니다.
 WAIT_STAGES = ('sam_settings_ready', 'mask_approved', 'tracking_approved')
 LATE_STAGES = ('prepare_reconstruction', 'reconstruct', 'hands', 'validate', 'publish')
+# ---- 업데이트 범위: 바뀐 파일만큼만 빌드·대기·점검·재시작합니다 ----
+#  none    이미지에 안 들어가는 파일(업데이터·문서·설치 스크립트)만 → 빌드·재시작 없음
+#  ui      UI 코드(code/platform/)만 → UI 이미지만 빌드, 기다리지 않고 UI 컨테이너만 재시작(GPU 작업·Airflow는 그대로)
+#  airflow code/·deploy/(DAG 등) → UI 이미지만 빌드, Airflow 실행 중 태스크·MANO 일괄 실행만 기다린 뒤 Airflow·UI 재시작
+#  full    그 밖(worker/·pipeline/·gpu/·Dockerfile·compose.yaml 등) → 전체 빌드, 지금까지와 같은 대기, GPU 점검, 전체 재시작
+NO_IMAGE = ('repro/', 'tests/', 'backups/', 'native/', 'install_docker.sh', 'setup.sh', 'start.sh', 'pack.sh')
+SCOPE_SERVICES = {'ui': ['ui'], 'airflow': ['airflow', 'ui']}
+UPDATER_FILES = ('repro/update_stack.py', 'repro/start_stack.py')
+IDLE_POLL = 15                   # 작업 종료 대기 중 다시 확인하는 간격(초)
+IDLE_POLL_FOR = 165              # 한 번 실행에서 이만큼 기다려 보고, 그래도 바쁘면 다음 타이머 실행에서 이어감
+
+
+def update_scope(changed):
+    files = [f for f in changed if not (f.startswith(NO_IMAGE) or f.endswith('.md'))]
+    if not files:
+        return 'none'
+    if all(f.startswith('code/platform/') for f in files):
+        return 'ui'
+    if all(f.startswith(('code/', 'deploy/')) for f in files):
+        return 'airflow'
+    return 'full'
+
+
+def scope_flags(scope):
+    return ['--services', *SCOPE_SERVICES[scope]] if scope in SCOPE_SERVICES else []
+
+
+def gpu_image_id():
+    r = subprocess.run(['docker', 'image', 'inspect', '--format', '{{.Id}}', 'kaist-gpu:latest'], capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
 STALE = 120                      # UI 상태 파일이 이보다 오래되면 '쉬는지 모름'으로 봅니다
 FORCE_UI_TIMEOUT = 180           # 강제 업데이트: UI가 이 시간 안에 작업 강제 종료를 끝내지 않으면(꺼짐·이전 버전) 그냥 재시작
 FORCE_SETTLE = 60                # 강제 종료 뒤 GPU 작업 프로세스가 정리되기를 기다리는 최대 시간
@@ -358,9 +394,11 @@ class Updater:
             return None
         return dict(meta['update_busy'] or {}, inflight=runs, inflight_active=active, inflight_late=late)
 
-    def idle_reasons(self, pinned):
+    def idle_reasons(self, pinned, scope='full'):
         reasons = []
-        busy = self.worker_busy()
+        if scope == 'ui':
+            return reasons   # UI 컨테이너만 재시작: GPU 작업·Airflow 실행에 영향 없음
+        busy = self.worker_busy() if scope == 'full' else []   # airflow 범위는 GPU Worker를 재시작하지 않음
         if busy:
             reasons.append(f'GPU 작업 {len(busy)}개 진행 중 (' + ', '.join(busy[:3]) + (' …' if len(busy) > 3 else '') + ')')
         ui = self.ui_busy()
@@ -415,15 +453,17 @@ class Updater:
             detail = ' / '.join(failed)[:600] + ' / ' if failed else ''
             raise RuntimeError(f'start_stack {" ".join(flags)} 실패: ' + detail + ' / '.join(tail)[-400:])
 
-    def rollback(self, prev, restart):
+    def rollback(self, prev, restart, scope='full'):
         if not prev or prev == git('rev-parse', 'HEAD'):
             return ''
         self.set_phase('rollback')
         self.report('rollback', f'실패 → 이전 커밋 {prev[:7]}로 되돌리는 중')
         git('reset', '--hard', '--quiet', prev)
         self.save_local(built=None)
+        flags = scope_flags(scope)
+        light = ['--no-gpu-check'] if scope in SCOPE_SERVICES else []   # GPU 이미지는 그대로라 점검 불필요
         try:
-            self.start_stack() if restart else self.start_stack('--build-only', '--no-gpu-check')
+            self.start_stack(*flags, *light) if restart else self.start_stack('--build-only', '--no-gpu-check', *flags)
             self.save_local(built=prev, checked=prev, **({'deployed': prev} if restart else {}))
             return f' → 이전 커밋 {prev[:7]}로 되돌림'
         except RuntimeError as e:
@@ -467,7 +507,7 @@ class Updater:
         if not req and auto and not fetch_error and git('rev-parse', 'HEAD') != git('rev-parse', f'origin/{BRANCH}'):
             auto_id = 'auto_' + git('rev-parse', '--short', f'origin/{BRANCH}')
             last = self.local.get('last') or {}
-            # 같은 커밋으로 자동 업데이트가 이미 실패했으면 3분마다 빌드·되돌리기를 반복하지 않습니다.
+            # 같은 커밋으로 자동 업데이트가 이미 실패했으면 타이머마다 빌드·되돌리기를 반복하지 않습니다.
             if self.local.get('prev') is not None or last.get('ok', True) or last.get('request') != auto_id:
                 req = {'id': auto_id, 'requested_by': 'auto'}
         in_progress = self.local.get('prev') is not None
@@ -493,6 +533,12 @@ class Updater:
                 self.save_local(prev=prev, changed=[])
             self.save_local(changed=sorted(set(self.local.get('changed') or []) | set(changed)))
             log(f'{prev[:7]} → {git("rev-parse", "--short", "HEAD")}: 파일 {len(changed)}개 변경')
+            # 업데이터 자신이 바뀌었으면 이번 업데이트부터 새 코드로 진행합니다(받은 변경 목록은 state.json에 남아 있음).
+            if any(f in UPDATER_FILES for f in changed) and not os.environ.get('KAIST_UPDATER_REEXEC'):
+                log('업데이터 코드가 바뀌어 새 코드로 다시 실행합니다')
+                sys.stdout.flush()
+                os.execve(sys.executable, [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]],
+                          dict(os.environ, KAIST_UPDATER_REEXEC='1'))
         head = git('rev-parse', 'HEAD')
         prev = self.local.get('prev')
         changed = self.local.get('changed') or []
@@ -508,46 +554,78 @@ class Updater:
             notes.append('UI 재시작')
         if any(f.startswith(('worker/', 'pipeline/', 'gpu/')) for f in changed):
             notes.append('Worker·파이프라인 변경은 native PC에서 자동 배포하지 않습니다(수동 배포 필요)')
+        if 'repro/install_updater.sh' in changed:
+            self.reinstall_timer()
         head = git('rev-parse', 'HEAD')
         self.save_local(deployed=head, built=head)
         self.done(req, ' · '.join([f'{prev[:7]} → {head[:7]}' if prev else '이미 최신'] + notes))
 
     def docker(self, req, prev, head, changed):
+        scope = update_scope(changed)
+        flags = scope_flags(scope)
+        if scope == 'none':
+            self.save_local(built=head, deployed=head)
+            return self.done(req, (f'{prev[:7]} → ' if prev else '') + f'{head[:7]} 반영 (이미지에 들어가는 파일 변경 없음 · 재시작 안 함)')
         if self.local.get('built') != head:
             self.set_phase('build')
-            self.report('building', f'{head[:7]} 이미지 빌드 중 (기존 서비스는 계속 동작)')
+            what = {'ui': 'UI 이미지만', 'airflow': 'UI·Airflow 이미지만'}.get(scope, '이미지')
+            self.report('building', f'{head[:7]} {what} 빌드 중 (기존 서비스는 계속 동작)')
             try:
-                self.start_stack('--build-only', '--no-gpu-check')
+                self.start_stack('--build-only', '--no-gpu-check', *flags)
             except RuntimeError as e:
-                return self.fail(req, str(e) + self.rollback(prev, restart=False))
+                return self.fail(req, str(e) + self.rollback(prev, restart=False, scope=scope))
             self.save_local(built=head, checked=None)
         if self.local.get('deployed') == head and not changed:
             return self.done(req, '이미 최신입니다')
         pinned = ('all' if any(f.startswith('pipeline/') and not f.endswith('.py') for f in changed)
                   else True if any(f.startswith(RUN_PINNED) for f in changed)
                   else 'late' if any(f.startswith(PINNED) for f in changed) else False)
-        self.set_phase('wait')
-        reasons = self.idle_reasons(pinned)
-        if req.get('force') and (reasons or (read_json(self.dir / 'stop.json') or {}).get('id') == req.get('id')):
-            reasons = self.force_stop(req, reasons)
-        if reasons:
-            return self.report('waiting', '빌드 완료 · 이 PC가 쉬면 GPU 점검 후 재시작합니다: ' + ' · '.join(reasons))
-        if self.local.get('checked') != head:
-            self.set_phase('check')
-            self.report('building', f'{head[:7]} GPU 점검 중 (' + ('강제 종료 후' if self.local.get('forced') else '작업 없음 확인됨') + ')')
-            try:
-                self.start_stack('--gpu-check-only')
-            except RuntimeError as e:
-                return self.fail(req, str(e) + self.rollback(prev, restart=False))
-            self.save_local(checked=head)
+        if scope != 'ui':
+            self.set_phase('wait')
+            # 바쁘면 다음 타이머(몇 분 뒤)까지 기다리지 않고 IDLE_POLL초마다 다시 확인합니다.
+            until = time.time() + IDLE_POLL_FOR
+            while True:
+                reasons = self.idle_reasons(pinned, scope)
+                if req.get('force') and (reasons or (read_json(self.dir / 'stop.json') or {}).get('id') == req.get('id')):
+                    reasons = self.force_stop(req, reasons)
+                if not reasons or time.time() >= until:
+                    break
+                self.report('waiting', '빌드 완료 · 이 PC가 쉬면 ' + ('GPU 점검 후 ' if scope == 'full' else '') + '재시작합니다: ' + ' · '.join(reasons))
+                time.sleep(IDLE_POLL)
+                req = self.request() or req
+            if reasons:
+                return self.report('waiting', '빌드 완료 · 이 PC가 쉬면 ' + ('GPU 점검 후 ' if scope == 'full' else '') + '재시작합니다: ' + ' · '.join(reasons))
+        if scope == 'full' and self.local.get('checked') != head:
+            # GPU 이미지가 지난번 점검한 이미지와 같으면(층이 모두 캐시) 점검을 다시 하지 않습니다.
+            image = gpu_image_id()
+            if image and image == self.local.get('checked_gpu'):
+                log('GPU 이미지가 지난 점검 때와 같아 GPU 점검을 건너뜁니다')
+                self.save_local(checked=head)
+            else:
+                self.set_phase('check')
+                self.report('building', f'{head[:7]} GPU 점검 중 (' + ('강제 종료 후' if self.local.get('forced') else '작업 없음 확인됨') + ')')
+                try:
+                    self.start_stack('--gpu-check-only')
+                except RuntimeError as e:
+                    return self.fail(req, str(e) + self.rollback(prev, restart=False, scope=scope))
+                self.save_local(checked=head, checked_gpu=image)
         self.set_phase('restart')
-        self.report('restarting', f'{head[:7]}로 서비스 재시작 중')
+        self.report('restarting', f'{head[:7]}로 ' + {'ui': 'UI만', 'airflow': 'Airflow·UI'}.get(scope, '서비스') + ' 재시작 중')
         try:
-            self.start_stack('--skip-build')
+            self.start_stack('--skip-build', *flags)
         except RuntimeError as e:
-            return self.fail(req, str(e) + self.rollback(prev, restart=True))
+            return self.fail(req, str(e) + self.rollback(prev, restart=True, scope=scope))
         self.save_local(deployed=head)
-        self.done(req, (f'{prev[:7]} → ' if prev else '') + f'{head[:7]} 반영 완료' + self.forced_note())
+        if 'repro/install_updater.sh' in changed:
+            self.reinstall_timer()
+        label = {'ui': ' (UI만 재시작 · 작업 대기·GPU 점검 생략)', 'airflow': ' (Airflow·UI만 재시작 · GPU 점검 생략)'}.get(scope, '')
+        self.done(req, (f'{prev[:7]} → ' if prev else '') + f'{head[:7]} 반영 완료' + label + self.forced_note())
+
+    def reinstall_timer(self):
+        """확인 주기 등 타이머 설정이 바뀌었으면 다시 설치합니다(자동 반영 여부는 유지)."""
+        args = [str(ROOT / 'repro/install_updater.sh')] + (['--auto'] if os.environ.get('KAIST_AUTO_UPDATE') == '1' else [])
+        r = subprocess.run(args, capture_output=True, text=True)
+        log('업데이트 타이머 다시 설치: ' + ('완료' if r.returncode == 0 else '실패 ' + r.stderr.strip()[-200:]))
 
     def forced_note(self):
         forced = self.local.get('forced')

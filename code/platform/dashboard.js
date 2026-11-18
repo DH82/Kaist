@@ -290,7 +290,7 @@ function updRow(p){
  if(run){
   const from=String(run.from||'').slice(0,7),to=String(run.to||st.commit||'').slice(0,7);
   h+='<span class="dbSub">'+(from&&from!==to?from+' → '+to+' · ':to?to+' · ':'')+(run.finished?'소요 '+dashDur(run.finished-run.started)+' · '+dashClock(run.finished)+' 종료':'시작 '+dashHM(run.started)+' · 경과 '+updAgo(run.started))+(run.requested_by?' · 요청 '+escape(run.requested_by):'')+(run.force||p.request?.force?' · <span class="bad">⚡ 강제</span>':'')+'</span>';
- }else if(rq)h+='<span class="dbSub">요청 '+updAgo(rq.at)+' 전 · 타이머가 3분 안에 가져갑니다</span>';
+ }else if(rq)h+='<span class="dbSub">요청 '+updAgo(rq.at)+' 전 · 타이머가 곧(1~3분 안에) 가져갑니다</span>';
  h+='</div>';
  if(run)h+=updPhases(p,run);
  const live=!run?.finished&&st.progress;

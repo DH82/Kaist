@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # GitHub 업데이트 타이머(systemd --user kaist-update.timer)를 설치합니다. sudo 없이 현재 사용자로 동작합니다.
-#   repro/install_updater.sh            # 3분마다 확인 (관리자 대시보드의 '업데이트' 요청이 있을 때만 반영)
+#   repro/install_updater.sh            # 1분마다 확인 (관리자 대시보드의 '업데이트' 요청이 있을 때만 반영)
 #   repro/install_updater.sh --auto     # GitHub에 새 커밋이 올라오면 요청 없이 자동 반영
 #   repro/install_updater.sh --remove   # 타이머 제거
 # 로그: journalctl --user -u kaist-update -e   ·   상태: python3 repro/update_stack.py --status
@@ -39,11 +39,11 @@ Nice=5
 EOF
 cat > "$UNIT_DIR/kaist-update.timer" <<'EOF'
 [Unit]
-Description=Check GitHub for KAIST stack updates every 3 minutes
+Description=Check GitHub for KAIST stack updates every minute
 
 [Timer]
 OnBootSec=2min
-OnUnitInactiveSec=3min
+OnUnitInactiveSec=1min
 Persistent=false
 
 [Install]

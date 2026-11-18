@@ -69,6 +69,17 @@ def gpu_check(compose, env, jobs):
     run(compose + ['run', '--rm', '--no-deps', 'gpu-worker', 'check'], env=env)
 
 
+def same_gpu_image(compose, env):
+    """(빌드된 kaist-gpu:latest 이미지 ID, 실행 중인 gpu-worker 컨테이너의 이미지 ID). 모르면 None."""
+    def out(cmd):
+        r = subprocess.run(cmd, env=env, capture_output=True, text=True)
+        return r.stdout.strip() if r.returncode == 0 else ''
+    built = out(['docker', 'image', 'inspect', '--format', '{{.Id}}', 'kaist-gpu:latest']) or None
+    ids = out(compose + ['ps', '-q', 'gpu-worker']).split()
+    running = out(['docker', 'inspect', '--format', '{{.Image}}', ids[0]]) or None if ids else None
+    return built, running
+
+
 def record_deployed():
     """repro/update_stack.py가 '지금 실행 중인 커밋'을 알 수 있게 기록합니다."""
     try:
@@ -105,6 +116,8 @@ def main():
     # 점검은 GPU를 실제로 씁니다. 업데이터는 빌드(--no-gpu-check)와 점검(--gpu-check-only)을 나눠 PC가 쉴 때만 점검합니다.
     parser.add_argument('--no-gpu-check', action='store_true', help='With --build-only: build images without the GPU self-check')
     parser.add_argument('--gpu-check-only', action='store_true', help='Run only the GPU self-check on already-built images')
+    # 업데이터가 바뀐 파일에 맞춰 범위를 줄일 때 씁니다. 예: UI 코드만 바뀌면 --services ui (UI 이미지만 빌드, UI 컨테이너만 재시작)
+    parser.add_argument('--services', nargs='+', metavar='SERVICE', help='Build/restart only these Compose services (restart uses --no-deps)')
     args = parser.parse_args()
     os.chdir(ROOT)
     env_file = args.env_file.resolve()
@@ -221,12 +234,19 @@ def main():
         return
     if args.gpu_check_only:
         phase('check')
+        # 빌드한 GPU 이미지가 지금 돌고 있는 GPU Worker 이미지와 같으면(층이 모두 캐시) 이미 점검을 통과해 배포된 이미지입니다.
+        # GPU를 실제로 쓰는 점검(작업이 끝날 때까지 대기 포함)을 다시 하지 않습니다.
+        built, running = same_gpu_image(compose, env)
+        if built and built == running:
+            print(f'GPU self-check skipped: built image {built[7:19]} is the one already running (checked when deployed).')
+            return
         gpu_check(compose, env, worker_state / 'worker/jobs')
         print('GPU self-check passed.')
         return
+    services = args.services or []
     if not args.skip_build:
         phase('build')
-        run(compose + ['build'], env=env)
+        run(compose + ['build', *services], env=env)
         if not args.no_gpu_check:
             # Exercise GPU packages, model assets, rendering and NAS before bringing the UI online.
             phase('check')
@@ -235,7 +255,7 @@ def main():
         print('Images built and checked. Running services were not restarted.')
         return
     phase('restart')
-    run(compose + ['up', '-d', '--wait', '--wait-timeout', '600'], env=env)
+    run(compose + ['up', '-d', '--wait', '--wait-timeout', '600', *(['--no-deps', *services] if services else [])], env=env)
     phase('verify')
     run([sys.executable, str(ROOT / 'repro/check_ui.py'), '--env-file', str(env_file)], env=env)
     if stack_name == 'kaist-pc':
