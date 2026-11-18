@@ -7,6 +7,8 @@ UI는 기본 `http://<PC-IP>:18083/`입니다. 현재 UI 코드의 RAW 목록·�
 마스크·추적 검수, 3D 복원, HaMBA·MANO, 작업 재시도, 결과 조회·NAS 저장 기능을 포함합니다.
 사람의 검수 승인이 필요한 단계는 UI에서 승인해야 계속 진행됩니다.
 
+작업자용 사용 설명은 [작업자 가이드](code/platform/worker-guide/README.md)에 있습니다. UI 사이드바 **📖 작업 가이드**에서도 같은 문서가 열립니다.
+
 ## 준비
 
 - Linux x86_64, Docker Engine·Compose v2(`up --wait` 지원), NVIDIA Container Toolkit.

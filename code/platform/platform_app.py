@@ -192,6 +192,23 @@ class Login(BaseModel):
  role:str='operator'
  password:str=''
 
+@app.get('/guide')
+def guide_page(req:Request):
+ """사이드바 '작업 가이드': worker-guide/README.md를 그대로 보여 줍니다."""
+ guard(req)
+ import guide
+ page=guide.page()
+ if not page:raise HTTPException(404,'가이드 문서가 이 PC에 없습니다.')
+ return HTMLResponse(page,headers={'Cache-Control':'no-store','Content-Security-Policy':"default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; frame-ancestors 'none'"})
+
+@app.get('/guide/img/{name}')
+def guide_image(name:str,req:Request):
+ guard(req)
+ import guide
+ p=guide.image(name)
+ if not p:raise HTTPException(404,'그림이 없습니다.')
+ return FileResponse(p,media_type='image/png')
+
 @app.get('/api/session')
 def session(req:Request):
  guard(req)
