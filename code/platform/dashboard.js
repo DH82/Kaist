@@ -111,9 +111,10 @@ function renderDash(){
   const dot=p.missing||p.error||!p.online?'':p.idle?'idle':'busy';
   const state=p.missing?'미설치':p.error?'읽기 오류':!p.online?'연결 끊김':p.idle?'GPU 유휴':'작업 중';
   const gpu=p.gpu?' · GPU '+(p.gpu.util??'—')+'% · '+((p.gpu.used_mb||0)/1024).toFixed(1)+'/'+Math.round((p.gpu.total_mb||0)/1024)+'GB':'';
+  const queue=' · RAW 큐 '+(p.queue_target??p.default_queue??'—')+'개'+(p.queue_target==null?'(기본)':'');
   const now=running.filter(of).map(j=>escape(j.episode)+' · '+escape(dashName(j.stage))+' '+dashDur(dashLen(j))).join('<br>');
   const wait=d.mano_waiting.filter(of).length;
-  return '<tr'+(dot?'':' class="off"')+'><td><b><span class="dbDot '+dot+'"></span>'+dashPcName(p.pc)+'</b>'+(p.online&&p.pc!==d.me?' <a class="dbLink" style="padding:0 4px" href="/api/fleet/open?pc='+p.pc+'" target="_blank" rel="noopener" title="'+dashPcName(p.pc)+' 화면을 관리자로 열기">원격 관리 ↗</a>':'')+'<span class="dbSub">'+state+gpu+'</span></td>'+
+  return '<tr'+(dot?'':' class="off"')+'><td><b><span class="dbDot '+dot+'"></span>'+dashPcName(p.pc)+'</b>'+(p.online&&p.pc!==d.me?' <a class="dbLink" style="padding:0 4px" href="/api/fleet/open?pc='+p.pc+'" target="_blank" rel="noopener" title="'+dashPcName(p.pc)+' 화면을 관리자로 열기">원격 관리 ↗</a>':'')+'<span class="dbSub">'+state+gpu+(p.missing?'':queue)+'</span></td>'+
    dashNum(uniq(starts.filter(of)))+dashNum(recon.filter(of).length)+dashNum(mano.filter(of).length)+dashNum(pub.filter(of).length)+dashNum(f,true)+
    (sum(work.filter(of))?'<td class="dbR">'+dashDur(sum(work.filter(of)))+'</td>':'<td class="dbR zero">—</td>')+'<td class="dbNow">'+(now||'<span class="zero">—</span>')+(wait?'<span class="dbSub">MANO 대기 '+wait+'개</span>':'')+'</td><td class="dbVer">'+dashVersion(p)+'</td></tr>'}).join('');
  // 에피소드

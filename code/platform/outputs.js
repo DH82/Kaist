@@ -220,10 +220,38 @@ function rawWho(e){
  return name===me?'<span class="rawMe">'+label+'</span>':label;
 }
 function renderRawTeam(){
- const t=rawTeam,el=$('rawTeam');if(!t){el.textContent='';return}
- const ops=t.operators.map(n=>escape(n)+' '+(t.load[n]||0)+'/'+t.target+(n===t.me?' (나)':'')).join(' · ');
- el.innerHTML='로그인 사용자 '+t.total_users+'명 · 작업자 '+t.operators.length+'명(관리자 '+t.admins+'명 제외) · 작업자마다 '+t.target+'개씩 자동 배정, 3D 복원이 끝나면 남은 RAW에서 다시 채웁니다.'+(ops?'<br>'+ops:'');
+ const t=rawTeam,el=$('rawTeam');if(!t){el.textContent='';renderQueueCtl();return}
+ const tg=n=>(t.targets&&t.targets[n]!=null)?t.targets[n]:t.target;
+ const ops=t.operators.map(n=>escape(n)+' '+(t.load[n]||0)+'/'+tg(n)+(n===t.me?' (나)':'')).join(' · ');
+ el.innerHTML='로그인 사용자 '+t.total_users+'명 · 작업자 '+t.operators.length+'명(관리자 '+t.admins+'명 제외) · 작업자마다 각자 정한 큐 크기(기본 '+(t.default_target??t.target)+'개)만큼 자동 배정, 3D 복원이 끝나면 남은 RAW에서 다시 채웁니다.'+(ops?'<br>'+ops:'');
+ renderQueueCtl();
 }
+// 내 RAW 큐 크기(각자 설정): NAS에 바로 저장되어 모든 PC 화면에 같은 값이 쓰입니다.
+let queueSaving=false;
+function renderQueueCtl(){
+ const box=$('rawQueueCtl'),t=rawTeam,q=t&&t.my_queue;
+ if(!q||!/^PC[1-6]$/.test(t.me||'')){box.hidden=true;return}
+ box.hidden=false;
+ const input=$('rawQueueInput');
+ if(document.activeElement!==input&&!queueSaving){input.value=q.target;input.min=q.min;input.max=q.max}
+ $('rawQueueNote').textContent=(q.custom?'내가 정한 값':'기본값')+' · '+(q.nas?'NAS에 저장돼 모든 PC에 적용':'NAS 미연결 · 이 PC에만 저장');
+}
+async function saveQueueTarget(){
+ const input=$('rawQueueInput'),v=Number(input.value),q=rawTeam&&rawTeam.my_queue;
+ if(!q||!Number.isInteger(v)||v<q.min||v>q.max){notice('큐 크기는 '+(q?q.min:0)+'~'+(q?q.max:30)+'개 사이 정수로 입력하세요.',true);return}
+ if(v===q.target&&q.custom)return;
+ if(v<q.target&&!confirm('내 큐를 '+q.target+'개 → '+v+'개로 줄입니다.\n시작하지 않은 배정 중 늦은 촬영부터 풀려 다른 작업자에게 갈 수 있습니다(시작한 RAW는 그대로).\n\n바꿀까요?')){input.value=q.target;return}
+ queueSaving=true;$('rawQueueSave').disabled=true;
+ try{
+  const r=await api('/api/queue-target',{method:'POST',body:JSON.stringify({target:v})});
+  notice('내 RAW 큐를 '+r.target+'개로 정했습니다.'+(r.nas?' NAS에 저장되어 모든 PC 화면에 바로 적용됩니다.':' (NAS 미연결 · 이 PC에만 저장)'));
+  if(rawTeam)rawTeam.my_queue=r;
+  input.blur();await refreshRawBoard(true);
+ }catch(e){notice(e.message,true)}
+ finally{queueSaving=false;$('rawQueueSave').disabled=false;renderQueueCtl()}
+}
+$('rawQueueSave').onclick=saveQueueTarget;
+$('rawQueueInput').onkeydown=e=>{if(e.key==='Enter'){e.preventDefault();saveQueueTarget()}};
 function renderRawTable(){
  rawDateCal.refresh();
  const filter=rawDateFilter,groups={},me=rawTeam&&rawTeam.me;

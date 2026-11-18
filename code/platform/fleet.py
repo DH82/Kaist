@@ -360,6 +360,56 @@ def raw_distributed():
     return out
 
 
+# ---- 작업자별 RAW 큐 크기: control/queue_targets/<이름>.json {"target": n, "by": ..., "at": ...} ----
+# 작업자(PC1~PC6 로그인 이름)가 직접 정합니다. 배정할 때마다 NAS 파일을 읽으므로 어느 PC 화면에서 바꿔도 바로 반영됩니다.
+QUEUE_MIN, QUEUE_MAX = 0, 30
+QUEUE_NAME = re.compile(r'PC[1-6]')
+
+
+def _queue_dir():
+    return CONTROL / 'queue_targets'
+
+
+def queue_target_get(name):
+    """작업자가 정한 큐 크기. 정한 적 없거나 읽을 수 없으면 None."""
+    if not QUEUE_NAME.fullmatch(name or '') or not available():
+        return None
+    try:
+        v = json.loads((_queue_dir() / f'{name}.json').read_text()).get('target')
+    except (OSError, ValueError, AttributeError):
+        return None
+    return v if isinstance(v, int) and not isinstance(v, bool) and QUEUE_MIN <= v <= QUEUE_MAX else None
+
+
+def queue_target_set(name, target, by):
+    """원자적으로 씁니다(임시 파일 → rename, NFS에서도 읽는 쪽은 완성된 파일만 봄)."""
+    if not QUEUE_NAME.fullmatch(name or ''):
+        raise ValueError('작업자 이름이 잘못되었습니다.')
+    if not isinstance(target, int) or isinstance(target, bool) or not QUEUE_MIN <= target <= QUEUE_MAX:
+        raise ValueError(f'큐 크기는 {QUEUE_MIN}~{QUEUE_MAX}개입니다.')
+    d = _queue_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    data = {'target': target, 'by': by, 'from_pc': PC_ID, 'at': time.time()}
+    tmp = d / f'.{name}.{secrets.token_hex(4)}.tmp'
+    tmp.write_text(json.dumps(data, ensure_ascii=False))
+    os.replace(tmp, d / f'{name}.json')
+    return data
+
+
+def queue_targets():
+    """{이름: {target, by, from_pc, at}} — 관리자 화면용"""
+    out = {}
+    try:
+        for p in _queue_dir().glob('PC*.json'):
+            try:
+                out[p.stem] = json.loads(p.read_text())
+            except (OSError, ValueError):
+                pass
+    except OSError:
+        pass
+    return out
+
+
 def raw_taken_elsewhere():
     """다른 PC가 선점했거나 이미 시작한 RAW → {RAW: pc}"""
     out = {ep: pc for ep, pc in raw_claims().items() if pc != PC_ID}

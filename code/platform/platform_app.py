@@ -1180,7 +1180,7 @@ def raw_episodes(req:Request):
  excluded=access.excluded_raw(user['name'],selected_worker(req))
  def hidden(ep):
   return user['role']!='admin' and ep in excluded_by and ep not in excluded and owners.get(ep)!=user['name'] and ep not in latest
- assigned,team=access.rebalance(selected_worker(req),episodes,done,set(latest),claim=fleet.raw_claim,release=fleet.raw_release,blocked=set(excluded_by))
+ assigned,team=access.rebalance(selected_worker(req),episodes,done,set(latest),claim=fleet.raw_claim,release=fleet.raw_release,blocked=set(excluded_by),targets=queue_target_of)
  episodes=[ep for ep in episodes if not hidden(ep)]
  others=[ep for ep in others if not hidden(ep)]
  out=[]
@@ -1212,8 +1212,49 @@ def raw_episodes(req:Request):
   pc=elsewhere[ep];ran=started_other.get(ep)==pc
   out.append({'episode':ep,'operator':None,'assigned_to':None,'can_run':False,'done':False,'excluded_from_mine':False,'can_exclude':False,
               'elsewhere':pc.upper(),'elsewhere_started':ran,'progress':'다른 PC에서 실행' if ran else '제외됨 · '+excluded_by[ep] if ep in excluded_by else '다른 PC 배정 · 실행 전'})
- return {'episodes':out,'team':{'total_users':team['total'],'operators':team['operators'],'admins':team['admins'],'target':team['target'],
-         'load':team['load'],'me':user['name'],'role':user['role']}}
+ mine=queue_target_info(user['name'])
+ return {'episodes':out,'team':{'total_users':team['total'],'operators':team['operators'],'admins':team['admins'],
+         'target':team['targets'].get(user['name'],mine['target']),'targets':team['targets'],'default_target':access.ASSIGN_TARGET,
+         'my_queue':mine,'load':team['load'],'me':user['name'],'role':user['role']}}
+
+# ---- 작업자별 RAW 큐 크기(각자 설정): NAS control/queue_targets/<이름>.json, NAS를 못 쓰면 이 PC UI DB ----
+def queue_db():
+ c=access.db()
+ c.execute('CREATE TABLE IF NOT EXISTS queue_targets (name TEXT PRIMARY KEY,target INTEGER NOT NULL,at REAL)')
+ return c
+
+def queue_target_of(name):
+ """작업자가 정한 큐 크기(정한 적 없으면 None → 기본 access.ASSIGN_TARGET). 배정할 때마다 NAS에서 읽습니다."""
+ if fleet.available():return fleet.queue_target_get(name)
+ with queue_db() as c:r=c.execute('SELECT target FROM queue_targets WHERE name=?',(name,)).fetchone()
+ return r[0] if r else None
+
+def queue_target_info(name):
+ v=queue_target_of(name)
+ return {'target':access.ASSIGN_TARGET if v is None else v,'custom':v is not None,'nas':fleet.available(),'min':fleet.QUEUE_MIN,'max':fleet.QUEUE_MAX}
+
+class QueueTarget(BaseModel):
+ target:int=Field(ge=0,le=30)
+
+@app.post('/api/queue-target')
+def set_queue_target(data:QueueTarget,req:Request):
+ """내 RAW 큐 크기를 정합니다. NAS에 바로 저장되어 모든 PC 화면이 다음 새로고침부터 같은 값을 씁니다.
+ 줄이면 시작 전 배정 중 늦은 촬영부터 풀리고, 늘리면 남은 RAW에서 바로 채웁니다(실행을 시작한 RAW는 그대로)."""
+ guard(req);u=access.user(req)
+ if not fleet.QUEUE_NAME.fullmatch(u['name']):raise HTTPException(400,'PC1~PC6 이름으로 로그인한 작업자만 정할 수 있습니다.')
+ if fleet.available():
+  try:fleet.queue_target_set(u['name'],data.target,u.get('label') or u['name'])
+  except (OSError,ValueError) as e:raise HTTPException(503,'NAS에 저장하지 못했습니다: '+str(e)[:200])
+ else:
+  with queue_db() as c:c.execute('INSERT OR REPLACE INTO queue_targets VALUES(?,?,?)',(u['name'],data.target,time.time()))
+ access.audit(req,f'queue-target {data.target}')
+ return queue_target_info(u['name'])
+
+@app.get('/api/queue-targets')
+def list_queue_targets(req:Request):
+ """관리자: 작업자별 큐 크기(NAS 기록)"""
+ guard(req);access.admin(req)
+ return {'default':access.ASSIGN_TARGET,'nas':fleet.available(),'targets':fleet.queue_targets() if fleet.available() else {}}
 
 class RawExclusion(BaseModel):
  episode:str=Field(pattern=r'^ep_[A-Za-z0-9_]+$')
@@ -2204,7 +2245,7 @@ def fleet_report(req:Request):
   g=(p.get('gpu') or [None])[0]
   out['pcs'].append({'pc':p['pc'],'online':bool(p.get('online')),'missing':bool(p.get('missing')),'error':p.get('error'),'age':p.get('age'),
    'updated_at':(p.get('meta') or {}).get('updated_at'),'ui_url':(p.get('meta') or {}).get('ui_url'),'has_jobs':bool(p.get('has_jobs') or p.get('local_only')),
-   'gpu':g,'assignments':len(p.get('assignments') or []),'idle':bool(p.get('idle')),'update':fleet.update_info(p['pc']) if fleet.available() else None})
+   'gpu':g,'assignments':len(p.get('assignments') or []),'queue_target':queue_target_of(p['pc'].upper()) if fleet.available() else None,'default_queue':access.ASSIGN_TARGET,'idle':bool(p.get('idle')),'update':fleet.update_info(p['pc']) if fleet.available() else None})
   for k in ('jobs','published','runs','mano_waiting','frames'):
    out[k]+=[dict(r,pc=p['pc']) for r in p.get(k) or []]
  out['raw_free']=len(free_raws(started))

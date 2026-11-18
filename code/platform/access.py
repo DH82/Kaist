@@ -84,7 +84,7 @@ def execution_worker(episode):
 
 
 # ---- RAW 자동 배정: 로그인한 작업자(관리자 제외)마다 진행 중인 RAW를 ASSIGN_TARGET개로 유지 ----
-ASSIGN_TARGET=3
+ASSIGN_TARGET=5
 _assign_lock=threading.Lock()
 
 def logged_in():
@@ -131,12 +131,16 @@ def capture_key(ep):
  # ep_YYYYMMDD_HHMMSS → 촬영 시각 순서(오래된 것부터)
  return ep
 
-def rebalance(worker_id,episodes,done,started,target=ASSIGN_TARGET,claim=None,release=None,blocked=()):
+def rebalance(worker_id,episodes,done,started,target=ASSIGN_TARGET,claim=None,release=None,blocked=(),targets=None):
  """episodes: 이 PC의 RAW 목록, done: 3D 복원까지 끝난 RAW, started: 실행 기록이 있는 RAW.
  - 회수: 실행을 시작했거나(담당자 생김) 목록에서 사라졌거나 배정받은 작업자의 세션이 없으면 배정을 풉니다.
  - 부하: 작업자별 (시작 전 배정) + (본인 담당이면서 3D 복원이 끝나지 않은 RAW)
  - 채우기: 담당자·실행 기록·배정이 없는 RAW를 오래된 촬영부터, 부하가 가장 적은 작업자에게 하나씩 줍니다.
- - 제외: 누구든 '내 작업에서 제외'한 RAW(이 PC 기록 + blocked: 다른 PC가 NAS에 남긴 제외)는 아무에게도 배정하지 않습니다."""
+ - 제외: 누구든 '내 작업에서 제외'한 RAW(이 PC 기록 + blocked: 다른 PC가 NAS에 남긴 제외)는 아무에게도 배정하지 않습니다.
+ - 큐 크기: targets(이름 → 개수 함수)로 작업자마다 다르게 정할 수 있고, 줄이면 시작 전 배정 중 늦은 촬영부터 풉니다."""
+ def tgt(u):
+  v=targets(u) if targets else None
+  return target if v is None else v
  with _assign_lock:
   users=logged_in();ops=users['operators'];own=owners();eps=set(episodes)
   with db() as c:
@@ -153,11 +157,20 @@ def rebalance(worker_id,episodes,done,started,target=ASSIGN_TARGET,claim=None,re
    for ep in eps:
     o=own.get(ep)
     if o in load and ep not in done and (worker_id,ep,o) not in excluded:load[o]+=1
+   goal={u:tgt(u) for u in ops}
+   # 큐를 줄였으면: 시작 전 배정(이 PC)을 늦은 촬영부터 풀어 목표 개수에 맞춥니다(시작한 RAW는 그대로).
+   for u in ops:
+    extra=load[u]-goal[u]
+    if extra<=0:continue
+    mine=sorted((ep for ep,(op,wid) in rows.items() if op==u and wid==worker_id),key=capture_key,reverse=True)
+    for ep in mine[:extra]:
+     c.execute('DELETE FROM raw_assignments WHERE episode=?',(ep,));del rows[ep];load[u]-=1
+     if release and not own.get(ep):release(ep)
    pool=[ep for ep in sorted(eps,key=capture_key) if not own.get(ep) and ep not in started and ep not in rows and ep not in blocked]
    for ep in pool:
-    needy=[u for u in ops if load[u]<target and (worker_id,ep,u) not in excluded]
+    needy=[u for u in ops if load[u]<goal[u] and (worker_id,ep,u) not in excluded]
     if not needy:continue
     if claim and not claim(ep):continue  # 다른 PC가 먼저 선점한 RAW
     u=min(needy,key=lambda n:(load[n],n))
     c.execute('INSERT INTO raw_assignments VALUES(?,?,?,?)',(ep,u,worker_id,time.time()));rows[ep]=(u,worker_id);load[u]+=1
-  return {ep:op for ep,(op,_) in rows.items()},dict(users,load=load,target=target)
+  return {ep:op for ep,(op,_) in rows.items()},dict(users,load=load,target=target,targets=goal)
