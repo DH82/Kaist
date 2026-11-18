@@ -23,9 +23,11 @@ async def lifespan(app):
  task=None
  if os.environ.get('KAIST_AIRFLOW_API_URL'):
   task=asyncio.create_task(prepare_worker_pools())
+  threading.Thread(target=cont_loop,name='kaist-continuous',daemon=True).start()
  try:
   yield
  finally:
+  _cont_stop.set()
   if task:
    task.cancel()
    await asyncio.gather(task,return_exceptions=True)
@@ -333,6 +335,88 @@ def gpu_usage(req:Request):
  gpu_cache[wid]=(time.monotonic(),d)
  return d
 
+# ---- 사이드바 '지금 진행 중': 이 PC Worker의 실행·대기 단계 + 단계별 예상 소요 시간 ----
+# 예상 시간 = 단계별 '프레임당 평균 시간'(ESTIMATE_SINCE 이후 성공 기록만, 오류·실패·중단 제외 · 재시도 전 시도 포함) × 이 에피소드 프레임 수.
+# 프레임 수(전처리 후 프레임, 이후 단계에서 변하지 않음)를 아직 모르면 같은 기간 평균 소요 시간을 씁니다.
+ESTIMATE_SINCE=datetime.fromisoformat(os.environ.get('KAIST_ESTIMATE_SINCE','2026-11-17T15:00:00+09:00')).timestamp()
+ESTIMATE_SKIP={'sam_settings_ready','mask_approved','tracking_approved'}   # 검수·설정 대기 관문: 시간은 작업자에게 달림
+ACTIVITY_STALE_SECONDS=12*3600
+_estimate_cache=[0.0,{}]
+
+def _job_dirs():
+ root=worker_jobs_dir()
+ try:return [d for d in root.iterdir() if d.is_dir() and not d.name.startswith('_')] if root and root.is_dir() else []
+ except OSError:return []
+
+def stage_estimates():
+ """{stage:{per_frame,frames,runs,mean,timed}} 60초 캐시. per_frame=총 소요 시간/총 프레임(프레임 수를 아는 기록만)."""
+ if time.monotonic()-_estimate_cache[0]<60:return _estimate_cache[1]
+ try:frames={r['episode']:r['prepared'] for r in episode_frame_rows() if r.get('prepared')}
+ except Exception:frames={}
+ acc={}
+ for d in _job_dirs():
+  try:req=json.loads((d/'request.json').read_text())
+  except (OSError,ValueError):continue
+  files=[d/'status.json']+(sorted((d/'attempts').glob('*/status.json')) if (d/'attempts').is_dir() else [])
+  for f in files:
+   try:st=json.loads(f.read_text())
+   except (OSError,ValueError):continue
+   s,e=st.get('started'),st.get('finished')
+   if st.get('state')!='success' or st.get('error') or not s or not e or s<ESTIMATE_SINCE or e<s:continue
+   a=acc.setdefault(req.get('stage'),{'secs':0.0,'frames':0,'fsecs':0.0,'runs':0,'timed':0})
+   a['secs']+=e-s;a['timed']+=1
+   n=frames.get(req.get('episode'))
+   if n:a['fsecs']+=e-s;a['frames']+=n;a['runs']+=1
+ out={k:{'per_frame':a['fsecs']/a['frames'] if a['frames'] else None,'frames':a['frames'],'runs':a['runs'],
+         'mean':a['secs']/a['timed'],'timed':a['timed']} for k,a in acc.items() if k}
+ _estimate_cache[:]=[time.monotonic(),out]
+ return out
+
+def episode_prepared_frames(ep,cache):
+ if ep not in cache:
+  n=stage_frames(Path(WORK_DIR),ep).get('prepared') if WORK_DIR and re.fullmatch(r'ep_[A-Za-z0-9_]+',ep or '') else None
+  if not n:
+   try:
+    with frames_db() as c:row=c.execute('SELECT prepared FROM episode_frames WHERE episode=?',(ep,)).fetchone()
+    n=row[0] if row else None
+   except Exception:n=None
+  cache[ep]=n
+ return cache[ep]
+
+@app.get('/api/activity')
+def activity(req:Request):
+ guard(req)
+ wid=selected_worker(req)
+ if wid!=DEFAULT_WORKER:return {'available':False,'items':[]}   # 작업 기록은 이 PC Worker 폴더에서만 읽습니다
+ now=time.time();items=[];frame_cache={};ready_today=set()
+ t=time.localtime(now);midnight=time.mktime((t.tm_year,t.tm_mon,t.tm_mday,0,0,0,0,0,-1))
+ for d in _job_dirs():
+  try:st=json.loads((d/'status.json').read_text())
+  except (OSError,ValueError):continue
+  # 오늘(이 PC 시간대 0시 이후) 3D 복원까지 성공 = MANO 대기 직전 단계까지 끝낸 에피소드(같은 에피소드 재실행은 1개로 셈)
+  if st.get('stage')=='reconstruct' and st.get('state')=='success' and (st.get('finished') or 0)>=midnight:
+   try:ready_today.add(json.loads((d/'request.json').read_text()).get('episode'))
+   except (OSError,ValueError):pass
+   continue
+  if st.get('state') not in ('running','queued') or st.get('stage') in ESTIMATE_SKIP:continue
+  if now-(st.get('started') or st.get('created') or 0)>ACTIVITY_STALE_SECONDS:continue
+  try:rq=json.loads((d/'request.json').read_text())
+  except (OSError,ValueError):continue
+  items.append({'episode':rq.get('episode'),'stage':rq.get('stage'),'run_id':rq.get('run_id'),'state':st['state'],
+                'created':st.get('created'),'started':st.get('started') if st['state']=='running' else None,
+                'gpu_slot':st.get('gpu_slot'),'progress':st.get('progress')})
+ est=stage_estimates()
+ for it in items:
+  e=est.get(it['stage']);n=episode_prepared_frames(it['episode'],frame_cache)
+  it['frames']=n
+  if e and e['per_frame'] and n:it['estimate']={'seconds':e['per_frame']*n,'per_frame':e['per_frame'],'basis':'frames','runs':e['runs']}
+  elif e:it['estimate']={'seconds':e['mean'],'basis':'mean','runs':e['timed']}
+  else:it['estimate']=None
+  ref=it['started'] if it['state']=='running' else it['created']
+  it['elapsed']=max(0,now-ref) if ref else None
+ items.sort(key=lambda x:(x['state']!='running',x['started'] or x['created'] or 0))
+ return {'available':True,'items':items,'since':ESTIMATE_SINCE,'ready_today':len(ready_today-{None})}
+
 def object_bboxes(value):
  # 선택 옵션: 첫 프레임 bbox(카메라 1~4 → 0~3, 정규화 x,y,w,h). Worker에서도 같은 기준으로 다시 검사합니다.
  if not isinstance(value,dict) or sorted(value)!=['0','1','2','3']:raise HTTPException(400,'bbox 물체 추적은 카메라 4대 모두 첫 프레임에서 물체 bbox를 그려야 합니다.')
@@ -386,11 +470,15 @@ def update_block():
 
 @app.post('/api/run')
 def launch(data:Launch,req:Request):
+ return _launch(data,req)
+
+def _launch(data,req,bypass_limit=False):
+ """bypass_limit: SAM3 연속 모드 대기열(cont_tick)에서만 True. PC당 동시 실행 한도를 적용하지 않습니다."""
  guard(req)
  if data.mode!='test':update_block()
  if data.mode=='test':access.admin(req)
  elif access.owners().get(data.episode_id) not in (None,access.user(req)['name']):raise HTTPException(403,'다른 작업자가 선택한 에피소드입니다.')
- elif not access.selectable(req,data.episode_id,data.worker_id):raise HTTPException(403,'본인에게 배정된 RAW만 시작할 수 있습니다. RAW 목록의 내 배정을 확인하세요.')
+ elif not raw_startable(req,data.episode_id,data.worker_id):raise HTTPException(403,'본인에게 배정된 RAW만 시작할 수 있습니다. RAW 목록의 내 배정을 확인하세요.')
  if data.mode not in DIRECT_DAGS:raise HTTPException(400,'실행 모드를 선택하세요.')
  try:pc=worker(data.worker_id)
  except ValueError as e:raise HTTPException(400,str(e))
@@ -401,8 +489,10 @@ def launch(data:Launch,req:Request):
   if data.worker_id!=DEFAULT_WORKER or data.mode!='pipeline':raise HTTPException(400,local_pc_label()+' 전체 파이프라인에서만 선택할 수 있습니다.')
   dag=DAY_DAG
  with lock:
-  if data.mode in ('raw','pipeline') and not access.selectable(req,data.episode_id,data.worker_id):
+  if data.mode in ('raw','pipeline') and not raw_startable(req,data.episode_id,data.worker_id):
    raise HTTPException(403,'배정이 변경되었거나 내 작업에서 제외한 RAW입니다. 목록을 새로고침하세요.')
+  if data.mode in ('raw','pipeline') and not bypass_limit and data.episode_id in cont_waiting_eps():
+   raise HTTPException(409,'SAM3 연속 모드 대기열에 있는 RAW입니다. 순서가 되면 자동으로 시작합니다(직접 실행하려면 대기열에서 빼세요).')
   # PC 간 중복 실행 방지: 다른 PC가 선점한 RAW는 시작하지 않습니다(이 PC에 이미 담당·실행 기록이 있으면 예외).
   if data.mode in ('raw','pipeline') and not access.owners().get(data.episode_id) and not fleet.raw_claim(data.episode_id):
    raise HTTPException(409,f'이 RAW는 {(fleet.raw_owner(data.episode_id) or "다른 PC").upper()}에서 작업 중입니다.')
@@ -423,7 +513,7 @@ def launch(data:Launch,req:Request):
     if not run_waiting(other_dag,row):running_here+=1
   # PC 한 대에서 최대 MAX_PARALLEL_RUNS개까지 동시에 진행합니다.
   # RAW 전처리 일괄 실행(prep)은 한도와 무관하게 시작합니다. 실제 GPU 동시 계산은 GPU PC의 GPU 슬롯이 2개로 제한합니다.
-  if running_here>=MAX_PARALLEL_RUNS and not data.prep:raise HTTPException(409,f'선택한 PC에서 이미 {running_here}개 작업이 실행 중입니다. (최대 {MAX_PARALLEL_RUNS}개 동시 실행)')
+  if running_here>=MAX_PARALLEL_RUNS and not data.prep and not bypass_limit:raise HTTPException(409,f'선택한 PC에서 이미 {running_here}개 작업이 실행 중입니다. (최대 {MAX_PARALLEL_RUNS}개 동시 실행)')
   if data.mode=='pipeline':
    for other_wid,_,other_dag in active_dags():
     if other_wid==data.worker_id:continue
@@ -1074,6 +1164,8 @@ def raw_episodes(req:Request):
   if fleet.available():
    started_other=fleet.started_elsewhere()
    elsewhere={ep:pc for ep,pc in fleet.raw_claims().items() if pc!=fleet.PC_ID}
+   for ep,pc in fleet.raw_distributed().items():  # 연속 모드로 다른 PC에 분배한 RAW
+    if pc!=fleet.PC_ID:elsewhere.setdefault(ep,pc)
    for ep,pc in started_other.items():elsewhere.setdefault(ep,pc)
  except Exception:started_other,elsewhere={},{}
  queued=[ep for ep in episodes if raw_in_queue(ep,owners,latest)]
@@ -1092,15 +1184,18 @@ def raw_episodes(req:Request):
  episodes=[ep for ep in episodes if not hidden(ep)]
  others=[ep for ep in others if not hidden(ep)]
  out=[]
+ dist=my_distributed();contq=cont_waiting_eps()  # SAM3 연속 모드
  for ep in episodes:
   owner=owners.get(ep);row=raw_row(ep,owner,user)
   # 다른 작업자의 담당·진행 단계도 모두 보여 줍니다(실행·수정은 본인 것만).
   row.update(operator=owner,assigned_to=None if owner else assigned.get(ep),done=ep in done)
   row['excluded_from_mine']=user['role']!='admin' and ep in excluded
   row['can_exclude']=user['role']=='operator' and ep not in excluded and ((owner==user['name'] and ep not in done) or (not owner and assigned.get(ep)==user['name']))
-  if user['role']!='admin':row['can_run']=ep not in excluded and (owner==user['name'] or (not owner and assigned.get(ep)==user['name']))
+  if user['role']!='admin':row['can_run']=ep not in excluded and (owner==user['name'] or (not owner and (assigned.get(ep)==user['name'] or ep in dist)))
   progress='실행 전' if not owner else '실행 기록 확인 필요'
   if not owner and ep not in latest:progress=('배정됨 · 실행 전' if assigned.get(ep) else '제외됨 · '+excluded_by[ep] if ep in excluded_by else '미배정 · 대기')
+  if not owner and ep not in latest and ep in contq:progress='연속 모드 · 실행 대기'
+  elif not owner and ep not in latest and ep in dist:progress='연속 모드 분배 · 포인트 전'
   if ep in latest:
    _,dag,r,mode=latest[ep]
    if (mode=='day' or r['dag_run_id'] in deferred) and r['state']=='success':progress=mano_progress(r,batch_states)[0]
@@ -1770,9 +1865,15 @@ def fleet_raw_reset(task,p):
   for e in rows:
    if not own.get(e):fleet.raw_release(e)
   for e in unmark:fleet.raw_unexclude(e)  # 이 PC가 NAS에 남긴 제외 표시도 풉니다.
+  # SAM3 연속 모드: 이 PC에 분배된 시작 전 RAW와 실행 전 대기열 항목도 풉니다.
+  dist=[e for e in my_distributed() if (not ep or e==ep) and not own.get(e)]
+  for e in dist:fleet.raw_undistribute(e,fleet.PC_ID)
+  with cont_db() as c:
+   ncont=c.execute("UPDATE sam_queue SET state='cancelled' WHERE state IN ('waiting','failed')"+(' AND raw_episode=?' if ep else ''),(ep,) if ep else ()).rowcount
   # 겹침 정리: 남기는 PC가 따로 있으면 이 PC의 선점도 풉니다(이 PC가 실행한 RAW는 제외).
   if ep and not own.get(ep):fleet.raw_release(ep)
- msg=(f'{ep} 시작 전 배정 해제' if ep else f'대기열 초기화: 시작 전 배정 {len(rows)}개 · 제외 기록 {excl}개 해제')+(' (배정 없음)' if not rows else '')
+ msg=(f'{ep} 시작 전 배정 해제' if ep else f'대기열 초기화: 시작 전 배정 {len(rows)}개 · 제외 기록 {excl}개 해제')+(' (배정 없음)' if not rows and not dist else '')
+ if dist or ncont:msg+=f' · 연속 모드 분배 {len(dist)}개 · 대기열 {ncont}개 해제'
  task_update(task['id'],state='done',message=msg)
 
 def fleet_reconstruct_redo(task,p):
@@ -1955,6 +2056,7 @@ def reconcile_raw_claims(snap):
  - 이 PC가 선점했지만 배정·담당·실행이 모두 없으면 해제(다른 PC가 가져갈 수 있게)."""
  with access._assign_lock:
   started=set(snap.get('raw_started') or []);mine=started|{e for e in access.owners() if fleet.RAW_NAME.fullmatch(e)}
+  mine|=my_distributed()|cont_waiting_eps()  # SAM3 연속 모드: 분배받은 RAW·대기열 RAW는 배정 행이 없어도 선점 유지
   for ep in mine:fleet.raw_claim(ep)
   assigned=access.assignments()
   for ep in list(assigned):
@@ -2325,3 +2427,265 @@ def save_sam_settings(data:SamSettings,req:Request):
  except Exception as e:print('SAM3 설정 대기 깨우기 실패:',e,flush=True)
  access.audit(req,'sam-settings '+ep+' '+data.sam_prompt.strip())
  return {'ok':True,'episode':ep,'settings':res.get('settings')}
+
+# ==== SAM3 연속 모드 ====
+# 작업자가 분배·배정받은 RAW마다 첫 프레임 4장(카메라 1~4)에 포인트(카메라당 최대 20개)와 분할 대상 텍스트를 넣고 '완료'하면
+# 대기열(sam_queue)에 쌓이고, 아래 스레드가 완료한 순서대로 하나씩 실행합니다. 앞 실행의 RAW 전처리~SAM3가 끝나야 다음을 시작하며,
+# PC당 동시 실행 한도(MAX_PARALLEL_RUNS)는 적용하지 않습니다. SAM3 뒤는 일반 실행과 같습니다(마스크 검수 대기).
+# 분배: 관리자가 남은 RAW 전체를 고른 PC(=작업자, PC 이름으로 로그인)에 균등 분배 → NAS control/distributed + claims.
+CONT_BUSY_STAGES=('prepare_raw','sam_settings_ready','sam3')
+CONT_TICK_SECONDS=10
+_cont_lock=threading.Lock();_cont_stop=threading.Event()
+
+def cont_db():
+ c=access.db()
+ c.execute('CREATE TABLE IF NOT EXISTS sam_queue (id INTEGER PRIMARY KEY AUTOINCREMENT,raw_episode TEXT NOT NULL,operator TEXT NOT NULL,worker_id TEXT NOT NULL,'
+           'sam_prompt TEXT NOT NULL,points TEXT NOT NULL,defer_mano INTEGER NOT NULL DEFAULT 0,created REAL NOT NULL,state TEXT NOT NULL,'
+           'run_id TEXT,dag_id TEXT,episode TEXT,error TEXT,started REAL)')
+ return c
+
+def my_distributed():
+ """이 PC에 분배된 RAW"""
+ try:return {ep for ep,pc in fleet.raw_distributed().items() if pc==fleet.PC_ID} if fleet.available() else set()
+ except Exception:return set()
+
+def cont_waiting_eps():
+ with cont_db() as c:return {r[0] for r in c.execute("SELECT raw_episode FROM sam_queue WHERE state='waiting'")}
+
+def raw_startable(req,ep,wid):
+ """자동 배정·담당(access.selectable) 또는 이 PC에 연속 모드로 분배된 RAW"""
+ if access.selectable(req,ep,wid):return True
+ u=access.user(req)
+ return ep in my_distributed() and ep not in access.excluded_raw(u['name'],wid) and access.owners().get(ep) in (None,u['name'])
+
+def raw_object(ep,cache=None):
+ """RAW 촬영 기록(rgbd_episode.json)의 물체 이름 → SAM3 분할 대상 기본값"""
+ rows=cache if cache is not None else {r['episode']:r for r in (raw_frames() or [])}
+ if ep in rows:return rows[ep].get('object')
+ root=Path(os.environ.get('KAIST_NAS_RAW_ROOT') or Path(os.environ.get('NAS_MOUNT','/mnt/kaist-data'))/'rgbd_raw')
+ try:meta=json.loads((root/ep/'rgbd_episode.json').read_text())
+ except (OSError,ValueError):return None
+ obj=meta.get('object') or {}
+ return obj.get('name') or obj.get('label') or obj.get('prompt') or (meta.get('task') or {}).get('taskName')
+
+def cont_busy(c):
+ """연속 모드로 시작한 실행 중 RAW 전처리~SAM3 단계에 있는 것이 있으면 True(확인할 수 없어도 기다림)."""
+ for r in c.execute("SELECT run_id,dag_id FROM sam_queue WHERE state='started' AND started>?",(time.time()-2*86400,)).fetchall():
+  try:
+   run=local_api('GET',f"/api/v2/dags/{r['dag_id']}/dagRuns/"+quote(r['run_id'],safe=''))
+   if run['state'] not in ('queued','running'):continue
+   stage,state=current_stage(r['dag_id'],r['run_id'])
+  except Exception:return True
+  if stage in CONT_BUSY_STAGES and state not in ('failed','upstream_failed'):return True
+ return False
+
+def cont_fail(row_id,msg):
+ with cont_db() as c:c.execute("UPDATE sam_queue SET state='failed',error=? WHERE id=?",(str(msg)[:500],row_id))
+
+def cont_tick():
+ if not _cont_lock.acquire(blocking=False):return
+ try:
+  with cont_db() as c:
+   nxt=c.execute("SELECT * FROM sam_queue WHERE state='waiting' AND worker_id=? ORDER BY created,id LIMIT 1",(DEFAULT_WORKER,)).fetchone()
+   if not nxt or cont_busy(c):return
+  try:update_block()
+  except HTTPException:return   # 업데이트 대기 중: 끝나면 이어서 시작
+  ep,op=nxt['raw_episode'],nxt['operator']
+  own=access.owners().get(ep)
+  if own:return cont_fail(nxt['id'],f'이미 실행을 시작한 RAW입니다({own}). 같은 RAW를 두 번 실행하지 않습니다.')
+  if fleet.available():
+   if not (own==op or ep in my_distributed() or access.assignments().get(ep)==op):return cont_fail(nxt['id'],'분배·배정이 회수된 RAW입니다.')
+   where=fleet.raw_taken_elsewhere().get(ep)
+   if where:return cont_fail(nxt['id'],f'이 RAW는 {where.upper()}에서 작업 중입니다.')
+  # 포인트를 찍은 작업자 이름의 관리자 세션으로 일반 실행과 같은 검사를 거쳐 시작합니다(동시 실행 한도만 제외).
+  tok=access.login(op,'admin')
+  try:
+   res=_launch(Launch(mode='pipeline',worker_id=nxt['worker_id'],episode_id=ep,sam_prompt=nxt['sam_prompt'],confirmed=True,preview_episode=ep,
+                      defer_mano=bool(nxt['defer_mano']),sam_object_mode='point_track',sam_object_points=json.loads(nxt['points'])),
+               internal_request(tok),bypass_limit=True)
+  except HTTPException as e:
+   if e.status_code==503:return
+   return cont_fail(nxt['id'],e.detail)
+  except Exception as e:
+   print('연속 모드 실행 시작 실패(다음 확인 때 다시 시도):',e,flush=True);return
+  finally:
+   with access.db() as c:c.execute('DELETE FROM ui_sessions WHERE token=?',(tok,))
+  with cont_db() as c:
+   c.execute("UPDATE sam_queue SET state='started',run_id=?,dag_id=?,episode=?,started=?,error=NULL WHERE id=?",(res['run_id'],res['dag_id'],res['episode'],time.time(),nxt['id']))
+   c.execute('INSERT INTO ui_audit VALUES(?,?,?)',(time.time(),op,f"continuous start {ep} {res['run_id']}"))
+ finally:_cont_lock.release()
+
+def cont_kick():threading.Thread(target=cont_tick,name='kaist-cont-kick',daemon=True).start()
+
+def cont_loop():
+ while not _cont_stop.wait(CONT_TICK_SECONDS):
+  try:cont_tick()
+  except Exception as e:print('연속 모드 대기열 확인 실패:',e,flush=True)
+
+@app.get('/api/continuous')
+def cont_status(req:Request):
+ guard(req);u=access.user(req);wid=selected_worker(req)
+ if wid!=DEFAULT_WORKER:return {'available':False}
+ me=u['name'];own=access.owners();assigned=access.assignments();dist=my_distributed();excluded=access.excluded_raw(me,wid)
+ with cont_db() as c:
+  rows=[dict(r) for r in c.execute("SELECT id,raw_episode,operator,sam_prompt,state,run_id,dag_id,episode,error,created,started FROM sam_queue "
+                                  "WHERE worker_id=? AND (state IN ('waiting','failed') OR (state='started' AND started>?)) ORDER BY created,id",(wid,time.time()-86400))]
+ active={r['raw_episode'] for r in rows if r['state'] in ('waiting','failed')}
+ try:raws=set(call('GET','/worker/info',worker_id=wid)['episodes'])
+ except Exception:raws=None
+ others=fleet.raw_taken_elsewhere() if fleet.available() else {}
+ cand=dist|{ep for ep,op in assigned.items() if op==me}
+ todo=sorted(ep for ep in cand if not own.get(ep) and ep not in active and ep not in excluded and ep not in others and (raws is None or ep in raws))
+ cache={r['episode']:r for r in (raw_frames() or [])}
+ n=0;shown=0
+ for r in rows:
+  if r['state']=='waiting':n+=1;r['position']=n
+  r['mine']=r['operator']==me or u['role']=='admin'
+ # 오늘 시작한 실행은 최근 8개만 현재 단계를 붙입니다(Airflow 조회 수 제한).
+ for r in reversed(rows):
+  if r['state']!='started' or shown>=8:continue
+  shown+=1
+  try:
+   run=local_api('GET',f"/api/v2/dags/{r['dag_id']}/dagRuns/"+quote(r['run_id'],safe=''))
+   if run['state']=='success':r['stage']='완료'
+   elif run['state']=='failed':r['stage']='실패 · 작업 현황 확인'
+   else:
+    stage,state=current_stage(r['dag_id'],r['run_id'])
+    r['stage']=(JOB_STAGE_LABELS.get(stage,stage or '실행 대기'))+(' · 검수 대기' if stage in WAIT_STAGES[1:] else ' · 실패' if state=='failed' else '')
+  except Exception:r['stage']=None
+ return {'available':True,'me':me,'todo':[{'episode':ep,'object':raw_object(ep,cache) if i<1 or ep in cache else None} for i,ep in enumerate(todo)],
+         'queue':rows,'distributed':len(dist),'busy_stages':list(CONT_BUSY_STAGES)}
+
+JOB_STAGE_LABELS={'prepare_raw':'RAW 전처리','sam_settings_ready':'분할 설정 확인','sam3':'SAM3','mask_approved':'마스크 검수','preflight':'추적 사전 검사','track':'추적',
+                  'tracking_approved':'추적 검수','prepare_reconstruction':'복원 준비','reconstruct':'3D 복원','hands':'MANO 피팅','validate':'결과 검사','publish':'최종 저장'}
+
+@app.get('/api/continuous/object')
+def cont_object(req:Request,episode:str):
+ guard(req)
+ if not re.fullmatch(r'ep_[A-Za-z0-9_]+',episode):raise HTTPException(400,'에피소드 이름이 잘못되었습니다.')
+ return {'episode':episode,'object':raw_object(episode)}
+
+class ContSubmit(BaseModel):
+ episode:str=Field(pattern=r'^ep_[A-Za-z0-9_]+$')
+ sam_prompt:str=Field(min_length=1,max_length=200)
+ points:dict
+ defer_mano:bool=False
+
+@app.post('/api/continuous/submit')
+def cont_submit(data:ContSubmit,req:Request):
+ guard(req);u=access.user(req);wid=DEFAULT_WORKER;ep=data.episode
+ points=object_points(data.points)
+ if data.defer_mano and wid!=DEFAULT_WORKER:raise HTTPException(400,'MANO 나중에 실행은 이 PC에서만 선택할 수 있습니다.')
+ if access.owners().get(ep):raise HTTPException(409,'이미 실행을 시작한 RAW입니다.')
+ if not raw_startable(req,ep,wid):raise HTTPException(403,'나에게 분배·배정된 RAW가 아닙니다. 목록을 새로고침하세요.')
+ if fleet.available():
+  where=fleet.raw_taken_elsewhere().get(ep)
+  if where:raise HTTPException(409,f'이 RAW는 {where.upper()}에서 작업 중입니다.')
+  if not fleet.raw_claim(ep):raise HTTPException(409,'다른 PC가 먼저 가져간 RAW입니다.')
+ with cont_db() as c:
+  c.execute('BEGIN IMMEDIATE')
+  if c.execute("SELECT 1 FROM sam_queue WHERE raw_episode=? AND state IN ('waiting','failed')",(ep,)).fetchone():raise HTTPException(409,'이미 연속 모드 대기열에 있는 RAW입니다.')
+  c.execute("INSERT INTO sam_queue(raw_episode,operator,worker_id,sam_prompt,points,defer_mano,created,state) VALUES(?,?,?,?,?,?,?,'waiting')",
+            (ep,u['name'],wid,data.sam_prompt.strip(),json.dumps(points),int(data.defer_mano),time.time()))
+ access.audit(req,'continuous submit '+ep+' '+data.sam_prompt.strip())
+ cont_kick()
+ return {'ok':True}
+
+class ContItem(BaseModel):
+ id:int
+
+def _cont_row(req,row_id,states):
+ u=access.user(req)
+ with cont_db() as c:r=c.execute('SELECT * FROM sam_queue WHERE id=?',(row_id,)).fetchone()
+ if not r or r['state'] not in states:raise HTTPException(409,'대기열 상태가 바뀌었습니다. 새로고침하세요.')
+ if u['role']!='admin' and r['operator']!=u['name']:raise HTTPException(403,'본인 항목만 바꿀 수 있습니다.')
+ return r
+
+@app.post('/api/continuous/cancel')
+def cont_cancel(data:ContItem,req:Request):
+ """실행 전(대기·실패) 항목을 빼면 그 RAW는 다시 '포인트 찍기'로 돌아갑니다."""
+ guard(req)
+ with _cont_lock:
+  r=_cont_row(req,data.id,('waiting','failed'))
+  with cont_db() as c:c.execute("UPDATE sam_queue SET state='cancelled' WHERE id=?",(r['id'],))
+ access.audit(req,'continuous cancel '+r['raw_episode'])
+ return {'ok':True,'episode':r['raw_episode']}
+
+@app.post('/api/continuous/retry')
+def cont_retry(data:ContItem,req:Request):
+ guard(req)
+ r=_cont_row(req,data.id,('failed',))
+ with cont_db() as c:c.execute("UPDATE sam_queue SET state='waiting',error=NULL,created=? WHERE id=?",(time.time(),r['id']))
+ access.audit(req,'continuous retry '+r['raw_episode']);cont_kick()
+ return {'ok':True}
+
+# ---- 관리자: 남은 RAW 균등 분배 ----
+def cont_started_all(pcs):
+ return set(access.owners())|{e for p in pcs for e in (p.get('raw_started') or [])}
+
+def cont_pool(started,dist,date=''):
+ """어느 PC도 선점·시작·제외·분배하지 않은 RAW(촬영일 RAW_QUEUE_START 이후, date='YYYY-MM-DD'면 그날 촬영만)"""
+ try:raws=call('GET','/worker/info',worker_id=DEFAULT_WORKER)['episodes']
+ except Exception as e:raise HTTPException(503,'RAW 목록을 불러오지 못했습니다.') from e
+ claims=fleet.raw_claims();excl=global_excluded();day=date.replace('-','')
+ out=[]
+ for ep in raws:
+  m=re.match(r'ep_(\d{8})_',ep)
+  if not m or m.group(1)<RAW_QUEUE_START or (day and m.group(1)!=day):continue
+  if ep in started or ep in claims or ep in excl or ep in dist:continue
+  out.append(ep)
+ return sorted(out)
+
+@app.get('/api/continuous/distribution')
+def cont_distribution(req:Request):
+ guard(req);access.admin(req)
+ if not fleet.available():return {'available':False}
+ pcs=fleet.read_all();dist=fleet.raw_distributed();started=cont_started_all(pcs)
+ per={p['pc']:{'pc':p['pc'],'online':bool(p.get('online')),'waiting':0,'started':0} for p in pcs}
+ for ep,pc in dist.items():
+  if pc in per:per[pc]['started' if ep in started else 'waiting']+=1
+ pool=cont_pool(started,dist);dates={}
+ for ep in pool:d=ep[3:7]+'-'+ep[7:9]+'-'+ep[9:11];dates[d]=dates.get(d,0)+1
+ return {'available':True,'pcs':list(per.values()),'pool':len(pool),'dates':dict(sorted(dates.items(),reverse=True))}
+
+class ContDistribute(BaseModel):
+ pcs:list[str]=Field(min_length=1,max_length=6)
+ date:str=Field(default='',pattern=r'^(\d{4}-\d{2}-\d{2})?$')
+
+@app.post('/api/continuous/distribute')
+def cont_distribute(data:ContDistribute,req:Request):
+ """남은 RAW를 고른 PC들에 오래된 촬영부터 하나씩, 시작 전 분배가 가장 적은 PC에 줍니다(PC별 개수가 같아지도록)."""
+ guard(req);admin=access.admin(req)
+ if not fleet.available():raise HTTPException(503,'NAS 관제를 사용할 수 없어 분배할 수 없습니다.')
+ targets=[pc for pc in fleet.PCS if pc in set(data.pcs)]
+ if not targets:raise HTTPException(400,'분배할 PC를 고르세요.')
+ with _cont_lock:
+  pcs=fleet.read_all();dist=fleet.raw_distributed();started=cont_started_all(pcs)
+  load={pc:0 for pc in targets}
+  for ep,pc in dist.items():
+   if pc in load and ep not in started:load[pc]+=1
+  given={pc:[] for pc in targets}
+  for ep in cont_pool(started,dist,data.date):
+   pc=min(targets,key=lambda p:(load[p],targets.index(p)))
+   if fleet.raw_distribute(ep,pc):load[pc]+=1;given[pc].append(ep)
+ with access.db() as c:c.execute('INSERT INTO ui_audit VALUES(?,?,?)',(time.time(),admin['name'],'continuous distribute '+json.dumps({p:len(v) for p,v in given.items()})))
+ return {'given':{p:len(v) for p,v in given.items()},'total':sum(len(v) for v in given.values()),'load':load}
+
+class ContRecall(BaseModel):
+ pc:str=Field(pattern=r'^pc[1-6]$')
+
+@app.post('/api/continuous/recall')
+def cont_recall(data:ContRecall,req:Request):
+ """PC 하나에 분배한 RAW 중 아직 시작하지 않은 것을 회수합니다(그 PC 대기열에 있던 항목은 시작 때 '회수됨'으로 실패 처리)."""
+ guard(req);admin=access.admin(req)
+ if not fleet.available():raise HTTPException(503,'NAS 관제를 사용할 수 없습니다.')
+ started=cont_started_all(fleet.read_all());n=0
+ for ep,pc in fleet.raw_distributed().items():
+  if pc==data.pc and ep not in started:fleet.raw_undistribute(ep,pc);n+=1
+ with access.db() as c:c.execute('INSERT INTO ui_audit VALUES(?,?,?)',(time.time(),admin['name'],f'continuous recall {data.pc} {n}'))
+ return {'recalled':n}
+
+@app.get('/assets/continuous.js')
+def continuous_script(req:Request):
+ guard(req)
+ return FileResponse(Path(__file__).parent/'continuous.js',media_type='application/javascript',headers={'Cache-Control':'no-store'})

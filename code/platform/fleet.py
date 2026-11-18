@@ -230,6 +230,12 @@ def raw_claim(ep):
     if not available():
         return True
     try:
+        # 연속 모드로 다른 PC에 분배한 RAW는 선점이 비어 있어도 가져가지 않습니다.
+        if os.readlink(_distributed() / ep) != PC_ID:
+            return False
+    except OSError:
+        pass
+    try:
         _claims().mkdir(parents=True, exist_ok=True)
         os.symlink(PC_ID, _claims() / ep)
         return True
@@ -303,9 +309,63 @@ def raw_claims():
     return out
 
 
+# ---- SAM3 연속 모드 분배: control/distributed/<RAW> = 분배받은 PC 이름 symlink ----
+# 관리자가 남은 RAW를 PC(작업자)별로 균등 분배할 때 씁니다. 같은 RAW의 선점(claims)도 그 PC로 만들어 다른 PC의
+# 자동 배정과 겹치지 않게 하고, 받은 PC는 배정 행이 없어도 이 표시가 있는 동안 선점을 풀지 않습니다.
+def _distributed():
+    return CONTROL / 'distributed'
+
+
+def raw_distribute(ep, pc):
+    """RAW를 pc에 분배합니다. 다른 PC가 선점·분배한 RAW면 False."""
+    if not RAW_NAME.fullmatch(ep or '') or pc not in PCS:
+        return False
+    for d in (_claims(), _distributed()):
+        d.mkdir(parents=True, exist_ok=True)
+        try:
+            os.symlink(pc, d / ep)
+        except FileExistsError:
+            try:
+                if os.readlink(d / ep) != pc:
+                    return False
+            except OSError:
+                return False
+    return True
+
+
+def raw_undistribute(ep, pc):
+    """pc에 분배한 RAW 표시와 그 PC의 선점을 풉니다(시작 전 RAW만 호출하세요)."""
+    if not RAW_NAME.fullmatch(ep or ''):
+        return
+    for d in (_distributed(), _claims()):
+        try:
+            if os.readlink(d / ep) == pc:
+                os.unlink(d / ep)
+        except OSError:
+            pass
+
+
+def raw_distributed():
+    """{RAW: 분배받은 PC}"""
+    out = {}
+    try:
+        for p in _distributed().iterdir():
+            if RAW_NAME.fullmatch(p.name):
+                try:
+                    out[p.name] = os.readlink(p)
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return out
+
+
 def raw_taken_elsewhere():
     """다른 PC가 선점했거나 이미 시작한 RAW → {RAW: pc}"""
     out = {ep: pc for ep, pc in raw_claims().items() if pc != PC_ID}
+    for ep, pc in raw_distributed().items():  # 연속 모드로 다른 PC에 분배한 RAW
+        if pc != PC_ID:
+            out.setdefault(ep, pc)
     for ep, pc in started_elsewhere().items():
         out.setdefault(ep, pc)
     return out
