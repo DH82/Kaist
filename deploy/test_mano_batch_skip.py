@@ -117,11 +117,12 @@ class ManoBatchRedo3DTests(unittest.TestCase):
         self.assertNotIn(('day_b', 'reconstruct'), self.started)
         self.assertEqual([c for c in self.calls if c[0] == 'reset'], [('reset', 'day_a', None)])
 
-    def test_redo_off_keeps_old_behaviour(self):
+    def test_redo_off_still_redoes_old_results(self):
+        # 옵션을 꺼도 업데이트 전 3D 결과는 3D 복원부터 다시 합니다(그대로 MANO만 하면 코드 변경 오류로 실패).
         self.run.conf['redo_3d'] = False
         self.assertFalse(self.poke())
-        self.assertEqual(self.started, [('day_a', 'hands')])
-        self.assertFalse([c for c in self.calls if c[0] in ('reset', 'drift', 'reset-status')])
+        self.assertIn(('reset', 'day_a', None), self.calls)
+        self.assertEqual(self.started, [])
 
     def test_config_change_is_skipped(self):
         self.config_drift.add('day_a')

@@ -180,7 +180,9 @@ def poll_mano_batch(**ctx):
     sources = ctx['dag_run'].conf['sources']
     run_obj = ctx['dag_run']
     cutoff = mano_cutoff(run_obj.start_date or run_obj.queued_at or run_obj.logical_date)
-    redo = bool(run_obj.conf.get('redo_3d'))
+    # 업데이트 전 코드로 고정된 3D 결과는 항상 3D 복원부터 다시 합니다. 그대로 MANO만 하면 반드시
+    # 'Code/config changed during run'으로 실패하므로, 실행 옵션(redo_3d)을 꺼도 건너뛰지 않습니다(2026-11-18).
+    redo = True
     since = started_ts(run_obj)
     skipped = []
     for n, source in enumerate(sources, 1):
