@@ -56,8 +56,8 @@ function hcEditControls(){
  for(let cam=0;cam<4;cam++){const tag=$('hcCamEdit'+cam);if(tag){const e=hcEdit.cams[cam],d=e?.ready&&e.dirty,none=e?.ready&&e.data.missing&&!d;
   // SAM3가 이 프레임에서 대상을 찾지 못해 마스크 파일이 없는 경우: 빈 마스크에서 새로 칠할 수 있습니다.
   const w=hcWandPending(e)?(e.wand.busy?'마법봉 분할 중…':e.wand.mask?'마법봉 적용 대기 (Enter)':'마법봉 점만 있음'):'';
-  tag.textContent=[d?'수정됨 · 저장 전':none?(e.obj===0?'물체':'손')+' 마스크 없음 · 칠하면 새로 만듦':'',w].filter(Boolean).join(' · ');tag.hidden=!tag.textContent}}
- if(!busy&&!$('hcEditState').classList.contains('error'))hcEditMessage(dirty.length?'저장하지 않은 수정이 있습니다. 다른 프레임으로 이동하기 전에 저장하세요.':'');
+  tag.textContent=[d?'':none?(e.obj===0?'물체':'손')+' 마스크 없음 · 칠하면 새로 만듦':'',w].filter(Boolean).join(' · ');tag.hidden=!tag.textContent}}
+ if(!busy&&!$('hcEditState').classList.contains('error'))hcEditMessage('');  // 수정 중 안내 문구는 띄우지 않습니다(이동·나가기 때 자동 저장)
 }
 
 // ---- 타일 렌더링 ----
@@ -309,7 +309,7 @@ function hcEditPng(e){
 async function hcSaveEdits(){
  const cams=hcEditDirtyCams();if(!cams.length||hcEdit.saving||hcBusy)return true;
  if(hcApproved()&&!confirm('수정한 마스크를 저장하면 기존 승인이 해제되고 다시 검수해야 합니다. 저장할까요?'))return false;
- hcStop();hcEdit.saving=true;hcEditControls();hcEditMessage('수정 내용과 원본 변경 여부를 검사하고 저장하는 중…');
+ hcStop();hcEdit.saving=true;hcEditControls();hcEditMessage('');  // 자동 저장은 조용히 진행합니다(실패할 때만 오류 표시)
  const frame=hcFrame,messages=[];let ok=true;
  try{
   for(const cam of cams){
@@ -325,19 +325,23 @@ async function hcSaveEdits(){
  finally{hcEdit.saving=false}
  try{const meta=await hcRequest(hcPath);if(meta&&hcMeta&&meta.episode===hcMeta.episode)hcMeta=meta}catch(_){}
  // 저장된 마스크로 서버 이미지를 새로 받습니다. 새 이미지가 뜰 때까지는 수정한 화면을 그대로 보여 줘 깜빡임이 없습니다.
- if(ok){hcImageRev++;hcStatus(messages.join(' · '));await hcShowFrame(frame,true,true);if(typeof loadJobs==='function')loadJobs()}
+ if(ok){hcImageRev++;await hcShowFrame(frame,true,true);if(typeof loadJobs==='function')loadJobs()}
  else hcEditControls();
  hcEnable();return ok;
 }
-// 저장하지 않은 수정이 있을 때 프레임 이동 등을 하기 전에 호출합니다. true면 진행해도 됩니다.
+// 프레임 이동·재생·대상 변경 등을 하기 전에 호출합니다. 수정한 내용이 있으면 묻지 않고 그대로 저장한 뒤 진행합니다.
+// 저장에 실패하면(원본 변경 등) 오류를 보여 주고 머무릅니다(false). action은 예전 호출과의 호환용입니다.
 async function hcEditResolve(action='이동'){
  if(!hcEditDirty())return true;
- if(!confirm('저장하지 않은 마스크 수정이 있습니다.\n\n확인: 저장하고 '+action+'\n취소: 그대로 머무르기'))return false;
  return hcSaveEdits();
 }
-function hcEditLeaveOk(){
+// 검수 화면을 나가기 전에 호출합니다. 수정한 내용이 있으면 묻지 않고 저장을 시작하고 false를 돌려줍니다.
+// 저장이 끝나면 retry(나가려던 동작)를 다시 실행합니다. 수정을 버리지 않습니다.
+function hcEditLeaveOk(retry){
  if(hcBatch.running){if(!confirm('마법봉 일괄 적용 중입니다. 중지하고 나갈까요? (이미 저장한 프레임은 유지됩니다)'))return false;hcBatch.stop=true}
- return !hcEditDirty()||confirm('저장하지 않은 마스크 수정이 있습니다. 버리고 나갈까요?')
+ if(!hcEditDirty())return true;
+ if(!hcEdit.saving)hcSaveEdits().then(ok=>{if(ok&&typeof retry==='function')retry()});
+ return false;
 }
 
 // ---- 도구 ----

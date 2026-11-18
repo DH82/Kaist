@@ -156,9 +156,9 @@ async function hcDecide(decision){
  finally{hcBusy=false;hcEnable()}
 }
 function returnToReviewQueue(){hcLoadGeneration++;hcEpoch++;hcStop();hcMeta=null;$('hcWorkspace').classList.add('hidden');$('hcQueuePanel').classList.remove('hidden');show('review')}
-$('hcBack').onclick=()=>{if(!hcEditLeaveOk())return;hcEditReset();if(hcReturnPage==='review'){returnToReviewQueue();return}hcLoadGeneration++;hcEpoch++;hcStop();show(hcReturnPage)};
-$('hcList').onclick=()=>{if(!hcEditLeaveOk())return;hcEditReset();returnToReviewQueue()};
-$('hcReload').onclick=()=>{if(!hcEditLeaveOk())return;hcEditReset();if($('hcEpisode').textContent)openReview($('hcEpisode').textContent,hcStage)};
+$('hcBack').onclick=()=>{if(!hcEditLeaveOk(()=>$('hcBack').onclick()))return;hcEditReset();if(hcReturnPage==='review'){returnToReviewQueue();return}hcLoadGeneration++;hcEpoch++;hcStop();show(hcReturnPage)};
+$('hcList').onclick=()=>{if(!hcEditLeaveOk(()=>$('hcList').onclick()))return;hcEditReset();returnToReviewQueue()};
+$('hcReload').onclick=()=>{if(!hcEditLeaveOk(()=>$('hcReload').onclick()))return;hcEditReset();if($('hcEpisode').textContent)openReview($('hcEpisode').textContent,hcStage)};
 $('hcRefreshQueue').onclick=loadHcQueue;document.querySelectorAll('[data-review-filter]').forEach(b=>b.onclick=()=>selectHcQueue(b.dataset.reviewFilter));
 $('hcApprove').onclick=()=>hcDecide('approve');$('hcHold').onclick=()=>hcDecide('hold');$('hcNote').oninput=hcEnable;
 $('hcFirst').onclick=()=>{hcStop();hcShowFrame(0)};$('hcMiddle').onclick=()=>{hcStop();hcShowFrame(Math.floor(hcMeta.frames/2))};$('hcLast').onclick=()=>{hcStop();hcShowFrame(hcMeta.frames-1)};

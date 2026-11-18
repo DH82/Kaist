@@ -25,7 +25,7 @@ async function adminPcSwitch(user){
  box.innerHTML='<span class="idRole">관리자</span><label class="idSwitch" title="다른 PC 화면으로 전환합니다. 관리자로 바로 들어갑니다."><select id="pcSwitch" aria-label="관리할 PC 화면">'+
   list.pcs.map(p=>'<option value="'+p.pc+'"'+(p.pc===list.me?' selected':'')+(!p.online&&known?' disabled':'')+'>'+p.pc.toUpperCase()+' 화면'+(p.pc===list.me?'':!p.online&&known?' · 연결 끊김':'')+'</option>').join('')+'</select></label>';
  $('pcSwitch').onchange=e=>{const pc=e.target.value;if(pc===list.me)return;
-  if(typeof hcEditLeaveOk==='function'&&page==='review'&&!hcEditLeaveOk()){e.target.value=list.me;return}
+  if(typeof hcEditLeaveOk==='function'&&page==='review'&&!hcEditLeaveOk(()=>{const s=$('pcSwitch');s.value=pc;s.onchange({target:s})})){e.target.value=list.me;return}
   e.target.disabled=true;box.querySelector('.idRole').textContent=pc.toUpperCase()+' 화면으로 이동 중…';
   location.href='/api/fleet/open?pc='+encodeURIComponent(pc)};
 }
