@@ -223,7 +223,7 @@ function renderRawTeam(){
  const t=rawTeam,el=$('rawTeam');if(!t){el.textContent='';renderQueueCtl();return}
  const tg=n=>(t.targets&&t.targets[n]!=null)?t.targets[n]:t.target;
  const ops=t.operators.map(n=>escape(n)+' '+(t.load[n]||0)+'/'+tg(n)+(n===t.me?' (나)':'')).join(' · ');
- el.innerHTML='로그인 사용자 '+t.total_users+'명 · 작업자 '+t.operators.length+'명(관리자 '+t.admins+'명 제외) · 작업자마다 각자 정한 큐 크기(기본 '+(t.default_target??t.target)+'개)만큼 자동 배정, 3D 복원이 끝나면 남은 RAW에서 다시 채웁니다.'+(ops?'<br>'+ops:'');
+ el.innerHTML='로그인 사용자 '+t.total_users+'명 · 작업자 '+t.operators.length+'명(관리자 '+t.admins+'명 제외) · 작업자마다 각자 정한 큐 크기(기본 '+(t.default_target??t.target)+'개)만큼 자동 배정, 첫 실행(추적 검수까지)이 끝나면 남은 RAW에서 다시 채웁니다.'+(ops?'<br>'+ops:'');
  renderQueueCtl();
 }
 // 내 RAW 큐 크기(각자 설정): NAS에 바로 저장되어 모든 PC 화면에 같은 값이 쓰입니다.

@@ -164,7 +164,7 @@ setInterval(()=>{if(page==='fleet'&&!document.hidden)loadContDist()},15000);
 document.querySelector('nav [data-page="fleet"]').addEventListener('click',()=>setTimeout(loadContDist,0));
 setTimeout(()=>{if(page==='fleet')loadContDist()},2500);
 
-// ---- SAM 이후 · MANO 일괄 실행: 3D 복원까지 끝나 MANO 대기가 된 실행을 오늘 자/전체로 바로 일괄 실행 ----
+// ---- SAM 이후 · 3D 복원 일괄 실행: 추적 검수까지 끝나 3D 복원 대기가 된 실행을 오늘 자/전체로 3D 복원 → MANO → 저장까지 일괄 실행 ----
 let contMano={today:[],all:[],at:0},contManoBusy=false,contManoStarting=false;
 async function loadContMano(force=false){
  if(contManoBusy||$('contCard').hidden||(!force&&Date.now()-contMano.at<30000))return;contManoBusy=true;
@@ -174,31 +174,31 @@ async function loadContMano(force=false){
   contMano={today:todayRows.map(r=>r.run),all:rows.map(r=>r.run),at:Date.now()};
   const s=st&&st.selected,running=!!(s&&s.can_stop);
   let state;
-  if(running){const c=s.current;state='<b>MANO 일괄 실행 진행 중</b>'+(c?' · ['+c.index+'] '+escape(c.episode)+' · '+escape(c.label||'')+' '+escape(stateName(c.state==='not_started'?'none':c.state)):'')+(s.queue&&s.queue.length?' · 남은 '+s.queue.length+'개':'')}
+  if(running){const c=s.current;state='<b>3D 복원 일괄 실행 진행 중</b>'+(c?' · ['+c.index+'] '+escape(c.episode)+' · '+escape(c.label||'')+' '+escape(stateName(c.state==='not_started'?'none':c.state)):'')+(s.queue&&s.queue.length?' · 남은 '+s.queue.length+'개':'')}
   else if(s){const b=(st.batches||[]).find(x=>x.run_id===s.run_id)||{};state='마지막 일괄 실행: '+(b.start?new Date(b.start).toLocaleString('ko-KR'):'—')+' · '+(b.count||0)+'개 · '+escape(stateName(b.state))}
-  else state='아직 MANO 일괄 실행 기록이 없습니다.';
-  $('contManoState').innerHTML=state+'<br>MANO 대기: 오늘 자 <b>'+todayRows.length+'개</b> · 전체 '+rows.length+'개';
+  else state='아직 일괄 실행 기록이 없습니다.';
+  $('contManoState').innerHTML=state+'<br>일괄 실행 대기: 오늘 자 <b>'+todayRows.length+'개</b> · 전체 '+rows.length+'개';
   const started=(contData&&contData.queue||[]).filter(r=>r.state==='started').length;
-  $('contManoFlow').textContent=started?'오늘 연속 모드로 시작 '+started+'개 → 검수·3D 복원을 마치면 MANO 대기(오늘 자)로 들어옵니다.':'';
+  $('contManoFlow').textContent=started?'오늘 연속 모드로 시작 '+started+'개 → 마스크·추적 검수를 마치면 3D 복원 대기(오늘 자)로 들어옵니다.':'';
   $('contManoToday').disabled=running||contManoStarting||!todayRows.length;$('contManoAll').disabled=running||contManoStarting||!rows.length;
-  $('contManoToday').textContent='▶ 오늘 자 MANO 일괄 실행 ('+todayRows.length+'개)';$('contManoAll').textContent='▶ MANO 대기 전체 실행 ('+rows.length+'개)';
-  if(running){$('contManoToday').title=$('contManoAll').title='MANO 일괄 실행이 진행 중입니다. 끝난 뒤 시작할 수 있습니다.'}else{$('contManoToday').title=$('contManoAll').title=''}
- }catch(e){$('contManoState').textContent='MANO 대기 목록을 불러오지 못했습니다: '+e.message}
+  $('contManoToday').textContent='▶ 오늘 자 3D 복원 일괄 실행 ('+todayRows.length+'개)';$('contManoAll').textContent='▶ 대기 전체 실행 ('+rows.length+'개)';
+  if(running){$('contManoToday').title=$('contManoAll').title='일괄 실행이 진행 중입니다. 끝난 뒤 시작할 수 있습니다.'}else{$('contManoToday').title=$('contManoAll').title=''}
+ }catch(e){$('contManoState').textContent='일괄 실행 대기 목록을 불러오지 못했습니다: '+e.message}
  finally{contManoBusy=false}
 }
 async function contManoRun(list,what){
  const runs=list.slice(0,100);if(!runs.length||contManoStarting)return;
  const redo=$('contManoRedo').checked;
- if(!confirm(what+' '+runs.length+'개를 MANO 일괄 실행합니다.'+(list.length>runs.length?'\n(한 번에 최대 100개 · 나머지 '+(list.length-runs.length)+'개는 다음에 실행하세요)':'')+(redo?'\n업데이트 전 코드로 만든 3D 결과는 3D 복원부터 다시 합니다(이전 결과 보관).':'')+'\n\n실행할까요?'))return;
+ if(!confirm(what+' '+runs.length+'개를 3D 복원 일괄 실행합니다(3D 복원 → MANO → 저장).'+(list.length>runs.length?'\n(한 번에 최대 100개 · 나머지 '+(list.length-runs.length)+'개는 다음에 실행하세요)':'')+(redo?'\n업데이트 전 코드로 만든 3D 결과는 3D 복원부터 다시 합니다(이전 결과 보관).':'')+'\n\n실행할까요?'))return;
  contManoStarting=true;$('contManoToday').disabled=$('contManoAll').disabled=true;
  try{
   const r=await api('/api/pc1/mano',{method:'POST',body:JSON.stringify({runs,redo_3d:redo})});
-  notice(r.count+'개 에피소드의 MANO 일괄 실행을 시작했습니다.'+(r.redo_3d?' · 업데이트 전 3D 결과는 3D 복원부터 다시 합니다.':''));
+  notice(r.count+'개 에피소드의 3D 복원 일괄 실행을 시작했습니다.'+(r.redo_3d?' · 업데이트 전 3D 결과는 3D 복원부터 다시 합니다.':''));
   if(typeof loadMano==='function'&&$('manoQueue').open)loadMano();
  }catch(e){notice(e.message,true)}
  finally{contManoStarting=false;loadContMano(true)}
 }
-$('contManoToday').onclick=()=>contManoRun(contMano.today,'오늘('+localDateKey(new Date())+') MANO 대기가 된 에피소드');
-$('contManoAll').onclick=()=>contManoRun(contMano.all,'MANO 대기 에피소드 전체');
+$('contManoToday').onclick=()=>contManoRun(contMano.today,'오늘('+localDateKey(new Date())+') 3D 복원 대기가 된 에피소드');
+$('contManoAll').onclick=()=>contManoRun(contMano.all,'일괄 실행 대기 에피소드 전체');
 $('contManoOpen').onclick=()=>{show('jobs');$('manoQueue').open=true;if(typeof loadMano==='function'){loadMano();loadManoLog()}};
 setInterval(()=>{if(page==='run'&&!document.hidden)loadContMano()},10000);

@@ -69,6 +69,11 @@ REDO_START = 'prepare_reconstruction'
 REDO_STAGES = ('prepare_reconstruction', 'reconstruct')
 REDO_LABELS = {'prepare_reconstruction': '3D 복원 준비(다시)', 'reconstruct': '3D 복원(다시)'}
 
+# 3D 복원 일괄 실행: 낮 실행(첫 실행)은 추적 검수까지만 하므로, 일괄 실행이 에피소드마다 아래 단계를 순서대로 합니다.
+# 이미 3D 복원까지 끝난 에피소드(예전 'MANO 대기')는 끝난 단계를 건너뛰고 MANO부터 합니다.
+BATCH_STAGES = REDO_STAGES + MANO_STAGES
+BATCH_LABELS = {'prepare_reconstruction': '3D 복원 준비', 'reconstruct': '3D 복원', **MANO_LABELS}
+
 
 def started_ts(run_obj):
     when = run_obj.start_date or run_obj.queued_at or run_obj.logical_date
@@ -152,9 +157,19 @@ def mano_cutoff(started):
             return cut
         day += dt.timedelta(days=1)
 
+def started_in_batch(request, since):
+    """이번 일괄 실행이 이 에피소드의 단계를 하나라도 시작했는지(일괄 실행 전에 끝난 3D 복원은 세지 않음)."""
+    for stage in BATCH_STAGES:
+        st = request(stage, 'status')
+        if st['state'] != 'not_started' and (st.get('started') or st.get('finished') or st.get('created') or 0) >= since - CLOCK_SLACK:
+            return True
+    return False
+
+
 def poll_mano_batch(**ctx):
-    """선택한 순서대로 에피소드마다 hands→validate→publish를 진행합니다.
-    redo_3d가 켜져 있으면 업데이트 전 코드로 고정된 에피소드만 먼저 3D 복원부터 다시 합니다(redo_3d 참고).
+    """선택한 순서대로 에피소드마다 3D 복원 준비→3D 복원→MANO 피팅→결과 검사→최종 저장을 진행합니다(이미 끝난 단계는 건너뜀).
+    3D 복원 전 에피소드는 실행 고정 이후 코드가 바뀌었는지 확인해, 바뀌었으면 3D 복원 준비부터 다시 고정한 뒤 진행합니다(redo_3d 참고).
+    redo_3d가 켜져 있으면 이미 3D 복원까지 끝난 에피소드 중 업데이트 전 코드로 만든 것도 3D 복원부터 다시 합니다.
     한 에피소드가 실패하거나(단계 실패·3D 복원 미완료·작업 요청 오류) UI에서 강제 종료되면
     일괄 실행을 멈추지 않고 그 에피소드만 건너뛰어 다음 에피소드로 넘어갑니다.
     실패한 작업은 Worker가 다시 시작하지 않으므로(start는 실패 상태를 그대로 돌려줌) 다음 확인에서도 계속 건너뜁니다.
@@ -183,17 +198,19 @@ def poll_mano_batch(**ctx):
             if request('publish', 'status')['state'] == 'success':
                 print(tag, '완료')
                 continue
+            need3d = request('reconstruct', 'status')['state'] != 'success'
+            check3d = redo or need3d
             # 이번 일괄 실행이 이미 3D 복원 다시를 시작한 에피소드는 오전 8시 마감과 관계없이 끝까지 진행합니다.
-            reset = worker_call('reset-status', {'episode': conf['episode_id'], 'run_id': run, 'start': REDO_START}) if redo else None
+            reset = worker_call('reset-status', {'episode': conf['episode_id'], 'run_id': run, 'start': REDO_START}) if check3d else None
             redoing = bool(reset) and redo_started(reset, since)
-            # 아직 MANO를 시작하지 않은 에피소드: 평일 오전 8시가 지났으면 여기서 멈추고 나머지는 대기로 남깁니다.
+            # 이번 일괄 실행에서 아직 아무 단계도 시작하지 않은 에피소드: 평일 오전 8시가 지났으면 여기서 멈추고 나머지는 대기로 남깁니다.
             # 앞에서 실패해 건너뛴 에피소드는 대기 목록에 넣지 않습니다(이미 실패로 표시됨).
-            if not redoing and request('hands', 'status')['state'] == 'not_started' and dt.datetime.now(cutoff.tzinfo) >= cutoff:
+            if not redoing and dt.datetime.now(cutoff.tzinfo) >= cutoff and not started_in_batch(request, since):
                 left = [s['conf']['episode_id'] for s in sources[n - 1:]]
                 print(f"평일 오전 {MANO_CUTOFF_HOUR}시({cutoff:%m-%d %H:%M}) 이후라 새 에피소드를 시작하지 않습니다. "
                       f"대기로 남김 {len(left)}개: {', '.join(left)}")
                 break
-            if redo:
+            if check3d:
                 phase, note = redo_3d(request, worker_call, run, conf, reset, since)
                 if phase == 'skip':
                     skip(note)
@@ -202,23 +219,22 @@ def poll_mano_batch(**ctx):
                     print(tag, note)
                 if phase == 'pending':
                     return False
-            if request('reconstruct', 'status')['state'] != 'success':
-                skip('3D 복원 완료 기록 없음')
-                continue
             outcome = 'success'
-            for stage in MANO_STAGES:
+            for stage in BATCH_STAGES:
                 current = request(stage, 'status')
+                if current['state'] == 'success':
+                    continue
                 if current['state'] == 'interrupted' and current.get('stopped_by_user'):
-                    skip(MANO_LABELS[stage] + ' 강제 종료됨')
+                    skip(BATCH_LABELS[stage] + ' 강제 종료됨')
                     outcome = 'skipped'
                     break
                 result = request(stage, 'start')
                 state = result['state']
                 progress = result.get('progress') or {}
                 detail = f" · {progress.get('label')} {progress.get('done')}/{progress.get('total')}" if progress.get('total') else ''
-                print(tag, MANO_LABELS[stage], state + detail)
+                print(tag, BATCH_LABELS[stage], state + detail)
                 if state in ('failed', 'interrupted'):
-                    skip(MANO_LABELS[stage] + (' 강제 종료됨' if result.get('stopped_by_user') else ' ' + state))
+                    skip(BATCH_LABELS[stage] + (' 강제 종료됨' if result.get('stopped_by_user') else ' ' + state))
                     outcome = 'skipped'
                     break
                 if state != 'success':

@@ -6,8 +6,9 @@ const dashOpen=new Set();
 const DASH_CHECKS=new Set(['sam_settings_ready','mask_approved','tracking_approved']);  // 검수 확인(수 초) 단계
 const DASH_MAIN=['prepare_raw','sam3','preflight','track','prepare_reconstruction','reconstruct','adopt','hands','validate','publish'];
 const DASH_STATES={success:'성공',failed:'실패',interrupted:'중단',running:'진행 중',queued:'GPU 대기',waiting:'검수 대기',not_started:'재시도 준비'};
-// 앞 단계 종료 → 다음 단계 시작 사이 대기
-const DASH_WAITS=[['mask','마스크 검수 대기','sam3','preflight'],['tracking','추적 검수 대기','track','prepare_reconstruction'],['mano','MANO 대기','reconstruct','hands']];
+// 앞 단계 종료 → 다음 단계 시작 사이 대기. 다섯째 값 'end'면 다음 단계의 '종료'까지(검수 관문은 승인될 때 끝남)
+// 첫 실행은 추적 검수까지만 하고, 3D 복원부터는 3D 복원 일괄 실행이 합니다(추적 승인 → 3D 복원 준비 시작 = 일괄 실행 대기).
+const DASH_WAITS=[['mask','마스크 검수 대기','sam3','preflight'],['tracking','추적 검수 대기','track','tracking_approved','end'],['mano','3D 복원 대기','tracking_approved','prepare_reconstruction']];
 // 에피소드 진행 막대의 구간(색)
 const DASH_PHASES=[['전처리',['prepare_raw'],'#c9c3f5'],['SAM3',['sam3'],'#8f80e8'],['추적',['preflight','track'],'#5fb3d9'],['3D 복원',['prepare_reconstruction','reconstruct'],'#4b9b7a'],['MANO',['adopt','hands'],'#e3a548'],['검사·저장',['validate','publish'],'#d9788c']];
 function dashName(s){return (typeof taskName!=='undefined'&&taskName[s])||({adopt:'이관 받기'})[s]||s}
@@ -47,8 +48,8 @@ function dashEpisodes(jobs){
   e.total=e.done?st.publish.finished-e.start:null;
   e.work=Object.values(st).filter(j=>!DASH_CHECKS.has(j.stage)).reduce((s,j)=>s+(dashLen(j)||0),0);
   e.waits={};e.open=null;
-  for(const [k,,a,b] of DASH_WAITS){const A=st[a],B=st[b];
-   if(A?.state==='success'&&A.finished){if(B?.started)e.waits[k]=B.started-A.finished;else if(!e.running){e.waits[k]=now-A.finished;e.open=k}}}
+  for(const [k,,a,b,end] of DASH_WAITS){const A=st[a],B=st[b],Bt=end?(B?.state==='success'?B.finished:null):B?.started;
+   if(A?.state==='success'&&A.finished){if(Bt)e.waits[k]=Math.max(0,Bt-A.finished);else if(!e.running){e.waits[k]=now-A.finished;e.open=k}}}
   e.waitSum=Object.values(e.waits).reduce((a,b)=>a+b,0);
   const order=pc=>Math.min(...e.jobs.filter(j=>j.pc===pc).map(j=>j.started));
   e.pcs.sort((x,y)=>order(x)-order(y));
@@ -59,7 +60,7 @@ function dashEpStatus(e){
  if(e.running)return ['running','진행 중'];
  if(e.failed)return ['failed','실패'];
  if(e.done)return ['success','최종 저장'];
- return e.open?['waiting',{mask:'마스크 검수',tracking:'추적 검수',mano:'MANO 대기'}[e.open]]:['','—'];
+ return e.open?['waiting',{mask:'마스크 검수',tracking:'추적 검수',mano:'3D 복원 대기'}[e.open]]:['','—'];
 }
 function dashEpRow(e){
  const [cls,label]=dashEpStatus(e),st=e.stages;
@@ -95,7 +96,7 @@ function renderDash(){
  const sum=a=>a.reduce((s,j)=>s+(dashLen(j)||0),0),uniq=a=>new Set(a.map(j=>j.episode)).size;
  // 상단 정보 · 경고
  const online=d.pcs.filter(p=>p.online).length,old=d.pcs.filter(p=>p.online&&!p.has_jobs).map(p=>dashPcName(p.pc));
- $('dashInfo').textContent=(d.nas?'PC 연결 '+online+'/'+d.pcs.length+'대':'NAS 연결 없음 · '+dashPcName(d.me)+' 기록만 표시')+' · 진행 중 '+running.filter(mine).length+'단계 · MANO 대기 '+d.mano_waiting.filter(mine).length+'개 · 남은 RAW '+d.raw_free+'개'+dashLatest(d)+' · 30초마다 갱신';
+ $('dashInfo').textContent=(d.nas?'PC 연결 '+online+'/'+d.pcs.length+'대':'NAS 연결 없음 · '+dashPcName(d.me)+' 기록만 표시')+' · 진행 중 '+running.filter(mine).length+'단계 · 3D 복원 대기 '+d.mano_waiting.filter(mine).length+'개 · 남은 RAW '+d.raw_free+'개'+dashLatest(d)+' · 30초마다 갱신';
  $('dashWarn').hidden=!old.length;$('dashWarn').textContent=old.length?old.join(', ')+'는 이전 버전 UI라 작업 시간 기록이 없습니다. 해당 PC의 UI를 업데이트하세요.':'';
  // 요약 카드
  const kpi=(label,val,sub,bad)=>'<div class="dbKpi'+(bad?' bad':'')+'"><span>'+label+'</span><b>'+val+'</b><small>'+sub+'</small></div>';
@@ -116,7 +117,7 @@ function renderDash(){
   const wait=d.mano_waiting.filter(of).length;
   return '<tr'+(dot?'':' class="off"')+'><td><b><span class="dbDot '+dot+'"></span>'+dashPcName(p.pc)+'</b>'+(p.online&&p.pc!==d.me?' <a class="dbLink" style="padding:0 4px" href="/api/fleet/open?pc='+p.pc+'" target="_blank" rel="noopener" title="'+dashPcName(p.pc)+' 화면을 관리자로 열기">원격 관리 ↗</a>':'')+'<span class="dbSub">'+state+gpu+(p.missing?'':queue)+'</span></td>'+
    dashNum(uniq(starts.filter(of)))+dashNum(recon.filter(of).length)+dashNum(mano.filter(of).length)+dashNum(pub.filter(of).length)+dashNum(f,true)+
-   (sum(work.filter(of))?'<td class="dbR">'+dashDur(sum(work.filter(of)))+'</td>':'<td class="dbR zero">—</td>')+'<td class="dbNow">'+(now||'<span class="zero">—</span>')+(wait?'<span class="dbSub">MANO 대기 '+wait+'개</span>':'')+'</td><td class="dbVer">'+dashVersion(p)+'</td></tr>'}).join('');
+   (sum(work.filter(of))?'<td class="dbR">'+dashDur(sum(work.filter(of)))+'</td>':'<td class="dbR zero">—</td>')+'<td class="dbNow">'+(now||'<span class="zero">—</span>')+(wait?'<span class="dbSub">3D 복원 대기 '+wait+'개</span>':'')+'</td><td class="dbVer">'+dashVersion(p)+'</td></tr>'}).join('');
  // 에피소드
  const all=dashEpisodes(jobs.filter(mine));
  const onlyRun=$('dashEpRunning').checked;

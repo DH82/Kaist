@@ -14,7 +14,7 @@ ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(Path(__file__).parent))
 import intake,access,re,fleet
 sys.path.insert(0,str(ROOT/'dags'))
-from direct_worker import call,token,request_for,MANO_STAGES,mano_cutoff,MANO_CUTOFF_HOUR,REDO_STAGES,REDO_LABELS,REDO_START
+from direct_worker import call,token,request_for,MANO_STAGES,mano_cutoff,MANO_CUTOFF_HOUR,REDO_STAGES,REDO_LABELS,REDO_START,BATCH_STAGES,BATCH_LABELS
 from workers import workers,worker,dag_entries,dag_worker,DEFAULT_WORKER,DAY_DAG,BATCH_DAG,MAX_PARALLEL_RUNS,POOL_SLOTS
 DIRECT_DAGS={"test":"kaist_mac_to_4090_test","pipeline":"kaist_direct_pipeline_4090","raw":"kaist_direct_raw_4090"}
 if os.environ.get('KAIST_GPU_TEST_ENABLED','true').lower()=='false':DIRECT_DAGS.pop('test')
@@ -393,8 +393,8 @@ def activity(req:Request):
  for d in _job_dirs():
   try:st=json.loads((d/'status.json').read_text())
   except (OSError,ValueError):continue
-  # 오늘(이 PC 시간대 0시 이후) 3D 복원까지 성공 = MANO 대기 직전 단계까지 끝낸 에피소드(같은 에피소드 재실행은 1개로 셈)
-  if st.get('stage')=='reconstruct' and st.get('state')=='success' and (st.get('finished') or 0)>=midnight:
+  # 오늘(이 PC 시간대 0시 이후) 추적 검수까지 통과 = 첫 실행을 끝내 3D 복원 일괄 실행 대기가 된 에피소드(같은 에피소드 재실행은 1개로 셈)
+  if st.get('stage')=='tracking_approved' and st.get('state')=='success' and (st.get('finished') or 0)>=midnight:
    try:ready_today.add(json.loads((d/'request.json').read_text()).get('episode'))
    except (OSError,ValueError):pass
    continue
@@ -644,26 +644,46 @@ def mano_removed(batch_run_id=None):
 
 MANO_DONE=set()  # publish까지 끝난 실행(run_id)은 다시 묻지 않습니다.
 
+RECON_DONE=set();_recon_seen={}  # 3D 복원이 끝난 실행(run_id) · 아직인 실행은 60초 동안 다시 묻지 않음
+
+def recon_done(run):
+ """이 실행의 3D 복원이 끝났는지(예전 'MANO 대기'처럼 3D까지 끝난 실행인지)."""
+ run_id=run['dag_run_id']
+ if run_id in RECON_DONE:return True
+ hit=_recon_seen.get(run_id)
+ if hit and time.monotonic()-hit<60:return False
+ try:ok=call('POST','/worker/jobs/status',json=request_for('reconstruct',run_id,run['conf']),timeout=15)['state']=='success'
+ except (httpx.HTTPError,OSError,ValueError):ok=False
+ if ok:RECON_DONE.add(run_id)
+ else:_recon_seen[run_id]=time.monotonic()
+ return ok
+
+def waiting_label(run):
+ return 'MANO 대기' if recon_done(run) else '3D 복원 대기'
+
 def mano_progress(run,history):
+ """3D 복원 일괄 실행 기준 진행 표시. (표시, 일괄 실행에 고를 수 있는지)
+ 첫 실행(낮 실행)은 추적 검수까지만 하므로 대기 중이면 '3D 복원 대기', 이미 3D까지 끝난 예전 실행은 'MANO 대기'."""
  run_id=run['dag_run_id']
  state=history.get(run_id)
- if not state:return 'MANO 대기',True
+ if not state:return waiting_label(run),True
  if BATCH_OF.get(run_id) and (BATCH_OF[run_id],run_id) in mano_removed(BATCH_OF[run_id]):
-  return 'MANO 대기 · 일괄 실행에서 제거됨',True
+  return waiting_label(run)+' · 일괄 실행에서 제거됨',True
  if run_id in MANO_DONE:return '전체 완료',False
  in_batch=state in ('running','queued')
- for stage,label in zip(reversed(MANO_STAGES),('최종 저장','결과 검사','MANO 피팅')):
+ status='not_started'
+ for stage in reversed(BATCH_STAGES):
   st=call('POST','/worker/jobs/status',json=request_for(stage,run_id,run['conf']))
-  status=st['state']
+  status=st['state'];label=BATCH_LABELS[stage]
   if status in ('failed','interrupted'):
    return label+(' · 강제 종료' if st.get('stopped_by_user') else ' · 실패'),not in_batch
   if status=='success':
    if stage=='publish':MANO_DONE.add(run_id);return '전체 완료',False
    break
   if status in ('queued','running'):return label+' · 진행 중',False
- if in_batch:return 'MANO 실행 대기',False
- # 일괄 실행이 끝났는데 MANO를 시작하지 않은 에피소드(평일 오전 8시 이후 대기로 남김 등)
- return ('MANO 대기',True) if status=='not_started' else ('MANO 재개 대기',True)
+ if in_batch:return '일괄 실행 순서 대기',False
+ # 일괄 실행이 끝났는데 시작하지 않은 에피소드(평일 오전 8시 이후 대기로 남김 등)
+ return (waiting_label(run),True) if status=='not_started' else ('일괄 실행 재개 대기',True)
 
 class ManoSelection(BaseModel):
  runs:list[str]=Field(min_length=1,max_length=100)
@@ -698,12 +718,12 @@ def launch_mano(data:ManoSelection,req:Request):
    conf=run['conf']
    access.require(req,conf['episode_id'])
    if run['state']!='success' or not mano_progress(run,history)[1]:
-    raise HTTPException(409,'복원 완료 후 MANO 대기 중인 실행만 선택하세요.')
+    raise HTTPException(409,'추적 검수까지 끝나 3D 복원 대기(또는 MANO 대기) 중인 실행만 선택하세요.')
    sources.append({'run_id':run_id,'conf':conf})
   for source in sources:
    if history.get(source['run_id']):
     # 3D 복원 다시는 일괄 실행 안에서만 실행되므로, 앞선 일괄 실행에서 실패·중단된 것도 다시 시작합니다.
-    for stage in (REDO_STAGES if data.redo_3d else ())+MANO_STAGES:
+    for stage in BATCH_STAGES:  # 3D 복원 단계도 일괄 실행이 하므로, 앞선 일괄 실행에서 실패·중단된 3D 단계도 다시 시작
      payload=request_for(stage,source['run_id'],source['conf'])
      if call('POST','/worker/jobs/status',json=payload)['state'] in ('failed','interrupted'):
       call('POST','/worker/jobs/retry',json=payload)
@@ -1646,28 +1666,21 @@ def hidden_set(data:HideRequest,req:Request):
  return {'ok':True}
 
 # ---- MANO 일괄 실행 진행 로그 ----
-MANO_LABELS={'hands':'MANO 피팅','validate':'결과 검사','publish':'최종 저장',**REDO_LABELS}
+MANO_LABELS=dict(BATCH_LABELS)  # 3D 복원 일괄 실행 단계 표시
 MANO_ALL_STAGES=REDO_STAGES+MANO_STAGES  # 강제 종료·대기열 제거 대상(3D 복원 다시 포함)
 
 def mano_source_state(src,redo=False):
- """일괄 실행 안 한 에피소드의 MANO 단계 상태. 끝난 것은 다시 묻지 않습니다.
- redo(3D 복원 다시 일괄 실행): MANO 시작 전이면 3D 복원 단계 중 진행·실패한 것도 앞에 넣습니다.
- (원래 성공한 3D 복원은 넣지 않습니다. 다시 하지 않은 에피소드가 '다시 완료'로 보이지 않게)"""
- if src['run_id'] in MANO_DONE:return {s:{'state':'success'} for s in MANO_STAGES}
+ """일괄 실행 안 한 에피소드의 단계 상태(3D 복원 준비 → 3D 복원 → MANO 피팅 → 결과 검사 → 최종 저장).
+ 처음 시작 전인 단계에서 멈춰 그 뒤는 묻지 않고, 끝난 에피소드는 다시 묻지 않습니다."""
+ if src['run_id'] in MANO_DONE:return {s:{'state':'success'} for s in BATCH_STAGES}
  states={}
- for stage in MANO_STAGES:
+ for stage in BATCH_STAGES:
   st=call('POST','/worker/jobs/status',json=request_for(stage,src['run_id'],src['conf']),timeout=15)
   states[stage]=st
   if st['state']=='not_started':
-   for rest in MANO_STAGES[MANO_STAGES.index(stage)+1:]:states[rest]={'state':'not_started'}
+   for rest in BATCH_STAGES[BATCH_STAGES.index(stage)+1:]:states[rest]={'state':'not_started'}
    break
  if states['publish']['state']=='success':MANO_DONE.add(src['run_id'])
- if redo and states['hands']['state']=='not_started':
-  front={}
-  for stage in REDO_STAGES:
-   st=call('POST','/worker/jobs/status',json=request_for(stage,src['run_id'],src['conf']),timeout=15)
-   if st['state'] in ('queued','running','failed','interrupted'):front[stage]=st
-  states={**front,**states}
  return states
 
 def mano_line(n,total,episode,states,waiting=''):
@@ -1681,7 +1694,7 @@ def mano_line(n,total,episode,states,waiting=''):
    extra=f" · {p.get('label')} {p.get('done')}/{p.get('total')} {p.get('unit','')} ({p.get('percent')}%)" if p.get('total') else (' · '+p['label'] if p.get('label') else '')
    return head+'  ▶ '+label+(' · GPU 대기' if st['state']=='queued' else ' · 진행 중')+extra
   if st['state']=='not_started':
-   done=[MANO_LABELS[s] for s in MANO_STAGES if states[s]['state']=='success']
+   done=[MANO_LABELS[s] for s in BATCH_STAGES if states[s]['state']=='success']
    return head+('  · '+label+' 대기 ('+', '.join(done)+' 완료)' if done else '  · '+(waiting or '대기'))
  return head
 
@@ -1701,7 +1714,7 @@ def mano_status(req:Request,run_id:str=''):
  for n,src in enumerate(b['conf'].get('sources',[]),1):
   if src not in sources:continue
   if src['run_id'] in removed:
-   lines.append(f'[{n}/{total}] {src["conf"].get("episode_id")}  ⊘ 대기열에서 제거됨 (MANO 대기로 돌아감)');continue
+   lines.append(f'[{n}/{total}] {src["conf"].get("episode_id")}  ⊘ 대기열에서 제거됨 (일괄 실행 대기로 돌아감)');continue
   try:states=mano_source_state(src,redo)
   except (httpx.HTTPError,OSError,ValueError):lines.append(f'[{n}/{total}] {src["conf"].get("episode_id")}  ? GPU PC 연결 확인 필요');continue
   active=b['state'] in ('queued','running')
@@ -1716,9 +1729,10 @@ def mano_status(req:Request,run_id:str=''):
  state_label={'queued':'실행 대기','running':'진행 중','success':'완료','failed':'실패·중단'}.get(b['state'],b['state'])
  cut=mano_cutoff(b.get('start_date') or b.get('queued_at'))
  days='월화수목금토일'
- head=[f"MANO 일괄 실행 {b['dag_run_id']} · {state_label}",f"시작 {when(b.get('start_date') or b.get('queued_at'))}"+(f" · 종료 {when(b.get('end_date'))}" if b.get('end_date') else ''),
+ head=[f"3D 복원 일괄 실행 {b['dag_run_id']} · {state_label}",f"시작 {when(b.get('start_date') or b.get('queued_at'))}"+(f" · 종료 {when(b.get('end_date'))}" if b.get('end_date') else ''),
        f"새 에피소드 시작 마감: {cut:%m-%d}({days[cut.weekday()]}) {cut:%H:%M} · 이후에는 진행 중인 에피소드까지만 끝내고 나머지는 대기"]
- if redo:head.append('업데이트 전 대기열 3D 복원 다시: 업데이트 전 코드로 만든 3D 결과만 3D 복원부터 다시 한 뒤 MANO 진행')
+ head.append('에피소드마다 3D 복원 준비 → 3D 복원 → MANO 피팅 → 결과 검사 → 최종 저장 (이미 끝난 단계는 건너뜀)')
+ if redo:head.append('업데이트 전 코드로 만든 3D 결과도 3D 복원부터 다시 함')
  head.append('')
  sel={'run_id':b['dag_run_id'],'state':b['state'],'summary':head+lines,'current':None,'queue':queue,
       'can_stop':b['state'] in ('queued','running') and (access.user(req)['role']=='admin' or len(sources)==total)}
@@ -1843,6 +1857,7 @@ def fleet_mano_export(task,p):
   if run['conf'].get('episode_id')!=ep or run['state']!='success':raise RuntimeError('복원이 끝난 실행이 아닙니다.')
   label,ready=mano_progress(run,batch_history())
   if not ready:raise RuntimeError('MANO 대기 상태가 아닙니다: '+label)
+  if not recon_done(run):raise RuntimeError('3D 복원 전(3D 복원 대기)이라 이관할 수 없습니다. 이 PC에서 3D 복원 일괄 실행을 하거나, 3D 복원까지 끝난 뒤 이관하세요.')
   with fleet_db() as c:c.execute('INSERT INTO mano_transfers VALUES(?,?,?,?,?,?)',(run_id,ep,target,'exporting',task['id'],time.time()))
   worker_action('sync',{'episode':ep},DEFAULT_WORKER)
   task_update(task['id'],state='running',step='syncing',message='NAS work/'+fleet.PC_ID+' 에 작업 폴더 업로드 중')
