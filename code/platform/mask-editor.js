@@ -38,7 +38,7 @@ function hcEditControls(){
  const dirty=hcEditDirtyCams(),busy=hcEdit.saving||hcBusy,we=hcWandEntry();
  $('hcSaveEdits').disabled=busy||!dirty.length;$('hcDiscardEdits').disabled=busy||!dirty.length;
  $('hcEditUndo').disabled=busy||!hcEdit.history.length;$('hcEditRedo').disabled=busy||!hcEdit.future.length;
- $('hcSaveEdits').textContent=dirty.length?'수정 저장 ('+dirty.map(c=>'카메라 '+(c+1)).join(', ')+')':'수정 저장';
+ $('hcSaveEdits').textContent='수정 저장';
  const ready=hcWandReadyCams(),pending=hcWandPendingCams();
  $('hcWandApply').disabled=busy||!ready.length||hcWandBusyCams().length>0;$('hcWandClear').disabled=busy||!we?.wand.points.length;$('hcWandClearAll').disabled=busy||!pending.length;
  hcEmptyNavControls();
