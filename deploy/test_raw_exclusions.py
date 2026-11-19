@@ -24,6 +24,9 @@ class RawExclusionTests(unittest.TestCase):
         # 실제 NAS(control/) 대신 임시 폴더
         _ctl = tempfile.TemporaryDirectory(); self.addCleanup(_ctl.cleanup)
         _p = patch.object(fleet, 'CONTROL', Path(_ctl.name) / 'control'); _p.start(); self.addCleanup(_p.stop)
+        # 이 시나리오는 작업자당 큐 3개 기준입니다(기본값은 5로 바뀌었으므로 NAS 큐 크기 기록으로 고정).
+        for name in ('PC1', 'PC2', 'PC3'): fleet.queue_target_set(name, 3, name)
+        ui._info_cache.clear(); self.addCleanup(ui._info_cache.clear)   # 화면용 NAS 기억은 테스트마다 새로
         for name, value in [('UI_PASSWORD_FILE', ''), ('ALLOWED_HOSTS', {'testserver'})]:
             p = patch.object(ui, name, value)
             p.start(); self.addCleanup(p.stop)

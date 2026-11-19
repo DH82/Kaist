@@ -21,10 +21,14 @@ class RawClaimTests(unittest.TestCase):
                                  (ui, 'UI_PASSWORD_FILE', ''), (ui, 'ALLOWED_HOSTS', {'testserver'})]:
             p = patch.object(obj, name, value); p.start(); self.addCleanup(p.stop)
         (self.tmp / 'control').mkdir()
+        # 이 시나리오는 작업자당 큐 3개 기준입니다(기본값은 5로 바뀌었으므로 NAS 큐 크기 기록으로 고정).
+        for name in ('PC1', 'PC2'): fleet.queue_target_set(name, 3, name)
+        ui._info_cache.clear(); self.addCleanup(ui._info_cache.clear)   # 화면용 NAS 기억은 테스트마다 새로
         for name, value in [('worker', {}), ('call', {'episodes': EPS}), ('active_dags', []), ('active_runs', []), ('active_batch_sources', [])]:
             p = patch.object(ui, name, return_value=value); p.start(); self.addCleanup(p.stop)
 
     def as_pc(self, pc):
+        ui._info_cache.clear()   # 실제로는 PC마다 UI 프로세스가 따로라 기억도 따로입니다
         return patch.object(fleet, 'PC_ID', pc)
 
     def test_claim_is_exclusive(self):

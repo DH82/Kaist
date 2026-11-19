@@ -1351,7 +1351,9 @@ def raw_episodes(req:Request):
  # '내 작업에서 제외'한 RAW: 이 PC 기록은 NAS에도 남기고(예전 제외분 포함), 어느 PC든 제외한 RAW는 아무에게도 배정하지 않습니다.
  # 제외한 본인(제외 취소용)·관리자·이미 이 PC에서 담당/실행한 RAW가 아니면 목록에도 보이지 않습니다.
  local_excl=access.excluded_any(selected_worker(req))
- excluded_by={ep:pc.upper() for ep,pc in global_excluded(view=True).items()}
+ # 제외 표시는 기억해 둔 값이 아니라 NAS에서 바로 읽습니다: 배정을 막는 근거라서, 다른 PC가 방금 제외한 RAW가
+ # 잠깐이라도 이 PC에 배정되면 안 됩니다(선점과 달리 배정 시점에 다시 확인하는 장치가 없음). 파일 수가 적어 부담이 작습니다.
+ excluded_by={ep:pc.upper() for ep,pc in global_excluded().items()}
  for ep,op in local_excl.items():
   if ep not in excluded_by:fleet.raw_exclude(ep);forget('nas:excluded');excluded_by[ep]=op
  excluded=access.excluded_raw(user['name'],selected_worker(req))
