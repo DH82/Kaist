@@ -120,6 +120,31 @@ def decode_mask(data,expected_size):
   if colors is None or any(v not in (0,255) for count,v in colors):raise ValueError('마스크는 배경 0과 영역 255로 저장해야 합니다.')
   return mask.copy()
 
+def write_one(review,project,ep,cam,obj,frame,file_sha,mask,operator):
+ # 호출하는 쪽에서 episode_lock과 idle()을 잡은 상태여야 합니다. 저장할 때마다 승인 해제로 폴더가 바뀔 수 있어 대상을 매번 다시 찾습니다.
+ d,draft,p,meta=target(review,project,ep,cam,obj,frame)
+ before=p.read_bytes() if p.exists() else None
+ if file_sha!=(sha(before) if before is not None else MISSING):raise ValueError('마스크 파일이 변경됐습니다. 다시 불러오세요.')
+ if mask.size!=tuple(meta['WH']):raise ValueError('원본과 같은 해상도의 PNG 마스크가 필요합니다.')
+ if before is None:
+  unchanged=not mask.getbbox()  # 없던 마스크에 아무것도 칠하지 않음
+ else:
+  with Image.open(io.BytesIO(before)) as old:unchanged=old.convert('L').tobytes()==mask.tobytes()
+ if unchanged:
+  return {'changed':False,'cam':cam,'obj':obj,'frame':frame,'message':'변경된 픽셀이 없어 기존 승인 상태를 유지했습니다.'}
+ event=uuid.uuid4().hex;history=d/'review/edit_history'/event;history.mkdir(parents=True)
+ if before is not None:(history/'before.png').write_bytes(before)
+ audit={'event':event,'episode':ep,'camera':cam,'object':obj,'frame':frame,'operator':str(operator).strip(),
+        'time':datetime.now(ZoneInfo('Asia/Seoul')).isoformat(),'before_sha256':sha(before) if before is not None else MISSING,'status':'prepared'}
+ (history/'edit.json').write_text(json.dumps(audit,indent=2,ensure_ascii=False))
+ review.write_mask(project,ep,cam,obj,frame,mask)
+ d=review.root(project,ep);saved=d/f'review/draft/mask/{cam}/{obj}/{frame}.png'
+ history=d/'review/edit_history'/event
+ audit.update(status='saved',after_sha256=sha(saved.read_bytes()))
+ (history/'edit.json').write_text(json.dumps(audit,indent=2,ensure_ascii=False))
+ return {'changed':True,'episode':ep,'cam':cam,'obj':obj,'frame':frame,
+         'message':'수정 초안을 저장했습니다. 기존 승인은 해제됐으며 다시 검수·승인해야 합니다. 후속 추적·복원 결과도 새 승인본 기준으로 다시 실행해야 합니다.'}
+
 def save_frame(review,project,ep,data,operator):
  if not str(operator).strip():raise ValueError('검수자 정보가 필요합니다.')
  with episode_lock(project,ep):
@@ -127,27 +152,41 @@ def save_frame(review,project,ep,data,operator):
   cam,obj,frame=data.get('cam'),data.get('obj'),data.get('frame')
   d,draft,p,meta=target(review,project,ep,cam,obj,frame)
   if not data.get('basis') or data['basis']!=fingerprint(review,draft):raise ValueError('편집 중 다른 수정이 저장됐습니다. 다시 불러온 뒤 수정하세요.')
-  before=p.read_bytes() if p.exists() else None
-  if data.get('file_sha256')!=(sha(before) if before is not None else MISSING):raise ValueError('마스크 파일이 변경됐습니다. 다시 불러오세요.')
-  mask=decode_mask(data,meta['WH'])
-  if before is None:
-   unchanged=not mask.getbbox()  # 없던 마스크에 아무것도 칠하지 않음
-  else:
-   with Image.open(io.BytesIO(before)) as old:unchanged=old.convert('L').tobytes()==mask.tobytes()
-  if unchanged:
-   return {'changed':False,'approval':review.approval_summary(project,ep),'message':'변경된 픽셀이 없어 기존 승인 상태를 유지했습니다.'}
-  event=uuid.uuid4().hex;history=d/'review/edit_history'/event;history.mkdir(parents=True)
-  if before is not None:(history/'before.png').write_bytes(before)
-  audit={'event':event,'episode':ep,'camera':cam,'object':obj,'frame':frame,'operator':str(operator).strip(),
-         'time':datetime.now(ZoneInfo('Asia/Seoul')).isoformat(),'before_sha256':sha(before) if before is not None else MISSING,'status':'prepared'}
-  (history/'edit.json').write_text(json.dumps(audit,indent=2,ensure_ascii=False))
-  review.write_mask(project,ep,cam,obj,frame,mask)
-  d=review.root(project,ep);saved=d/f'review/draft/mask/{cam}/{obj}/{frame}.png'
-  history=d/'review/edit_history'/event
-  audit.update(status='saved',after_sha256=sha(saved.read_bytes()))
-  (history/'edit.json').write_text(json.dumps(audit,indent=2,ensure_ascii=False))
-  return {'changed':True,'episode':ep,'cam':cam,'obj':obj,'frame':frame,'approval':review.approval_summary(project,ep),
-          'message':'수정 초안을 저장했습니다. 기존 승인은 해제됐으며 다시 검수·승인해야 합니다. 후속 추적·복원 결과도 새 승인본 기준으로 다시 실행해야 합니다.'}
+  result=write_one(review,project,ep,cam,obj,frame,data.get('file_sha256'),decode_mask(data,meta['WH']),operator)
+  result['approval']=review.approval_summary(project,ep)
+  return result
+
+def save_many(review,project,ep,data,operator):
+ # 한 프레임의 여러 카메라 수정을 요청 한 번으로 저장합니다(화면에서 카메라마다 조회+저장을 왕복하지 않도록).
+ # 마스크마다 불러올 때의 file_sha256이 지금 파일과 같아야 하며, 하나라도 다르면 아무것도 쓰지 않습니다.
+ if not str(operator).strip():raise ValueError('검수자 정보가 필요합니다.')
+ items=data.get('masks')
+ if not isinstance(items,list) or not 1<=len(items)<=8 or any(not isinstance(x,dict) for x in items):raise ValueError('Invalid mask request')
+ with episode_lock(project,ep):
+  idle(ep);ready=[];seen=set()
+  for x in items:
+   cam,obj,frame=x.get('cam'),x.get('obj'),x.get('frame')
+   d,draft,p,meta=target(review,project,ep,cam,obj,frame)
+   if (cam,obj,frame) in seen:raise ValueError('Invalid mask request')
+   seen.add((cam,obj,frame))
+   before=p.read_bytes() if p.exists() else None
+   if x.get('file_sha256')!=(sha(before) if before is not None else MISSING):raise ValueError(f'카메라 {cam+1} 마스크가 다른 곳에서 변경됐습니다. 수정을 버리고 다시 불러오세요.')
+   ready.append((cam,obj,frame,x.get('file_sha256'),decode_mask(x,meta['WH'])))
+  results=[write_one(review,project,ep,*item,operator) for item in ready]
+  d=review.root(project,ep)
+  return {'results':results,'changed':any(r['changed'] for r in results),'basis':fingerprint(review,d/'review/draft'),'approval':review.approval_summary(project,ep)}
+
+def mask_areas(review,project,ep,data):
+ # 프레임 구간의 마스크 픽셀 수를 한 번에 돌려줍니다(-1 = 파일 없음). '빈 마스크 찾기'·'빈 마스크 일괄 적용'이 프레임마다 PNG를 받지 않도록 합니다.
+ obj,a,b=data.get('obj'),data.get('from'),data.get('to');cams=data.get('cams',[0,1,2,3])
+ if any(type(v) is not int for v in (obj,a,b)) or not isinstance(cams,list) or not cams or any(type(c) is not int for c in cams) or a>b:raise ValueError('Invalid mask coordinates')
+ with episode_lock(project,ep):
+  d,draft,p,meta=target(review,project,ep,cams[0],obj,a)
+  if b not in range(meta['frame_num']) or any(cam not in range(4) for cam in cams):raise ValueError('Invalid mask coordinates')
+ def area(path):
+  if not path.is_file():return -1
+  with Image.open(path) as im:return sum(im.convert('L').histogram()[1:])
+ return {'obj':obj,'from':a,'to':b,'areas':{str(cam):[area(draft/f'mask/{cam}/{obj}/{f}.png') for f in range(a,b+1)] for cam in cams}}
 
 if __name__=='__main__':
  parser=argparse.ArgumentParser();parser.add_argument('action',choices=['frame','save','wand_source','track_source','apply_track']);parser.add_argument('--config',required=True);parser.add_argument('--episode',required=True)
@@ -160,6 +199,10 @@ if __name__=='__main__':
   elif args.action=='apply_track':
    payload=json.load(sys.stdin);value=apply_track(review,project,ep,payload,payload.get('operator',''))
   else:
-   payload=json.load(sys.stdin);value=save_frame(review,project,ep,payload,payload.get('operator',''))
+   # 저장 요청(POST /edit)의 op로 묶음 저장·픽셀 수 조회를 구분합니다(워커 서비스 경로를 늘리지 않습니다).
+   payload=json.load(sys.stdin);op=payload.get('op') if isinstance(payload,dict) else None
+   if op=='areas':value=mask_areas(review,project,ep,payload)
+   elif op=='save_many':value=save_many(review,project,ep,payload,payload.get('operator',''))
+   else:value=save_frame(review,project,ep,payload,payload.get('operator',''))
   print(json.dumps(value,ensure_ascii=False))
  except Exception as e:print(str(e),file=sys.stderr);sys.exit(1)

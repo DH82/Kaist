@@ -1,13 +1,16 @@
 // HC 마스크 검수 화면의 카메라 1~4 타일에서 바로 마스크를 수정합니다.
 // - 원본 + 마스크 표시에서 타일 위를 드래그(또는 클릭)하면 선택한 대상(손/물체)의 마스크를 칠하거나 지웁니다.
 // - 마법봉: 클릭한 곳을 SAM3.1로 분할합니다. 물체 이름을 함께 주면 같은 종류의 물체를 먼저 찾고 클릭한 것을 고릅니다.
-//   왼쪽 클릭 = 포함할 곳, Shift+클릭 또는 오른쪽 클릭 = 제외할 곳, Enter = 모든 카메라의 결과 적용 후 바로 저장,
-//   Esc = 마지막으로 누른 카메라의 점 지우기, '모든 점 초기화' = 모든 카메라의 점·결과 지우기
+//   왼쪽 클릭 = 포함할 곳, Shift+클릭 또는 오른쪽 클릭 = 제외할 곳, Enter = 모든 카메라의 결과 적용 후 바로 저장(분할 중이면 끝나는 대로),
+//   Backspace(또는 Ctrl+Z) = 마지막 점 하나 취소, Esc = 마지막으로 누른 카메라의 점 지우기, '모든 점 초기화' = 모든 카메라의 점·결과 지우기
+//   클릭은 기다리지 않고 바로 분할을 시작합니다. 더블클릭(크게 보기)이면 방금 찍은 점을 되돌립니다.
 //   '빈 마스크 일괄 적용' = 마지막으로 누른 카메라의 점 프롬프트로, 같은 카메라에서 마스크가 비어 있는 프레임들을 일괄 분할·저장
 // - 타일을 더블클릭하면 그 카메라만 크게 보고, 다시 더블클릭(또는 Esc)하면 2×2로 돌아갑니다.
 // - 마스크 좌표와 브러시 반경은 원본 해상도 기준이며, 원본 RGB는 바꾸지 않습니다.
 const hcEdit={cams:[null,null,null,null],history:[],future:[],stroke:null,tap:null,saving:false,solo:null,
- names:{0:null,1:'hand'},wandCam:null,wandLoaded:false};
+ names:{0:null,1:'hand'},wandCam:null,wandLoaded:false,hover:null,warmTimer:0,applyWait:false,
+ // 옛 워커(묶음 저장·픽셀 수 조회 없음)에서는 예전 방식으로 동작합니다.
+ legacySave:false,legacyAreas:false};
 const HC_TAP_DELAY=260;
 // 마법봉 일괄 적용 상태(같은 카메라의 빈 마스크 프레임에 현재 점 프롬프트를 차례로 적용·저장)
 const hcBatch={running:false,stop:false,track:false};  // track: 추적 일괄 교체(워커 작업이라 중간에 멈출 수 없음)
@@ -32,6 +35,7 @@ function hcWandPending(e){return Boolean(e?.ready&&e.wand&&(e.wand.mask||e.wand.
 // 적용·지우기 후에는 마법봉 작업이 남아 있는 다른 카메라를 이어서 활성 카메라로 삼습니다.
 function hcWandNextCam(){const cam=[0,1,2,3].find(c=>hcWandPending(hcEdit.cams[c]));return cam===undefined?null:cam}
 function hcWandReadyCams(){return [0,1,2,3].filter(c=>{const e=hcEdit.cams[c];return e?.ready&&e.wand?.mask&&!e.wand.busy})}
+function hcPost(data){return hcRequest(hcPath+'/edit',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':hcToken},body:JSON.stringify(data)})}
 function hcWandPendingCams(){return [0,1,2,3].filter(c=>hcWandPending(hcEdit.cams[c]))}
 function hcWandEntry(){const cam=hcEdit.wandCam;const e=cam===null?null:hcEdit.cams[cam];return e?.ready&&e.wand?e:null}
 function hcEditControls(){
@@ -40,7 +44,10 @@ function hcEditControls(){
  $('hcEditUndo').disabled=busy||!hcEdit.history.length;$('hcEditRedo').disabled=busy||!hcEdit.future.length;
  $('hcSaveEdits').textContent='수정 저장';
  const ready=hcWandReadyCams(),pending=hcWandPendingCams();
- $('hcWandApply').disabled=busy||!ready.length||hcWandBusyCams().length>0;$('hcWandClear').disabled=busy||!we?.wand.points.length;$('hcWandClearAll').disabled=busy||!pending.length;
+ // 분할 중에도 Enter(적용)를 받을 수 있습니다. 끝나는 대로 적용·저장합니다.
+ $('hcWandApply').disabled=busy||!(ready.length||hcWandBusyCams().length);$('hcWandClear').disabled=busy||!we?.wand.points.length;$('hcWandClearAll').disabled=busy||!pending.length;
+ $('hcWandUndo').disabled=busy||!we?.wand.points.length;
+ if(hcBatch.running)$('hcBatchBox').open=true;
  hcEmptyNavControls();
  $('hcBatchApply').textContent='빈 '+($('hcEditObj').value==='0'?'물체':'손')+' 마스크 일괄 적용';
  $('hcBatchApply').disabled=busy||hcBatch.running||!we?.wand.points.some(x=>x[2]===1)||we.wand.busy;$('hcBatchStop').hidden=!hcBatch.running||hcBatch.track;
@@ -56,7 +63,9 @@ function hcEditControls(){
  for(let cam=0;cam<4;cam++){const tag=$('hcCamEdit'+cam);if(tag){const e=hcEdit.cams[cam],d=e?.ready&&e.dirty,none=e?.ready&&e.data.missing&&!d;
   // SAM3가 이 프레임에서 대상을 찾지 못해 마스크 파일이 없는 경우: 빈 마스크에서 새로 칠할 수 있습니다.
   const w=hcWandPending(e)?(e.wand.busy?'마법봉 분할 중…':e.wand.mask?'마법봉 적용 대기 (Enter)':'마법봉 점만 있음'):'';
-  tag.textContent=[d?'':none?(e.obj===0?'물체':'손')+' 마스크 없음 · 칠하면 새로 만듦':'',w].filter(Boolean).join(' · ');tag.hidden=!tag.textContent}}
+  tag.textContent=[d?'':none?(e.obj===0?'물체':'손')+' 마스크 없음 · 칠하면 새로 만듦':'',w].filter(Boolean).join(' · ');tag.hidden=!tag.textContent;
+  // Enter·Esc·일괄 적용이 동작하는 카메라(마지막으로 누른 카메라)와 분할 중인 카메라를 화면에서 바로 알 수 있게 표시합니다.
+  const fig=tag.closest('figure');fig.classList.toggle('hcWandActive',cam===hcEdit.wandCam&&hcWandPending(e));fig.classList.toggle('hcWandBusy',Boolean(e?.ready&&e.wand?.busy))}}
  if(!busy&&!$('hcEditState').classList.contains('error'))hcEditMessage('');  // 수정 중 안내 문구는 띄우지 않습니다(이동·나가기 때 자동 저장)
 }
 
@@ -122,11 +131,17 @@ function hcEditLoad(cam){
  hcEdit.cams[cam]=entry;return entry.promise;
 }
 function hcEditReset(){
- clearTimeout(hcEdit.tap?.timer);hcEdit.tap=null;hcEdit.stroke=null;hcEdit.wandCam=null;
+ clearTimeout(hcEdit.tap?.timer);hcEdit.tap=null;hcEdit.stroke=null;hcEdit.wandCam=null;clearTimeout(hcEdit.warmTimer);
  hcEdit.cams.forEach(e=>{if(e?.raf)cancelAnimationFrame(e.raf)});
  hcEdit.cams=[null,null,null,null];hcEdit.history=[];hcEdit.future=[];
  for(let cam=0;cam<4;cam++)hcEditRender(cam);
  $('hcEditState').classList.remove('error');hcWandMessage('');hcEditControls();
+}
+// 프레임을 옮긴 뒤에도 마우스가 카메라 화면 위에 그대로 있으면(pointerenter가 다시 오지 않음) 편집용 마스크를 미리 불러 둡니다.
+// 재생 중이거나 프레임을 빠르게 넘기는 동안에는 불러오지 않습니다.
+function hcEditWarm(){
+ clearTimeout(hcEdit.warmTimer);
+ hcEdit.warmTimer=setTimeout(()=>{if(hcEdit.hover!==null&&!hcTimer&&!hcBatch.running&&!hcEditBlocked())hcEditLoad(hcEdit.hover)},150);
 }
 function hcEditSnap(cam,e){return {cam,entry:e,pixels:e.mask.getContext('2d').getImageData(0,0,e.width,e.height),dirty:e.dirty}}
 // 되돌리기 한 단계 = 카메라 여러 개의 스냅숏. 마법봉을 여러 카메라에 한꺼번에 적용해도 한 번에 되돌립니다.
@@ -147,9 +162,10 @@ function hcEditDraw(e,from,to){
 async function hcEditFlush(stroke){
  const e=await hcEditLoad(stroke.cam);
  if(!e||stroke.cancelled||hcEdit.cams[stroke.cam]!==e)return;
- if(!stroke.started){stroke.started=true;hcEditPushHistory([hcEditSnap(stroke.cam,e)])}
+ const first=!stroke.started;
+ if(first){stroke.started=true;hcEditPushHistory([hcEditSnap(stroke.cam,e)])}
  while(stroke.drawn<stroke.pts.length){hcEditDraw(e,stroke.drawn?stroke.pts[stroke.drawn-1]:null,stroke.pts[stroke.drawn]);stroke.drawn++}
- e.dirty=true;hcEditSchedule(stroke.cam);hcEditControls();
+ e.dirty=true;hcEditSchedule(stroke.cam);if(first)hcEditControls();  // 버튼 상태는 획이 시작될 때 한 번만 바뀝니다
 }
 function hcEditRing(cam,ev){
  const ring=$('hcRing'+cam),canvas=$('hcEdit'+cam);if(!ring||!canvas)return;
@@ -159,11 +175,12 @@ function hcEditRing(cam,ev){
  Object.assign(ring.style,{width:size+'px',height:size+'px',left:(ev.clientX-r.left)+'px',top:(ev.clientY-r.top)+'px'});
  ring.classList.toggle('erase',hcTool()==='erase');ring.hidden=false;
 }
-function hcCancelTap(){if(hcEdit.tap){clearTimeout(hcEdit.tap.timer);hcEdit.tap.stroke.cancelled=true;hcEdit.tap=null}}
+function hcCancelTap(){if(hcEdit.tap){const s=hcEdit.tap.stroke;clearTimeout(hcEdit.tap.timer);s.cancelled=true;hcEdit.tap=null;if(s.wand)hcWandUnclick(s)}}
 function hcEditBind(cam){
  const canvas=$('hcEdit'+cam);
- canvas.onpointerenter=ev=>{if(!hcEditBlocked())hcEditLoad(cam);hcEditRing(cam,ev)};
- canvas.onpointerleave=()=>hcEditRing(cam,null);
+ canvas.style.cursor=hcTool()==='wand'?'copy':'crosshair';
+ canvas.onpointerenter=ev=>{hcEdit.hover=cam;if(!hcEditBlocked())hcEditLoad(cam);hcEditRing(cam,ev)};
+ canvas.onpointerleave=()=>{if(hcEdit.hover===cam)hcEdit.hover=null;hcEditRing(cam,null)};
  canvas.oncontextmenu=ev=>{if(hcTool()==='wand')ev.preventDefault()};
  canvas.onpointerdown=ev=>{
   const wand=hcTool()==='wand';
@@ -174,9 +191,10 @@ function hcEditBind(cam){
   // 마법봉 오른쪽 클릭은 더블클릭과 겹치지 않으므로 바로 '제외' 점으로 씁니다.
   if(wand&&ev.button===2){hcWandClick(cam,p,0);return}
   // 같은 자리를 빠르게 두 번 누르면 더블클릭(크게 보기)으로 보고 점을 찍지 않습니다.
-  if(hcEdit.tap&&hcEdit.tap.cam===cam&&Math.hypot(hcEdit.tap.client.x-ev.clientX,hcEdit.tap.client.y-ev.clientY)<12)hcCancelTap();
+  const second=Boolean(hcEdit.tap&&hcEdit.tap.cam===cam&&Math.hypot(hcEdit.tap.client.x-ev.clientX,hcEdit.tap.client.y-ev.clientY)<12);
+  if(second)hcCancelTap();
   hcEdit.stroke={cam,pts:[p],drawn:0,started:false,moved:false,cancelled:false,pointer:ev.pointerId,client:{x:ev.clientX,y:ev.clientY},
-   wand,label:ev.shiftKey||ev.altKey?0:1};
+   wand,label:ev.shiftKey||ev.altKey?0:1,second};
   canvas.setPointerCapture(ev.pointerId);hcEditLoad(cam);
  };
  canvas.onpointermove=ev=>{
@@ -190,8 +208,15 @@ function hcEditBind(cam){
   const s=hcEdit.stroke;if(!s||s.cam!==cam||s.pointer!==ev.pointerId)return;hcEdit.stroke=null;
   if(s.moved){hcEditFlush(s);return}
   s.pts=[s.pts[0]];
-  const run=s.wand?()=>{if(!s.cancelled)hcWandClick(cam,s.pts[0],s.label)}:()=>hcEditFlush(s);
-  hcEdit.tap={cam,stroke:s,client:s.client,timer:setTimeout(()=>{if(hcEdit.tap?.stroke===s)hcEdit.tap=null;run()},HC_TAP_DELAY)};
+  if(s.wand){
+   // 마법봉 클릭은 더블클릭 판정을 기다리지 않고 바로 분할을 시작합니다. 같은 자리를 곧바로 다시 누르면(더블클릭 = 크게 보기)
+   // hcCancelTap이 방금 찍은 점을 되돌리고, 그 두 번째 누름은 점으로 쓰지 않습니다.
+   if(s.second)return;
+   hcWandClick(cam,s.pts[0],s.label,s);
+   hcEdit.tap={cam,stroke:s,client:s.client,timer:setTimeout(()=>{if(hcEdit.tap?.stroke===s)hcEdit.tap=null},HC_TAP_DELAY)};
+   return;
+  }
+  hcEdit.tap={cam,stroke:s,client:s.client,timer:setTimeout(()=>{if(hcEdit.tap?.stroke===s)hcEdit.tap=null;hcEditFlush(s)},HC_TAP_DELAY)};
  };
  canvas.onpointercancel=()=>{if(hcEdit.stroke?.cam===cam){hcEdit.stroke.cancelled=!hcEdit.stroke.started;hcEdit.stroke=null}};
  canvas.ondblclick=ev=>{ev.preventDefault();hcCancelTap();hcToggleSolo(cam)};
@@ -203,46 +228,79 @@ function hcWandRequestBody(e){
  const useName=$('hcWandPrompt').value==='name';
  return {cam:e.cam,frame:e.frame,points:e.wand.points,text:useName?$('hcWandText').value.trim():'',threshold:Number($('hcWandThr').value)};
 }
-async function hcWandClick(cam,p,label){
+async function hcWandClick(cam,p,label,stroke=null){
  const blocked=hcEditBlocked();if(blocked){hcEditMessage(blocked,true);return}
- const e=await hcEditLoad(cam);if(!e||hcEdit.cams[cam]!==e)return;
+ const e=await hcEditLoad(cam);if(!e||hcEdit.cams[cam]!==e||stroke?.cancelled)return;
  // 마법봉 점·결과는 카메라마다 따로 유지합니다. 다른 카메라를 눌러도 이전 카메라의 작업은 그대로 남고,
  // 적용(Enter)·점 지우기(Esc)는 마지막으로 누른 카메라에 동작합니다.
  hcEdit.wandCam=cam;
  if(!e.wand)e.wand={points:[],mask:null,seq:0,busy:false};
  if(label===0&&!e.wand.points.some(x=>x[2]===1)){hcWandMessage('먼저 포함할 곳을 왼쪽 클릭하세요. 제외는 Shift+클릭 또는 오른쪽 클릭입니다.',true);return}
  if(e.wand.points.length>=20){hcWandMessage('점은 20개까지 찍을 수 있습니다. 점 지우기 후 다시 시작하세요.',true);return}
- e.wand.points.push([p.x/e.width,p.y/e.height,label]);hcEditRender(cam);hcEditControls();hcWandRun(cam);
+ const point=[p.x/e.width,p.y/e.height,label];
+ if(stroke){stroke.point=point;stroke.entry=e}
+ e.wand.points.push(point);hcEditRender(cam);hcEditControls();hcWandRun(cam);
 }
-async function hcWandRun(cam){
- const e=hcEdit.cams[cam];if(!e?.wand?.points.length)return;
- const w=e.wand,seq=++w.seq;w.busy=true;hcEditRender(cam);hcEditControls();
- hcWandMessage(hcEdit.wandLoaded?'SAM3로 분할하는 중…':'SAM3 모델을 GPU에 불러오는 중… 처음 한 번은 10~20초 걸립니다.');
- try{
-  const r=await hcRequest(hcPath+'/wand',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':hcToken},body:JSON.stringify(hcWandRequestBody(e))});
-  if(hcEdit.cams[cam]!==e||e.wand!==w||w.seq!==seq)return;
-  const im=await hcEditImage('data:image/png;base64,'+r.mask_png);
-  if(hcEdit.cams[cam]!==e||e.wand!==w||w.seq!==seq)return;
-  const c=document.createElement('canvas');c.width=e.width;c.height=e.height;const ctx=c.getContext('2d',{willReadFrequently:true});ctx.drawImage(im,0,0,e.width,e.height);
-  const px=ctx.getImageData(0,0,e.width,e.height);
-  for(let i=0;i<px.data.length;i+=4){const inside=px.data[i]>127;px.data[i]=px.data[i+1]=px.data[i+2]=255;px.data[i+3]=inside?255:0}
-  ctx.putImageData(px,0,0);w.mask=c;hcEdit.wandLoaded=true;
-  const how={text:'이름으로 찾음','text+points':'이름 + 클릭으로 다듬음',points:'클릭으로 분할'}[r.method]||r.method;
-  hcWandMessage('카메라 '+(cam+1)+' · '+how+' · '+r.area.toLocaleString()+'px · '+r.message+' 노란 영역을 확인하고 Enter(적용)를 누르세요.');
- }catch(err){
-  if(hcEdit.cams[cam]===e&&e.wand===w&&w.seq===seq){w.points.pop();hcWandMessage(err.message,true)}
- }finally{
-  if(e.wand===w&&w.seq===seq){w.busy=false;hcEditRender(cam);hcEditControls()}
- }
+// 점 하나를 빼고 남은 점으로 다시 분할합니다. 포함 점이 남지 않으면 그 카메라의 마법봉 작업을 지웁니다.
+function hcWandDropPoint(e,point){
+ const w=e.wand,i=w?w.points.indexOf(point):-1;if(i<0||hcEdit.cams[e.cam]!==e)return false;
+ w.points.splice(i,1);
+ if(!w.points.some(x=>x[2]===1)){e.wand=null;if(hcEdit.wandCam===e.cam)hcEdit.wandCam=hcWandNextCam();hcWandMessage('')}
+ else hcWandRun(e.cam);
+ hcEditRender(e.cam);hcEditControls();return true;
+}
+// 더블클릭의 첫 번째 누름으로 찍힌 점을 되돌립니다.
+function hcWandUnclick(stroke){if(stroke.point&&stroke.entry)hcWandDropPoint(stroke.entry,stroke.point)}
+// 마지막으로 누른 카메라에서 마지막에 찍은 점 하나만 취소합니다(Backspace · Ctrl+Z).
+function hcWandUndoPoint(){
+ const e=hcWandEntry();if(!e||!e.wand.points.length||hcEdit.saving||hcBusy)return false;
+ return hcWandDropPoint(e,e.wand.points[e.wand.points.length-1]);
+}
+// 카메라마다 요청은 한 번에 하나만 보냅니다. 분할 중에 점·이름·기준이 바뀌면 끝난 뒤 최신 상태로 한 번만 다시 보냅니다
+// (빠르게 여러 번 클릭해도 서버에 요청이 쌓여 밀리지 않습니다). w.done = 진행 중인 분할이 모두 끝나면 완료되는 Promise.
+function hcWandRun(cam){
+ const e=hcEdit.cams[cam],w=e?.wand;if(!w?.points.length)return Promise.resolve();
+ if(w.busy){w.again=true;return w.done}
+ const live=()=>hcEdit.cams[cam]===e&&e.wand===w;
+ w.busy=true;hcEditRender(cam);hcEditControls();
+ w.done=(async()=>{
+  do{
+   w.again=false;const sent=w.points.length;
+   hcWandMessage(hcEdit.wandLoaded?'SAM3로 분할하는 중…':'SAM3 모델을 GPU에 불러오는 중… 처음 한 번은 10~20초 걸립니다.');
+   try{
+    const r=await hcRequest(hcPath+'/wand',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':hcToken},body:JSON.stringify(hcWandRequestBody(e))});
+    hcEdit.wandLoaded=true;
+    if(!live())return;if(w.again)continue;
+    const {canvas:c,ctx,px}=await hcPngPixels(r.mask_png,e.width,e.height);
+    if(!live())return;if(w.again)continue;
+    for(let i=0;i<px.data.length;i+=4){const inside=px.data[i]>127;px.data[i]=px.data[i+1]=px.data[i+2]=255;px.data[i+3]=inside?255:0}
+    ctx.putImageData(px,0,0);w.mask=c;
+    const how={text:'이름으로 찾음','text+points':'이름 + 클릭으로 다듬음',points:'클릭으로 분할'}[r.method]||r.method;
+    hcWandMessage('카메라 '+(cam+1)+' · '+how+' · '+r.area.toLocaleString()+'px · '+r.message+' 노란 영역을 확인하고 Enter(적용)를 누르세요.');
+   }catch(err){
+    if(!live())return;if(w.again)continue;
+    // 실패한 요청의 마지막 점은 되돌립니다(이전 결과가 있으면 그대로 둡니다).
+    if(w.points.length===sent)w.points.pop();
+    if(!w.points.length&&!w.mask){e.wand=null;if(hcEdit.wandCam===cam)hcEdit.wandCam=hcWandNextCam()}
+    hcWandMessage(err.message,true);
+   }
+  }while(live()&&w.again);
+ })().finally(()=>{w.busy=false;w.again=false;if(hcEdit.cams[cam]===e){hcEditRender(cam);hcEditControls()}});
+ return w.done;
 }
 function hcWandBusyCams(){return [0,1,2,3].filter(c=>hcEdit.cams[c]?.wand?.busy)}
 // 지금까지 마법봉 결과(노란 영역)가 나온 모든 카메라에 한 번에 적용하고 곧바로 저장합니다.
 // 저장하면 프레임을 새로 불러와 남은 마법봉 점도 지워지므로, 분할 중인 카메라가 있으면 끝날 때까지 기다립니다.
 async function hcWandApply(){
- if(hcEdit.saving||hcBusy)return;
- const cams=hcWandReadyCams();if(!cams.length)return;
+ if(hcEdit.saving||hcBusy||hcEdit.applyWait)return;
  const busyCams=hcWandBusyCams();
- if(busyCams.length){hcWandMessage(busyCams.map(c=>'카메라 '+(c+1)).join(', ')+' 분할이 끝난 뒤 적용·저장할 수 있습니다.',true);return}
+ if(busyCams.length){
+  // 분할이 끝나기 전에 Enter를 눌러도 됩니다. 끝나는 대로 적용·저장합니다(저장하면 프레임을 새로 불러와 남은 점이 지워지므로 모두 기다립니다).
+  hcEdit.applyWait=true;const key=hcEditKey();hcWandMessage('분할이 끝나는 대로 적용·저장합니다…');
+  try{while(hcWandBusyCams().length)await Promise.all(hcWandBusyCams().map(c=>hcEdit.cams[c].wand.done))}catch(_){}finally{hcEdit.applyWait=false}
+  if(hcEdit.saving||hcBusy||key!==hcEditKey()||$('hcWandState').classList.contains('error'))return;
+ }
+ const cams=hcWandReadyCams();if(!cams.length)return;
  const mode=$('hcWandMode').value;
  hcEditPushHistory(cams.map(cam=>hcEditSnap(cam,hcEdit.cams[cam])));
  for(const cam of cams){
@@ -310,20 +368,29 @@ async function hcSaveEdits(){
  const cams=hcEditDirtyCams();if(!cams.length||hcEdit.saving||hcBusy)return true;
  if(hcApproved()&&!confirm('수정한 마스크를 저장하면 기존 승인이 해제되고 다시 검수해야 합니다. 저장할까요?'))return false;
  hcStop();hcEdit.saving=true;hcEditControls();hcEditMessage('');  // 자동 저장은 조용히 진행합니다(실패할 때만 오류 표시)
- const frame=hcFrame,messages=[];let ok=true;
+ const frame=hcFrame,path=hcPath,messages=[];let ok=true,refresh=true;
  try{
-  for(const cam of cams){
+  // 수정한 카메라를 요청 한 번으로 저장합니다. 응답에 새 검수 기준값(basis)·승인 상태가 함께 옵니다.
+  let many=null;
+  if(!hcEdit.legacySave){
+   const entries=cams.map(cam=>hcEdit.cams[cam]);
+   try{many=await hcPost({op:'save_many',masks:entries.map(e=>({cam:e.cam,obj:e.obj,frame:e.frame,file_sha256:e.data.file_sha256,mask_png:hcEditPng(e)}))})}
+   catch(err){if(!/Invalid mask coordinates/.test(err.message))throw err;hcEdit.legacySave=true}  // 옛 워커: 아래 카메라별 저장으로
+   if(many){entries.forEach(e=>{e.dirty=false});if(hcMeta&&hcPath===path){hcMeta.basis=many.basis;hcMeta.approval=many.approval}}
+  }
+  if(!many)for(const cam of cams){
    const e=hcEdit.cams[cam];
    // 저장할 때마다 검수 기준값(basis)이 바뀌므로 카메라마다 최신 값을 다시 받아 저장합니다.
    const fresh=await hcRequest(hcPath+'/edit?'+new URLSearchParams({cam,obj:e.obj,frame:e.frame}));
    if(fresh.file_sha256!==e.data.file_sha256)throw Error('카메라 '+(cam+1)+' 마스크가 다른 곳에서 변경됐습니다. 수정을 버리고 다시 불러오세요.');
    const payload={cam,obj:e.obj,frame:e.frame,basis:fresh.basis,file_sha256:e.data.file_sha256,mask_png:hcEditPng(e)};
-   const result=await hcRequest(hcPath+'/edit',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':hcToken},body:JSON.stringify(payload)});
+   const result=await hcPost(payload);
    e.dirty=false;messages.push('카메라 '+(cam+1)+': '+result.message);
   }
+  refresh=!many;
  }catch(err){ok=false;hcEditMessage(err.message,true)}
  finally{hcEdit.saving=false}
- try{const meta=await hcRequest(hcPath);if(meta&&hcMeta&&meta.episode===hcMeta.episode)hcMeta=meta}catch(_){}
+ if(refresh)try{const meta=await hcRequest(hcPath);if(meta&&hcMeta&&meta.episode===hcMeta.episode)hcMeta=meta}catch(_){}
  // 저장된 마스크로 서버 이미지를 새로 받습니다. 새 이미지가 뜰 때까지는 수정한 화면을 그대로 보여 줘 깜빡임이 없습니다.
  if(ok){hcImageRev++;await hcShowFrame(frame,true,true);if(typeof loadJobs==='function')loadJobs()}
  else hcEditControls();
@@ -349,11 +416,21 @@ function hcSetTool(tool){
  $('hcBrushMode').value=tool;
  for(const [id,t] of [['hcBrush','add'],['hcEraser','erase'],['hcWand','wand']])$(id).setAttribute('aria-pressed',String(tool===t));
  $('hcWandTools').hidden=tool!=='wand';$('hcBrushTools').hidden=tool==='wand';
+ $('hcEditHelp').textContent=tool==='wand'
+  ?'마법봉 · 클릭 = 포함할 곳 · Shift+클릭/오른쪽 클릭 = 제외할 곳 · Backspace 마지막 점 취소 · Esc 이 카메라 점 지우기 · Enter 모든 카메라 결과 적용·저장(분할 중에 눌러도 됩니다) · 노란 테두리 = Enter·Esc·일괄 적용이 동작하는 카메라'
+  :(tool==='erase'?'지우개':'브러시')+' · "원본 + 마스크" 표시에서 카메라 화면을 드래그 · [ ] 반경 · Enter 저장(프레임을 옮겨도 자동 저장) · Ctrl/Cmd+Z 취소';
+ $('hcEditHelp').textContent+=' · B 브러시 · E 지우개 · W 마법봉 · Q 대상(손↔물체) 전환 · ←→ 프레임 이동 · 더블클릭 크게 보기';
  document.querySelectorAll('.hcEditCanvas').forEach(c=>c.style.cursor=tool==='wand'?'copy':'crosshair');
  for(let c=0;c<4;c++)hcEditRing(c,null);
 }
 $('hcBrush').onclick=()=>hcSetTool('add');$('hcEraser').onclick=()=>hcSetTool('erase');$('hcWand').onclick=()=>hcSetTool('wand');
 $('hcRadius').oninput=()=>$('hcRadiusLabel').textContent=$('hcRadius').value+'px';
+// [ ] 로 브러시 반경을 줄이고 키웁니다(작을 때는 1px, 클수록 크게).
+function hcRadiusStep(dir){const el=$('hcRadius'),v=Number(el.value),step=v<10?1:v<30?2:5;el.value=Math.max(Number(el.min),Math.min(Number(el.max),v+dir*step));el.oninput()}
+$('hcWandUndo').onclick=hcWandUndoPoint;
+// 일괄 적용 영역은 접어 둘 수 있고, 펼친 상태는 이 브라우저에 기억합니다.
+try{$('hcBatchBox').open=localStorage.getItem('hcBatchOpen')==='1'}catch(_){}
+$('hcBatchBox').ontoggle=()=>{try{localStorage.setItem('hcBatchOpen',$('hcBatchBox').open?'1':'0')}catch(_){}};
 $('hcEditUndo').onclick=hcEditUndo;$('hcEditRedo').onclick=hcEditRedo;
 $('hcDiscardEdits').onclick=hcEditDiscard;$('hcSaveEdits').onclick=()=>hcSaveEdits();
 $('hcTrackApply').onclick=()=>hcTrackRun(false);$('hcTrackForward').onclick=()=>hcTrackRun(true);$('hcWandApply').onclick=hcWandApply;$('hcBatchApply').onclick=hcBatchRun;$('hcBatchStop').onclick=()=>{hcBatch.stop=true;hcWandMessage('일괄 적용을 중지하는 중… 지금 처리 중인 프레임까지만 저장합니다.')};$('hcWandClear').onclick=hcWandClear;$('hcWandClearAll').onclick=hcWandClearAll;
@@ -365,14 +442,20 @@ $('hcEditObj').onchange=async()=>{
  if(!await hcEditResolve('대상 변경'))return;
  $('hcEditObj').value=hcEditObjValue=next;hcEditReset();hcWandSyncName();
 };
-hcWandSyncName();
+hcWandSyncName();hcSetTool('add');
 document.addEventListener('keydown',e=>{
  if(page!=='review'||!hcMeta||hcStage!=='mask'||$('hcWorkspace').classList.contains('hidden')||document.querySelector('dialog[open]')||e.isComposing||e.target.closest('input:not([type=range]):not([type=checkbox]),textarea,select,[contenteditable="true"]'))return;
- const key=e.key.toLowerCase();
- if((e.ctrlKey||e.metaKey)&&key==='z'){e.preventDefault();e.shiftKey?hcEditRedo():hcEditUndo()}
+ // 글자 단축키는 자판 위치(e.code)로 읽어 한글 입력 상태에서도 동작합니다.
+ const key=/^Key[A-Z]$/.test(e.code)?e.code[3].toLowerCase():e.code==='BracketLeft'?'[':e.code==='BracketRight'?']':e.key.toLowerCase();
+ // 마법봉으로 점을 찍는 중이면 Ctrl+Z·Backspace는 마지막 점 하나를 취소합니다.
+ if((e.ctrlKey||e.metaKey)&&key==='z'&&!e.shiftKey&&hcTool()==='wand'&&hcWandUndoPoint())e.preventDefault();
+ else if(key==='backspace'&&hcTool()==='wand'){e.preventDefault();hcWandUndoPoint()}
+ else if((e.ctrlKey||e.metaKey)&&key==='z'){e.preventDefault();e.shiftKey?hcEditRedo():hcEditUndo()}
  else if(e.ctrlKey&&key==='y'){e.preventDefault();hcEditRedo()}
  else if(!e.ctrlKey&&!e.metaKey&&!e.altKey&&(key==='b'||key==='e'||key==='w')){e.preventDefault();hcSetTool({b:'add',e:'erase',w:'wand'}[key])}
- else if(key==='enter'&&hcWandReadyCams().length){e.preventDefault();hcWandApply()}
+ else if(!e.ctrlKey&&!e.metaKey&&!e.altKey&&(key==='['||key===']')&&hcTool()!=='wand'){e.preventDefault();hcRadiusStep(key==='['?-1:1)}
+ else if(!e.ctrlKey&&!e.metaKey&&!e.altKey&&key==='q'&&!e.repeat){e.preventDefault();const sel=$('hcEditObj');if(!hcEdit.saving&&!hcBusy&&!hcBatch.running){sel.value=sel.value==='1'?'0':'1';sel.onchange()}}
+ else if(key==='enter'&&(hcWandReadyCams().length||hcWandBusyCams().length)){e.preventDefault();if(!e.repeat)hcWandApply()}
  // 브러시·지우개 수정: Enter = 수정 저장(버튼에 포커스가 있어도 그 버튼을 누르지 않고 저장합니다)
  else if(key==='enter'&&!e.repeat&&hcEditDirty()){e.preventDefault();if(!hcEdit.saving)hcSaveEdits()}
  else if(key==='escape'){if(hcWandClear())e.preventDefault();else if(hcEdit.solo!==null){e.preventDefault();hcToggleSolo(hcEdit.solo)}}
@@ -434,7 +517,10 @@ async function hcBatchRun(){
  const headers={'Content-Type':'application/json','X-CSRF-Token':token},targets=[],failed=[];let saved=0,notFound=0,changed=0,clickOnly=0,otherTarget=0;
  try{
   // 1) 범위 안에서 마스크가 비어 있거나 없는 프레임 찾기
-  for(let f=from;f<=to&&!hcBatch.stop;f++){
+  hcWandMessage('일괄 적용 · 카메라 '+(cam+1)+' 빈 '+objName+' 마스크 찾는 중…');
+  const areas=await hcAreas(obj,from,to,[cam]);
+  if(areas)areas[cam].forEach((a,i)=>{if(a<minPx)targets.push(from+i)});
+  else for(let f=from;f<=to&&!hcBatch.stop;f++){
    hcWandMessage('일괄 적용 · 카메라 '+(cam+1)+' 빈 '+objName+' 마스크 찾는 중 '+(f-from+1)+'/'+(to-from+1));
    const d=await hcRequest(path+'/edit?'+new URLSearchParams({cam,obj,frame:f}));
    if(d.missing||await hcPngArea(d.mask_png)<minPx)targets.push(f);
@@ -479,13 +565,28 @@ function hcEmptyNavControls(){
  const off=hcEmptyNav.running||hcBatch.running||!hcMeta||hcStage!=='mask';
  $('hcEmptyPrev').disabled=off;$('hcEmptyNext').disabled=off;$('hcEmptyStop').hidden=!hcEmptyNav.running;
 }
+// 프레임 구간의 마스크 픽셀 수(-1 = 파일 없음)를 서버에서 한 번에 받습니다: {카메라: [픽셀 수, ...]}. 옛 워커면 null.
+async function hcAreas(obj,from,to,cams){
+ if(hcEdit.legacyAreas)return null;
+ try{return (await hcPost({op:'areas',obj,from,to,cams})).areas}
+ catch(err){if(!/Invalid mask coordinates/.test(err.message))throw err;hcEdit.legacyAreas=true;return null}
+}
+// 저장할 때마다 hcImageRev가 올라가므로 키에 넣어 저장 후에는 새로 조회합니다.
+function hcAreaKey(cam,obj,frame){return [hcPath,hcImageRev,obj,cam,frame].join('|')}
+// frame부터 step 방향으로 200프레임의 픽셀 수를 요청 한 번으로 받아 기억합니다.
+async function hcAreaPrefetch(obj,frame,step,n){
+ if(hcEmptyNav.cache.has(hcAreaKey(0,obj,frame)))return;
+ const a=step>0?frame:Math.max(0,frame-199),b=step>0?Math.min(n-1,frame+199):frame,keys=[0,1,2,3].map(cam=>i=>hcAreaKey(cam,obj,a+i));
+ const areas=await hcAreas(obj,a,b,[0,1,2,3]);if(!areas)return;
+ if(hcEmptyNav.cache.size>40000)hcEmptyNav.cache.clear();
+ for(let cam=0;cam<4;cam++)(areas[cam]||[]).forEach((v,i)=>hcEmptyNav.cache.set(keys[cam](i),v));
+}
 async function hcMaskArea(cam,obj,frame){
- // 저장할 때마다 hcImageRev가 올라가므로 키에 넣어 저장 후에는 새로 조회합니다.
- const key=[hcPath,hcImageRev,obj,cam,frame].join('|');
+ const key=hcAreaKey(cam,obj,frame);
  if(hcEmptyNav.cache.has(key))return hcEmptyNav.cache.get(key);
  const d=await hcRequest(hcPath+'/edit?'+new URLSearchParams({cam,obj,frame}));
  const area=d.missing?-1:await hcPngArea(d.mask_png);
- if(hcEmptyNav.cache.size>4000)hcEmptyNav.cache.clear();
+ if(hcEmptyNav.cache.size>40000)hcEmptyNav.cache.clear();
  hcEmptyNav.cache.set(key,area);return area;
 }
 async function hcGoEmpty(step){
@@ -498,7 +599,7 @@ async function hcGoEmpty(step){
   for(let f=start+step;f>=0&&f<n&&!hcEmptyNav.stop;f+=step){
    if(!hcMeta||hcMeta.episode!==episode)return;
    hcStatus(objName+' 빈 마스크 찾는 중… 프레임 '+(f+1)+' / '+n+(step>0?' (다음 방향)':' (이전 방향)'));
-   const empty=[];
+   const empty=[];await hcAreaPrefetch(obj,f,step,n);
    for(let cam=0;cam<4;cam++){const a=await hcMaskArea(cam,obj,f);if(a<minPx)empty.push({cam,a})}
    checked++;
    if(empty.length){found={frame:f,empty};break}

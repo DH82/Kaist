@@ -113,7 +113,7 @@ async function hcShowFrame(value,skipEditCheck=false,keepEditsUntilLoaded=false)
   img.onerror=()=>{if(epoch!==hcEpoch){resolve();return}hcStatus('카메라 '+(cam+1)+' 이미지를 불러오지 못했습니다. 새로 불러오기를 눌러주세요.',true);hcStop();resolve()};
   img.src=url;img.onclick=()=>window.open(url,'_blank','noopener');
  })));
- if(epoch!==hcEpoch)return;hcFrameLoading=false;if(keepEditsUntilLoaded)hcEditReset();
+ if(epoch!==hcEpoch)return;hcFrameLoading=false;if(keepEditsUntilLoaded)hcEditReset();if(typeof hcEditWarm==="function")hcEditWarm();
  ['hcFirst','hcMiddle','hcLast','hcSlider','hcMaskMode'].forEach(id=>$(id).disabled=false);
  $('hcPrevFrame').disabled=hcFrame===0;$('hcNextFrame').disabled=hcFrame===hcMeta.frames-1;hcEnable();
 }
