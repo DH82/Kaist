@@ -1430,9 +1430,12 @@ def raw_episodes(req:Request):
   if not owner and ep not in latest:progress=('배정됨 · 실행 전' if assigned.get(ep) else '제외됨 · '+excluded_by[ep] if ep in excluded_by else '미배정 · 대기')
   if not owner and ep not in latest and ep in contq:progress='연속 모드 · 실행 대기'
   elif not owner and ep not in latest and ep in dist:progress='연속 모드 분배 · 포인트 전'
+  gate=None  # 작업자가 지금 처리할 단계(화면에서 누르면 그 작업 화면으로 이동): mask·tracking 검수, sam 설정, batch 일괄 실행
   if ep in latest:
    _,dag,r,mode=latest[ep]
-   if (mode=='day' or r['dag_run_id'] in deferred) and r['state']=='success':progress=mano_progress(r,batch_states)[0]
+   if (mode=='day' or r['dag_run_id'] in deferred) and r['state']=='success':
+    progress,ready=mano_progress(r,batch_states)
+    if ready:gate='batch'
    elif r['state']=='success':progress='RAW 전처리 완료' if mode=='raw' else '전체 완료'
    else:
     tasks=local_api('GET',f"/api/v2/dags/{dag}/dagRuns/"+quote(r['dag_run_id'],safe='')+'/taskInstances')['task_instances']
@@ -1440,7 +1443,12 @@ def raw_episodes(req:Request):
     if active:
      label=labels.get(active['task_id'],active['task_id']);state=active['state']
      progress=label+(' · 실패' if state=='failed' else ' · 재시도 대기' if state=='up_for_retry' else ' · 승인 대기' if active['task_id'] in ('mask_approved','tracking_approved') else ' · 진행 중')
+     if state not in ('failed','up_for_retry'):
+      gate={'mask_approved':'mask','tracking_approved':'tracking'}.get(active['task_id'])
+      if active['task_id']=='sam_settings_ready' and not (r.get('conf') or {}).get('sam_settings_confirmed'):gate='sam'
     else:progress='실패' if r['state']=='failed' else '실행 대기'
+   # 검수·설정은 담당자 본인(또는 관리자)만 할 수 있으므로 그때만 바로가기를 줍니다. 검수 화면은 실행의 에피소드 이름으로 엽니다.
+   if gate and (user['role']=='admin' or owner==user['name']):row.update(gate=gate,gate_episode=(r.get('conf') or {}).get('episode_id') or ep)
   out.append(dict(row,progress=progress))
  for ep in others:
   pc=elsewhere[ep];ran=started_other.get(ep)==pc
@@ -2048,7 +2056,7 @@ def mano_status(req:Request,run_id:str=''):
  out={'batches':[{'run_id':b['dag_run_id'],'state':b['state'],'start':b.get('start_date') or b.get('queued_at'),'end':b.get('end_date'),'count':len(srcs)} for b,srcs in batches],'selected':None}
  pick=next(((b,srcs) for b,srcs in batches if b['dag_run_id']==run_id),batches[0] if batches else None)
  if not pick:return out
- b,sources=pick;lines=[];current=None;total=len(b['conf'].get('sources',[]));redo=bool(b['conf'].get('redo_3d'))
+ b,sources=pick;lines=[];done_lines=[];current=None;total=len(b['conf'].get('sources',[]));redo=bool(b['conf'].get('redo_3d'))
  removed={r for _,r in mano_removed(b['dag_run_id'])};queue=[]
  for n,src in enumerate(b['conf'].get('sources',[]),1):
   if src not in sources:continue
@@ -2057,6 +2065,7 @@ def mano_status(req:Request,run_id:str=''):
   try:states=mano_source_state(src,redo)
   except (httpx.HTTPError,OSError,ValueError):lines.append(f'[{n}/{total}] {src["conf"].get("episode_id")}  ? GPU PC 연결 확인 필요');continue
   active=b['state'] in ('queued','running')
+  if states['publish']['state']=='success':done_lines.append(len(lines))  # 화면의 '완료 항목 지우기'가 숨길 줄
   lines.append(mano_line(n,total,src['conf'].get('episode_id'),states,'대기' if active else f'대기 · 시작 안 함 (평일 오전 {MANO_CUTOFF_HOUR}시 이후 또는 중단) → 목록에서 다시 선택'))
   if active and states['publish']['state']!='success':queue.append({'n':n,'episode':src['conf'].get('episode_id'),'run_id':src['run_id'],
    'running':any(st['state'] in ('running','queued') for st in states.values())})
@@ -2073,7 +2082,7 @@ def mano_status(req:Request,run_id:str=''):
  head.append('에피소드마다 3D 복원 준비 → 3D 복원 → MANO 피팅 → 결과 검사 → 최종 저장 (이미 끝난 단계는 건너뜀)')
  if redo:head.append('업데이트 전 코드로 만든 3D 결과도 3D 복원부터 다시 함')
  head.append('')
- sel={'run_id':b['dag_run_id'],'state':b['state'],'summary':head+lines,'current':None,'queue':queue,
+ sel={'run_id':b['dag_run_id'],'state':b['state'],'summary':head+lines,'done_lines':[len(head)+i for i in done_lines],'current':None,'queue':queue,
       'can_stop':b['state'] in ('queued','running') and (access.user(req)['role']=='admin' or len(sources)==total)}
  if current:
   src,stage,n=current
