@@ -1399,6 +1399,10 @@ def raw_episodes(req:Request):
    ep=r.get('conf',{}).get('raw_episode_id') or r.get('conf',{}).get('episode_id');stamp=r.get('logical_date') or r.get('queued_at') or ''
    if ep in episodes and (ep not in latest or stamp>latest[ep][0]):latest[ep]=(stamp,dag,r,mode)
  mark('airflow');deferred=deferred_runs()
+ # 내 작업 현황에서 '목록에서 삭제'한 실행이 그 RAW의 마지막 실행이고 실패(강제 종료 포함)로 끝났으면, RAW 목록에서도 내립니다:
+ # 내 작업 고정 칸·큐 부하에서 빠지고 '제외·삭제한 항목 보기'에서만 보입니다. 다시 실행하거나 삭제를 되돌리면 원래대로 돌아옵니다.
+ with access.db() as c:hidden_jobs={r['key'] for r in c.execute("SELECT key FROM ui_hidden WHERE scope='jobs'")}
+ dropped={ep for ep,(_,dag,r,_m) in latest.items() if r['state']=='failed' and json.dumps([dag,r['dag_run_id']],separators=(',',':'),ensure_ascii=False) in hidden_jobs} if hidden_jobs else set()
  batch_states=batch_history() if any((v[3]=='day' or v[2]['dag_run_id'] in deferred) and v[2]['state']=='success' for v in latest.values()) else {}
  labels={'prepare_raw':'RAW 전처리','sam_settings_ready':'분할 설정 확인','sam3':'SAM3','mask_approved':'마스크 검수','preflight':'추적 사전 검사','track':'추적','tracking_approved':'추적 검수','prepare_reconstruction':'복원 준비','reconstruct':'3D 복원','hands':'MANO 피팅','validate':'결과 검사','publish':'최종 저장'}
  # 3D 복원까지 끝난 RAW(낮 실행 성공 → MANO 대기/완료, 또는 전체 파이프라인 성공)는 배정 부하에서 빠집니다.
@@ -1429,7 +1433,7 @@ def raw_episodes(req:Request):
  excluded=access.excluded_raw(user['name'],selected_worker(req))
  def hidden(ep):
   return user['role']!='admin' and ep in excluded_by and ep not in excluded and owners.get(ep)!=user['name'] and ep not in latest
- assigned,team=access.rebalance(selected_worker(req),episodes,done,set(latest),claim=fleet.raw_claim,release=fleet.raw_release,blocked=set(excluded_by),targets=queue_target_view);mark('assign')
+ assigned,team=access.rebalance(selected_worker(req),episodes,done|dropped,set(latest),claim=fleet.raw_claim,release=fleet.raw_release,blocked=set(excluded_by),targets=queue_target_view);mark('assign')
  episodes=[ep for ep in episodes if not hidden(ep)]
  others=[ep for ep in others if not hidden(ep)]
  out=[]
@@ -1439,6 +1443,7 @@ def raw_episodes(req:Request):
   # 다른 작업자의 담당·진행 단계도 모두 보여 줍니다(실행·수정은 본인 것만).
   row.update(operator=owner,assigned_to=None if owner else assigned.get(ep),done=ep in done)
   row['excluded_from_mine']=user['role']!='admin' and ep in excluded
+  if ep in dropped:row['run_hidden']=True
   row['can_exclude']=user['role']=='operator' and ep not in excluded and ((owner==user['name'] and ep not in done) or (not owner and assigned.get(ep)==user['name']))
   if user['role']!='admin':row['can_run']=ep not in excluded and (owner==user['name'] or (not owner and (assigned.get(ep)==user['name'] or ep in dist)))
   progress='실행 전' if not owner else '실행 기록 확인 필요'
