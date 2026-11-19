@@ -1047,21 +1047,15 @@ def shape_input_identity():
     files += sorted((Path(hamba_base_path)/case_name).glob('*/results.pt'))
     files += [Path.cwd()/'data_process/models/mano_wrapper.py']
     files += sorted((Path.cwd()/'data_process/Hamba/_DATA/data/mano').glob('*.pkl'))
+    if shape_rescue_path().exists(): files.append(shape_rescue_path())
     return dict(algorithm=ALGORITHM_VERSION,seed=args.seed,num_cams=NUM_CAMS,num_hands=num_hands,
         weights=dict(w_mask=w_mask,w_mask_cover=w_mask_cover,wrist_weight=args.wrist_weight,hamba_weight=hamba_weight,cover_max_px=cover_max_px),
         hashes={str(p):file_digest(p) for p in files})
 
 
-def representative_shape_frames(frame_num,hand_data,mp_out,is_right,ref):
-    """Select by measured mask/reprojection agreement and articulation diversity.
-    MediaPipe handedness confidence is used only as an availability gate.
-    """
+def shape_candidates(frame_num,hand_data,mp_out,is_right,ref):
+    """Frames whose 2D hand detections agree with the hand mask and triangulate consistently."""
     hidx=1 if is_right else 0;side='Left' if is_right else 'Right'
-    if args.shape_frames:
-        frames=sorted(set(int(x) for x in args.shape_frames.split(',') if x.strip()))
-        if not frames or any(f<0 or f>=frame_num or hand_data[ref].get(f'{f}_{hidx}') is None for f in frames):
-            raise ValueError('Invalid explicit calibration frames')
-        return frames
     ids=HAND_MASK_IDS if num_hands==1 else _two_hand_mask_ids(is_right,mp_out)
     # Extrinsics are supplied by process_hands through the selection context.
     projections=[np.asarray(REAL_KS[c])@np.linalg.inv(SHAPE_SELECTION_C2WS[c])[:3] for c in range(NUM_CAMS)]
@@ -1099,6 +1093,20 @@ def representative_shape_frames(frame_num,hand_data,mp_out,is_right,ref):
             bones/=np.maximum(np.linalg.norm(bones,axis=1,keepdims=True),1e-8)
             descriptor.extend(np.sum(bones[:-1]*bones[1:],axis=1))
         candidates.append(dict(frame=f,error=error,views=len(views),mask_agreement=float(np.mean(inliers)),descriptor=np.asarray(descriptor)))
+    return candidates
+
+
+def representative_shape_frames(frame_num,hand_data,mp_out,is_right,ref):
+    """Select by measured mask/reprojection agreement and articulation diversity.
+    MediaPipe handedness confidence is used only as an availability gate.
+    """
+    hidx=1 if is_right else 0;side='Left' if is_right else 'Right'
+    if args.shape_frames:
+        frames=sorted(set(int(x) for x in args.shape_frames.split(',') if x.strip()))
+        if not frames or any(f<0 or f>=frame_num or hand_data[ref].get(f'{f}_{hidx}') is None for f in frames):
+            raise ValueError('Invalid explicit calibration frames')
+        return frames
+    candidates=shape_candidates(frame_num,hand_data,mp_out,is_right,ref)
     if len(candidates)<3:raise RuntimeError('Too few geometrically consistent calibration frames')
     # Retain the better geometric observations, then farthest-point sample pose descriptors.
     candidates.sort(key=lambda x:x['error']+2*(NUM_CAMS-x['views'])+5*(1-x['mask_agreement']))
@@ -1108,6 +1116,112 @@ def representative_shape_frames(frame_num,hand_data,mp_out,is_right,ref):
         chosen.append(pool.pop(best))
     print('Geometry/diversity calibration selection:',[{k:v for k,v in x.items() if k!='descriptor'} for x in chosen],flush=True)
     return sorted(x['frame'] for x in chosen)
+
+
+SHAPE_RESCUE_VERSION='single-hand-shape-rescue-v1'
+SHAPE_RESCUE_CROP=3.0  # crop side = this x the larger side of the hand-mask box
+
+def shape_rescue_path():
+    return Path(f'{phystwin_base_path}/{case_name}/{log}/shape_rescue.pkl')
+
+
+def mask_crop_mediapipe(frame_num,mp_out):
+    """Second MediaPipe pass for frames without an accepted detection (single hand).
+    The full-frame palm detector misses small or partly hidden hands; the same detector is
+    run on a square crop around the approved hand mask. A detection is kept only with the
+    same side/score rule as the first pass and when its joints lie on the hand mask.
+    Returns {camera: {frame: (21x2 pixel joints, score)}}.
+    """
+    import mediapipe as mp
+    found={}
+    for cidx in range(NUM_CAMS):
+        found[cidx]={}
+        missing=[f for f in range(frame_num) if float(np.asarray(mp_out[cidx]['conf']['Left'][f]).mean())<.5]
+        if not missing:continue
+        detector=mp.solutions.hands.Hands(static_image_mode=False,max_num_hands=1,min_detection_confidence=0.5,min_tracking_confidence=0.5)
+        for f in missing:
+            mask=cv2.imread(f'{phystwin_base_path}/{case_name}/mask/{cidx}/{HAND_MASK_IDS[cidx]}/{f}.png',0)
+            image=cv2.imread(os.path.join(phystwin_base_path,case_name,'color',f'{cidx}',f'{f}.png'))
+            if image is None or mask is None or (mask>127).sum()<50:continue
+            ys,xs=np.nonzero(mask>127)
+            half=max(xs.max()-xs.min(),ys.max()-ys.min())*SHAPE_RESCUE_CROP/2
+            cx_,cy_=(xs.min()+xs.max())/2,(ys.min()+ys.max())/2
+            x0,y0=int(max(0,cx_-half)),int(max(0,cy_-half))
+            x1,y1=int(min(image.shape[1],cx_+half)),int(min(image.shape[0],cy_+half))
+            if x1-x0<16 or y1-y0<16:continue
+            crop=np.ascontiguousarray(image[y0:y1,x0:x1])
+            results=detector.process(cv2.cvtColor(crop,cv2.COLOR_BGR2RGB))
+            if not results.multi_hand_landmarks or not results.multi_handedness:continue
+            label=results.multi_handedness[0].classification[0]
+            if label.label!='Left' or label.score<0.9:continue
+            xy=np.asarray([[lm.x*crop.shape[1]+x0,lm.y*crop.shape[0]+y0] for lm in results.multi_hand_landmarks[0].landmark],dtype=float)
+            padded=cv2.dilate((mask>127).astype(np.uint8),np.ones((11,11),np.uint8))
+            ij=np.rint(xy).astype(int);inside=(ij[:,0]>=0)&(ij[:,0]<mask.shape[1])&(ij[:,1]>=0)&(ij[:,1]<mask.shape[0])
+            ok=np.zeros(21,dtype=bool);ok[inside]=padded[ij[inside,1],ij[inside,0]]>0
+            if ok.mean()>=.8:found[cidx][f]=(xy,float(label.score))
+        detector.close()
+    return found
+
+
+def apply_shape_rescue(record,mp_out,ref_cidx):
+    for cidx,frames in record['observations'].items():
+        for f,(xy,score) in frames.items():
+            mp_out[cidx]['kpts']['Left'][f]=xy
+            mp_out[cidx]['conf']['Left'][f]=score
+    for hidx,ref in record['ref_cidx'].items():ref_cidx[hidx]=ref
+
+
+def load_shape_rescue(mp_out,ref_cidx):
+    """Re-apply a stored rescue on resume so every frame is fit from the same observations."""
+    path=shape_rescue_path()
+    if not path.exists():return
+    if not Path(f'{phystwin_base_path}/{case_name}/{log}/shared_shape.pkl').exists():
+        path.unlink();return  # interrupted before calibration finished: decide again
+    with path.open('rb') as f:record=pickle.load(f)
+    observations=Path(args.observations_cache or f'{phystwin_base_path}/{case_name}/{log}/observations.pkl')
+    if record.get('version')!=SHAPE_RESCUE_VERSION or record.get('observations_digest')!=file_digest(observations):
+        raise RuntimeError('Shape rescue record does not match the frozen observations; use a new attempt')
+    apply_shape_rescue(record,mp_out,ref_cidx)
+    print('Shape rescue re-applied:',record['summary'],flush=True)
+
+
+def rescue_shape_frames(frame_num,hand_data,mp_out,is_right,ref_cidx):
+    """Runs only when the standard selection found fewer than three calibration frames
+    (the run would otherwise stop). Single hand only.
+    1) Another reference camera: the default is the first camera with a HaMBA result at
+       frame 0, which fails when that camera has the hand in almost no other frame.
+    2) Mask-crop MediaPipe for frames the full-frame detector missed, then 1) again.
+    The decision is stored next to the calibration and re-applied on resume.
+    """
+    hidx=1 if is_right else 0;default=ref_cidx[hidx]
+    def best_reference():
+        counts={}
+        for c in range(NUM_CAMS):
+            if hand_data[c] is None or hand_data[c].get(f'0_{hidx}') is None:continue
+            counts[c]=len(shape_candidates(frame_num,hand_data,mp_out,is_right,c))
+        if counts.get(default,0)>=3:return default,counts
+        best=max(counts,key=lambda c:(counts[c],-c))
+        return (best if counts[best]>=3 else None),counts
+    record=dict(version=SHAPE_RESCUE_VERSION,crop=SHAPE_RESCUE_CROP,observations={},ref_cidx={})
+    ref,counts=best_reference();added={}
+    if ref is None:
+        state=rng_state()
+        record['observations']=mask_crop_mediapipe(frame_num,mp_out)
+        restore_rng(state)
+        apply_shape_rescue(record,mp_out,ref_cidx)
+        added={c:len(v) for c,v in record['observations'].items()}
+        ref,counts=best_reference()
+    record['summary']=dict(default_reference=default,reference=ref,candidates_per_reference=counts,rescued_detections=added)
+    print('Shape rescue:',record['summary'],flush=True)
+    if ref is None:raise RuntimeError('Too few geometrically consistent calibration frames')
+    if ref!=default:record['ref_cidx'][hidx]=ref;ref_cidx[hidx]=ref
+    observations=Path(args.observations_cache or f'{phystwin_base_path}/{case_name}/{log}/observations.pkl')
+    record['observations_digest']=file_digest(observations)
+    path=shape_rescue_path();path.parent.mkdir(parents=True,exist_ok=True)
+    tmp=path.with_suffix('.tmp')
+    with tmp.open('wb') as f:pickle.dump(record,f)
+    os.replace(tmp,path)
+    return representative_shape_frames(frame_num,hand_data,mp_out,is_right,ref)
 
 
 def calibrate_shared_beta(frames,hand_data,mp_out,c2ws,is_right,ref):
@@ -1212,7 +1326,12 @@ def prepare_shared_shape(frame_num,hand_data,mp_out,c2ws,ref_cidx):
         stored=dict(identity=identity,settings=settings,betas={},diagnostics={})
         for hidx in ([1] if num_hands==1 else [0,1]):
             is_right=hidx==1;side='right' if is_right else 'left'
-            frames=representative_shape_frames(frame_num,hand_data,mp_out,is_right,ref_cidx[hidx])
+            try:
+                frames=representative_shape_frames(frame_num,hand_data,mp_out,is_right,ref_cidx[hidx])
+            except RuntimeError as error:
+                if num_hands!=1 or args.shape_frames or 'Too few' not in str(error):raise
+                frames=rescue_shape_frames(frame_num,hand_data,mp_out,is_right,ref_cidx)
+                stored['identity']=shape_input_identity()
             beta,diagnostic=calibrate_shared_beta(frames,hand_data,mp_out,c2ws,is_right,ref_cidx[hidx])
             stored['betas'][side]=beta;stored['diagnostics'][side]=diagnostic
         path.parent.mkdir(parents=True,exist_ok=True)
@@ -1683,7 +1802,11 @@ def process_hands(case_name):
     timer.start("process_hands-compute_mediapipe_2d_gt")
 
     mp_out = frozen_observations(frame_num)
+    if num_hands == 1: load_shape_rescue(mp_out, ref_cidx)
     shared_shape_path = prepare_shared_shape(frame_num,hand_data,mp_out,c2ws,ref_cidx)
+    if shape_rescue_path().exists():
+        with open(out_path_cidx, 'wb') as f:
+            pickle.dump(ref_cidx, f)
     if args.shape_only:
         print('Shared-shape setup complete; temporal tracking skipped',flush=True)
         return
@@ -1713,6 +1836,7 @@ def process_hands(case_name):
     if args.init_from_log: input_files.append(case_path/args.init_from_log/'hand_reg_params.pkl')
     input_files.append(Path(args.observations_cache or case_path/log/'observations.pkl'))
     if shared_shape_path is not None:input_files.append(shared_shape_path)
+    if shape_rescue_path().exists():input_files.append(shape_rescue_path())
     checkpoint_config['hashes']={str(x):file_digest(x) for x in input_files}
     if os.path.isfile(checkpoint_path) and not args.resume: raise RuntimeError('Existing checkpoint: use --resume or a new log directory')
     loop_start = start_frame
