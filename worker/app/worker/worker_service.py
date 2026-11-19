@@ -337,20 +337,85 @@ def wand_status(dag_id:str):
 review_app=app
 app=FastAPI(dependencies=[Depends(get_user)],docs_url=None,redoc_url=None)
 
-def intake_fingerprints(raw_root):
-    """Match the canonical upload manifest used by the central intake catalogue."""
+def intake_fingerprint(folder):
+    """Match the canonical upload manifest used by the central intake catalogue (one RAW folder)."""
     import hashlib
-    result = {}
-    for folder in Path(raw_root).glob('ep_*'):
-        if not folder.is_dir() or folder.is_symlink():continue
-        manifest = folder/'upload_manifest.json'
-        if not manifest.is_file() or not (folder/'upload_complete.json').is_file():continue
-        try:
-            value = json.loads(manifest.read_text())
-            if value.get('episode') != folder.name:continue
-            result[folder.name] = hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
-        except (OSError, ValueError, AttributeError):continue
-    return result
+    manifest = folder/'upload_manifest.json'
+    if not manifest.is_file() or not (folder/'upload_complete.json').is_file():return None
+    try:
+        value = json.loads(manifest.read_text())
+        if value.get('episode') != folder.name:return None
+        return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+    except (OSError, ValueError, AttributeError):return None
+
+# ---- RAW 목록 캐시 ----
+# /worker/info는 화면이 몇 초마다 부르는데, 예전에는 부를 때마다 NAS의 RAW 폴더 전체(수백 개)를 돌며
+# 폴더마다 매니페스트를 다시 읽었습니다. NAS가 느린 날에는 한 번에 몇 분이 걸려 RAW 큐가 뜨지 않았습니다.
+# 이제 요청은 기억해 둔 목록을 바로 돌려주고, 목록이 오래됐으면 뒤에서 한 번만(동시에 하나만) 다시 읽습니다.
+#  - 폴더 이름: 디렉터리 한 번 읽기로 끝냅니다(폴더마다 따로 묻지 않음).
+#  - 매니페스트 지문: 한 번 확인한 폴더는 INFO_RECHECK초 동안 다시 읽지 않습니다.
+#    실행 직전 확인은 /worker/info?episode=<RAW>가 그 폴더 하나만 NAS에서 새로 읽습니다.
+INFO_FRESH=float(os.environ.get('KAIST_INFO_FRESH_S','20'))
+INFO_RECHECK=float(os.environ.get('KAIST_INFO_RECHECK_S','300'))
+_INFO={'root':None,'episodes':None,'at':0.0,'prints':{},'checked':{},'busy':False,'error':''}
+_INFO_DONE=__import__('threading').Condition()
+_GPU_LABEL=[]
+
+def _info_scan(raw_root):
+    import time
+    names=[];folders=[]
+    with os.scandir(raw_root) as entries:
+        for e in entries:
+            if not e.name.startswith('ep_'):continue
+            try:
+                if not e.is_dir():continue
+                real=e.is_dir(follow_symlinks=False)
+            except OSError:continue
+            if re.fullmatch(r'ep_[A-Za-z0-9_]+',e.name):names.append(e.name)
+            if real:folders.append(e.name)
+    with _INFO_DONE:  # 목록부터 내놓고, 지문은 이어서 채웁니다.
+        if _INFO['root']!=raw_root:return
+        _INFO.update(episodes=sorted(names),at=time.time(),error='');_INFO_DONE.notify_all()
+    for name in folders:
+        with _INFO_DONE:
+            if _INFO['root']!=raw_root:return
+            if time.time()-_INFO['checked'].get(name,0)<INFO_RECHECK:continue
+        value=intake_fingerprint(Path(raw_root)/name)
+        with _INFO_DONE:
+            if _INFO['root']!=raw_root:return
+            _INFO['checked'][name]=time.time()
+            if value:_INFO['prints'][name]=value
+            else:_INFO['prints'].pop(name,None)
+    keep=set(folders)
+    with _INFO_DONE:
+        if _INFO['root']!=raw_root:return
+        for key in ('prints','checked'):
+            for name in [n for n in _INFO[key] if n not in keep]:del _INFO[key][name]
+
+def _info_refresh(raw_root):
+    error=''
+    try:_info_scan(raw_root)
+    except Exception as e:error=f'{type(e).__name__}: {e}'
+    finally:
+        with _INFO_DONE:
+            if _INFO['root']==raw_root:_INFO.update(busy=False,error=error)
+            _INFO_DONE.notify_all()
+
+def raw_info(raw_root):
+    """(RAW 폴더 이름, 매니페스트 지문). 기억해 둔 값을 바로 돌려주고 오래됐으면 뒤에서 새로 읽습니다."""
+    import threading,time
+    with _INFO_DONE:
+        if _INFO['root']!=raw_root:_INFO.update(root=raw_root,episodes=None,at=0.0,prints={},checked={},busy=False,error='')
+        if time.time()-_INFO['at']>=INFO_FRESH and not _INFO['busy']:
+            _INFO['busy']=True
+            threading.Thread(target=_info_refresh,args=(raw_root,),daemon=True).start()
+        while _INFO['episodes'] is None and _INFO['busy'] and _INFO['root']==raw_root:_INFO_DONE.wait(1)  # 시작 직후 첫 목록만 기다림
+        if _INFO['root']!=raw_root or _INFO['episodes'] is None:
+            raise HTTPException(503,'RAW 폴더를 읽지 못했습니다: '+(_INFO['error'] or raw_root))
+        return list(_INFO['episodes']),dict(_INFO['prints'])
+
+def intake_fingerprints(raw_root):
+    return raw_info(raw_root)[1]
 
 @app.get('/worker/intake/fingerprint')
 def manual_fingerprint(episode:str):
@@ -367,12 +432,18 @@ def manual_fingerprint(episode:str):
     return {'fingerprint':hashlib.sha256(json.dumps(manifest,sort_keys=True).encode()).hexdigest()}
 
 @app.get('/worker/info')
-def worker_info():
+def worker_info(episode:str=''):
     cfg=json.loads((ROOT/'config/gpu_4090_a.json').read_text())
-    gpu=subprocess.check_output(['nvidia-smi','--query-gpu=name,uuid','--format=csv,noheader'],text=True).strip()
-    return {'episodes':[p.name for p in sorted(Path(cfg['raw_root']).iterdir()) if p.is_dir() and re.fullmatch(r'ep_[A-Za-z0-9_]+',p.name)],
-            'intake_manifests':intake_fingerprints(cfg['raw_root']),
-            'gpu':gpu,'server':cfg.get('server_label',__import__('socket').gethostname()),'raw_root':cfg['raw_root'],'project_dir':cfg['project_dir'],
+    if not _GPU_LABEL:  # GPU 이름·UUID는 바뀌지 않으므로 한 번만 묻습니다.
+        _GPU_LABEL.append(subprocess.check_output(['nvidia-smi','--query-gpu=name,uuid','--format=csv,noheader'],text=True,timeout=30).strip())
+    episodes,prints=raw_info(cfg['raw_root'])
+    if re.fullmatch(r'ep_[A-Za-z0-9_]+',episode):  # 실행 직전 확인: 이 RAW의 지문만 NAS에서 새로 읽습니다.
+        value=intake_fingerprint(Path(cfg['raw_root'])/episode)
+        if value:prints[episode]=value
+        else:prints.pop(episode,None)
+    return {'episodes':episodes,
+            'intake_manifests':prints,
+            'gpu':_GPU_LABEL[0],'server':cfg.get('server_label',__import__('socket').gethostname()),'raw_root':cfg['raw_root'],'project_dir':cfg['project_dir'],
             'nas_ready':Path(cfg['nas_mount']).is_mount(),'worker_kind':'ssh','server_airflow_required':False}
 
 def gpu_status():

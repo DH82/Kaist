@@ -318,7 +318,10 @@ def sync_run(episode):
   except BlockingIOError:
    print('다른 에피소드 업로드가 끝나기를 기다립니다.',flush=True);fcntl.flock(queue,fcntl.LOCK_EX)
    print('업로드 차례:',episode,time.strftime('%Y-%m-%d %H:%M:%S'),flush=True)
-  rec=sync_work.sync_episode(cfg,episode,lambda m:print(m,flush=True))
+  # 낮 시간대 업로드 속도 제한(이 PC에 config/nas_upload_limit.json이 있을 때만). 형식은 sync_work.upload_limit 참고.
+  try:limit=json.loads((CONFIG.parent/'nas_upload_limit.json').read_text())
+  except (OSError,ValueError):limit=None
+  rec=sync_work.sync_episode(cfg,episode,lambda m:print(m,flush=True),**({'limit':limit} if isinstance(limit,dict) else {}))
   # 최종 저장까지 끝난 에피소드면 업로드 후 로컬 사본을 지웁니다(진행 중인 단계 작업이 있으면 유지).
   deleted=[]
   if any(s.get('state') in ('queued','running') and s.get('episode')==episode for s in _active_jobs()):

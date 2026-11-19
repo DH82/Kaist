@@ -47,6 +47,95 @@ def selected_worker(req):
  except ValueError as e:raise HTTPException(400,str(e))
  return wid
 
+# ---- 느린 조회 기억(워커 RAW 목록, NAS 관제 기록) ----
+# RAW 목록 화면은 15초마다 워커의 RAW 폴더 목록과 NAS의 선점·제외·분배 기록(파일 수백 개)을 읽습니다.
+# NAS가 느리면 한 번에 몇 분이 걸려, 부를 때마다 새로 읽으면 RAW 큐가 비거나 '단계 확인 중'에서 멈췄습니다.
+# 마지막으로 읽은 값을 바로 쓰고, 오래됐으면 뒤에서 한 번만(항목별로 동시에 하나만) 다시 읽습니다.
+# 읽은 적이 없을 때만 first초까지 기다립니다. 화면 표시에만 쓰고, 실행·선점처럼 겹치면 안 되는 판단은 NAS를 직접 읽습니다.
+INFO_FRESH=10      # 이보다 새 값은 그대로 씀(초)
+INFO_WAIT=1        # 오래된 값이 있을 때 새 값을 기다려 보는 시간(초)
+INFO_TIMEOUT=900   # 뒤에서 워커 목록을 다시 받을 때 응답을 기다리는 시간(초)
+NAS_FRESH=20       # NAS 관제 기록(선점·제외·분배·큐 크기)을 그대로 쓰는 시간(초)
+NAS_WAIT=0.3       # 오래된 NAS 기록이 있을 때 새 값을 기다려 보는 시간(초): 읽는 데 수십 초 걸릴 수 있어 거의 기다리지 않음
+SLOW_REQUEST_S=5   # 이보다 오래 걸린 요청은 로그에 남김(초)
+NAS_FIRST=150      # NAS 관제 기록을 읽은 적이 없을 때 기다리는 시간(초)
+_info_cache={};_info_cond=threading.Condition()
+# 기억해 둔 값은 파일에도 남겨, UI를 재시작한 직후에도 마지막 값으로 바로 화면을 띄웁니다
+# (예전에는 재시작할 때마다 NAS를 처음부터 다시 읽느라 몇 분 동안 RAW 목록이 비었음). 오래된 파일(VIEW_KEEP초)은 쓰지 않습니다.
+VIEW_FILE=Path(os.environ['KAIST_INTAKE_DB']).parent/'view_cache.json' if os.environ.get('KAIST_INTAKE_DB') else None
+VIEW_KEEP=6*3600
+VIEW_SAVE_EVERY=5
+_view_save_lock=threading.Lock();_view_saved=[0.0]
+
+def views_save(force=False):
+ if VIEW_FILE is None or not _view_save_lock.acquire(blocking=force):return
+ try:
+  if not force and time.time()-_view_saved[0]<VIEW_SAVE_EVERY:return
+  with _info_cond:snap={k:{'data':v['data'],'at':v['at']} for k,v in _info_cache.items() if v['have']}
+  tmp=VIEW_FILE.with_name(VIEW_FILE.name+f'.{os.getpid()}.tmp')
+  tmp.write_text(json.dumps(snap,ensure_ascii=False));os.replace(tmp,VIEW_FILE);_view_saved[0]=time.time()
+ except (OSError,TypeError,ValueError):pass
+ finally:_view_save_lock.release()
+
+def views_load():
+ """재시작 직후: 파일에 남긴 값을 '오래된 값'으로 올려 둡니다(바로 쓰되 곧 뒤에서 새로 읽음)."""
+ if VIEW_FILE is None:return 0
+ try:snap=json.loads(VIEW_FILE.read_text())
+ except (OSError,ValueError):return 0
+ n=0
+ with _info_cond:
+  for key,v in snap.items() if isinstance(snap,dict) else []:
+   if not isinstance(v,dict) or time.time()-float(v.get('at') or 0)>VIEW_KEEP or key in _info_cache:continue
+   _info_cache[key]={'data':v.get('data'),'have':True,'at':0.0,'busy':False,'error':None,'gen':0};n+=1
+ return n
+
+def _remember_fetch(key,fetch):
+ while True:
+  with _info_cond:gen=_info_cache[key]['gen']
+  data=error=None
+  try:data=fetch()
+  except Exception as e:error=f'{type(e).__name__}: {e}'[:200]
+  with _info_cond:
+   slot=_info_cache[key]
+   if slot['gen']!=gen:continue  # 읽는 사이 이 PC가 값을 바꿨음(forget): 바뀐 뒤 값으로 다시 읽음
+   slot['busy']=False;slot['error']=error
+   if error is None:slot.update(data=data,at=time.time(),have=True)
+   _info_cond.notify_all()
+  if error is None:views_save()
+  return
+
+def remembered(key,fetch,fresh=None,wait=None,first=150):
+ """기억해 둔 값(없으면 None). fetch는 예외로 실패를 알립니다."""
+ with _info_cond:
+  slot=_info_cache.setdefault(key,{'data':None,'have':False,'at':0.0,'busy':False,'error':None,'gen':0})
+  if time.time()-slot['at']>=(INFO_FRESH if fresh is None else fresh):
+   if not slot['busy']:
+    slot['busy']=True;threading.Thread(target=_remember_fetch,args=(key,fetch),daemon=True).start()
+   seen=slot['at'];until=time.time()+((INFO_WAIT if wait is None else wait) if slot['have'] else first)
+   while slot['busy'] and slot['at']==seen and time.time()<until:_info_cond.wait(max(0.05,min(1,until-time.time())))
+  return (slot['data'] if slot['have'] else None),slot['have'],slot['error']
+
+def forget(*keys):
+ """이 PC가 방금 바꾼 NAS 기록: 다음 조회는 새로 읽은 값을 기다립니다."""
+ with _info_cond:
+  for key in keys:
+   slot=_info_cache.get(key)
+   if slot:slot.update(have=False,data=None,at=0.0,gen=slot['gen']+1)
+
+views_load()
+
+def raw_worker_info(wid=DEFAULT_WORKER,first=150):
+ data,have,error=remembered(wid,lambda:call('GET','/worker/info',worker_id=wid,timeout=INFO_TIMEOUT),first=first)
+ if not have:
+  raise HTTPException(503,'GPU PC가 NAS의 RAW 목록을 아직 읽고 있습니다. NAS 응답이 느립니다. 잠시 뒤 다시 열어 주세요.'+(' ('+error+')' if error else ''))
+ return dict(data)
+
+def nas_view(name,fetch):
+ """NAS 관제 기록을 화면 표시용으로 읽습니다(기억해 둔 값 우선). 아직 읽지 못했으면 예외."""
+ data,have,error=remembered('nas:'+name,fetch,fresh=NAS_FRESH,wait=NAS_WAIT,first=NAS_FIRST)
+ if not have:raise OSError('NAS 관제 기록을 아직 읽지 못했습니다: '+(error or name))
+ return dict(data) if isinstance(data,dict) else data
+
 def active_dags():
  return [(wid,mode,dag) for wid,mode,dag in dag_entries() if worker(wid,False)['enabled']]
 
@@ -221,7 +310,12 @@ async def errors(req,call_next):
    try:access.user(req);valid=True
    except HTTPException:pass
   if not valid:return Response('로그인이 필요합니다.',status_code=401,headers={'WWW-Authenticate':'Basic realm="KAIST"'},media_type='text/plain')
- try:return await call_next(req)
+ began=time.time()
+ try:
+  response=await call_next(req)
+  # 느린 요청은 기록해 둡니다(NAS가 느릴 때 어느 화면이 밀리는지 로그로 확인).
+  if time.time()-began>=SLOW_REQUEST_S:print(f'slow request {time.time()-began:.1f}s {req.method} {req.url.path}',flush=True)
+  return response
  except Exception as e:
   print(type(e).__name__,str(e)[:500],flush=True)
   return Response(json.dumps({'detail':'서버 연결 또는 처리에 실패했습니다. 연결 상태와 작업 로그를 확인하세요.'},ensure_ascii=False),status_code=502,media_type='application/json')
@@ -312,13 +406,13 @@ def operators(req:Request):
  guard(req);access.admin(req)
  with access.db() as c:names=[r[0] for r in c.execute("SELECT DISTINCT name FROM ui_sessions WHERE role='operator' ORDER BY name")]
  own=access.owners()
- return {'names':names,'episodes':[{'episode':ep,'operator':own.get(ep)} for ep in call('GET','/worker/info')['episodes']]}
+ return {'names':names,'episodes':[{'episode':ep,'operator':own.get(ep)} for ep in raw_worker_info()['episodes']]}
 
 @app.post('/api/operators/assign')
 def operator_assign(data:dict,req:Request):
  guard(req);access.admin(req)
  ep=data.get('episode');name=str(data.get('operator','')).strip()
- if ep not in call('GET','/worker/info')['episodes'] or not name or len(name)>80:raise HTTPException(400,'에피소드와 이름을 확인하세요.')
+ if ep not in raw_worker_info()['episodes'] or not name or len(name)>80:raise HTTPException(400,'에피소드와 이름을 확인하세요.')
  if any(r['episode']==ep for r in intake.rows()):
   try:intake.assign(ep,name,'gpu_4090_a')
   except ValueError as e:raise HTTPException(409,str(e))
@@ -348,13 +442,13 @@ def raw_row(ep,owner,user):
 def info(req:Request):
  guard(req)
  wid=selected_worker(req)
- d=call('GET','/worker/info',worker_id=wid)
+ d=raw_worker_info(wid)
  d['central_ready']=local_api('GET','/api/v2/monitor/health')['scheduler']['status']=='healthy'
  d['server_ready']=True
  d['airflow_public_url']=AIRFLOW_PUBLIC
  d['gpu_test_enabled']='test' in DIRECT_DAGS and access.user(req)['role']=='admin'
  owners=access.owners();user=access.user(req)
- try:elsewhere=fleet.raw_taken_elsewhere() if fleet.available() else {}
+ try:elsewhere=nas_view('taken',fleet.raw_taken_elsewhere) if fleet.available() else {}
  except Exception:elsewhere={}
  d['episodes']=[ep for ep in d['episodes'] if raw_in_queue(ep,owners) and (ep not in elsewhere or owners.get(ep))]
  d['raw_episodes']=[raw_row(ep,owners.get(ep),user) for ep in d['episodes']]
@@ -591,7 +685,7 @@ def _launch(data,req,bypass_limit=False):
    bboxes=object_bboxes(data.sam_object_bboxes) if data.mode=='pipeline' and data.sam_object_mode=='bbox_track' else None
    points=object_points(data.sam_object_points) if data.mode=='pipeline' and data.sam_object_mode=='point_track' else None
    # Validate against live server episode list; no arbitrary path input.
-   captures=call('GET','/worker/info',worker_id=data.worker_id)['episodes']
+   captures=raw_worker_info(data.worker_id)['episodes']
    used_names.update(ep for ep in captures if ep!=data.episode_id)
    if data.episode_id not in captures:raise HTTPException(400,'서버 RAW 목록에 없는 에피소드입니다.')
    catalog=call('GET','/worker/outputs/catalog',params={'root':'project'},worker_id=data.worker_id)
@@ -599,7 +693,7 @@ def _launch(data,req,bypass_limit=False):
    try:assignment=intake.for_launch(data.episode_id,operator=access.user(req)['name'])
    except ValueError as e:raise HTTPException(409,str(e))
    if assignment:
-    worker_info=call('GET','/worker/info',worker_id=data.worker_id)
+    worker_info=call('GET','/worker/info',params={'episode':data.episode_id},worker_id=data.worker_id)
     expected=hashlib.sha256(assignment['metadata'].encode()).hexdigest()
     actual=worker_info.get('intake_manifests',{}).get(data.episode_id)
     if json.loads(assignment['metadata']).get('source')=='manual_nas_copy':
@@ -965,7 +1059,7 @@ def stage_log(wid,stage,run_id,conf):
  subs=re.findall(r'로그: (\S+\.log)',_ANSI.sub('',text))
  if subs:
   try:
-   project=call('GET','/worker/info',worker_id=wid,timeout=15)['project_dir'].rstrip('/')+'/'
+   project=raw_worker_info(wid,first=15)['project_dir'].rstrip('/')+'/'
    path=subs[-1]
    if path.startswith(project):
     rel=path[len(project):]
@@ -1093,7 +1187,7 @@ async def output_proxy(action:str,req:Request):
 def operator_output(action,req):
  wid=selected_worker(req);remote=worker(wid)['url']
  if action in ('preview','preview-info'):
-  if req.query_params.get('episode','') not in call('GET','/worker/info',worker_id=wid)['episodes']:raise HTTPException(404,'RAW 목록에 없는 에피소드입니다.')
+  if req.query_params.get('episode','') not in raw_worker_info(wid)['episodes']:raise HTTPException(404,'RAW 목록에 없는 에피소드입니다.')
  else:
   if req.query_params.get('root','project')!='project':raise HTTPException(403,'배정된 파이프라인 결과만 조회할 수 있습니다.')
   if action=='roots':return {'selected':'project','roots':[{'id':'project','label':'내 작업 결과','path':'배정된 에피소드','available':True}]}
@@ -1227,14 +1321,14 @@ def session_script(req:Request):
 
 @app.get('/api/raw-episodes')
 def raw_episodes(req:Request):
- guard(req)
- episodes=call('GET','/worker/info',worker_id=selected_worker(req))['episodes'];owners=access.owners();user=access.user(req);latest={}
+ guard(req);marks=[('start',time.time())];mark=lambda name:marks.append((name,time.time()))
+ episodes=raw_worker_info(selected_worker(req))['episodes'];owners=access.owners();user=access.user(req);latest={};mark('worker')
  for wid,mode,dag in active_dags():
   runs=local_api('GET',f'/api/v2/dags/{dag}/dagRuns',params={'limit':100,'order_by':'-logical_date'})['dag_runs']
   for r in runs:
    ep=r.get('conf',{}).get('raw_episode_id') or r.get('conf',{}).get('episode_id');stamp=r.get('logical_date') or r.get('queued_at') or ''
    if ep in episodes and (ep not in latest or stamp>latest[ep][0]):latest[ep]=(stamp,dag,r,mode)
- deferred=deferred_runs()
+ mark('airflow');deferred=deferred_runs()
  batch_states=batch_history() if any((v[3]=='day' or v[2]['dag_run_id'] in deferred) and v[2]['state']=='success' for v in latest.values()) else {}
  labels={'prepare_raw':'RAW 전처리','sam_settings_ready':'분할 설정 확인','sam3':'SAM3','mask_approved':'마스크 검수','preflight':'추적 사전 검사','track':'추적','tracking_approved':'추적 검수','prepare_reconstruction':'복원 준비','reconstruct':'3D 복원','hands':'MANO 피팅','validate':'결과 검사','publish':'최종 저장'}
  # 3D 복원까지 끝난 RAW(낮 실행 성공 → MANO 대기/완료, 또는 전체 파이프라인 성공)는 배정 부하에서 빠집니다.
@@ -1245,29 +1339,29 @@ def raw_episodes(req:Request):
  started_other={};elsewhere={}
  try:
   if fleet.available():
-   started_other=fleet.started_elsewhere()
-   elsewhere={ep:pc for ep,pc in fleet.raw_claims().items() if pc!=fleet.PC_ID}
-   for ep,pc in fleet.raw_distributed().items():  # 연속 모드로 다른 PC에 분배한 RAW
+   started_other=nas_view('started',fleet.started_elsewhere)
+   elsewhere={ep:pc for ep,pc in nas_view('claims',fleet.raw_claims).items() if pc!=fleet.PC_ID}
+   for ep,pc in nas_view('distributed',fleet.raw_distributed).items():  # 연속 모드로 다른 PC에 분배한 RAW
     if pc!=fleet.PC_ID:elsewhere.setdefault(ep,pc)
    for ep,pc in started_other.items():elsewhere.setdefault(ep,pc)
  except Exception:started_other,elsewhere={},{}
- queued=[ep for ep in episodes if raw_in_queue(ep,owners,latest)]
+ mark('nas');queued=[ep for ep in episodes if raw_in_queue(ep,owners,latest)]
  episodes=[ep for ep in queued if ep not in elsewhere or owners.get(ep) or ep in latest]
  others=[ep for ep in queued if ep not in set(episodes)]
  # '내 작업에서 제외'한 RAW: 이 PC 기록은 NAS에도 남기고(예전 제외분 포함), 어느 PC든 제외한 RAW는 아무에게도 배정하지 않습니다.
  # 제외한 본인(제외 취소용)·관리자·이미 이 PC에서 담당/실행한 RAW가 아니면 목록에도 보이지 않습니다.
  local_excl=access.excluded_any(selected_worker(req))
- excluded_by={ep:pc.upper() for ep,pc in global_excluded().items()}
+ excluded_by={ep:pc.upper() for ep,pc in global_excluded(view=True).items()}
  for ep,op in local_excl.items():
-  if ep not in excluded_by:fleet.raw_exclude(ep);excluded_by[ep]=op
+  if ep not in excluded_by:fleet.raw_exclude(ep);forget('nas:excluded');excluded_by[ep]=op
  excluded=access.excluded_raw(user['name'],selected_worker(req))
  def hidden(ep):
   return user['role']!='admin' and ep in excluded_by and ep not in excluded and owners.get(ep)!=user['name'] and ep not in latest
- assigned,team=access.rebalance(selected_worker(req),episodes,done,set(latest),claim=fleet.raw_claim,release=fleet.raw_release,blocked=set(excluded_by),targets=queue_target_of)
+ assigned,team=access.rebalance(selected_worker(req),episodes,done,set(latest),claim=fleet.raw_claim,release=fleet.raw_release,blocked=set(excluded_by),targets=queue_target_view);mark('assign')
  episodes=[ep for ep in episodes if not hidden(ep)]
  others=[ep for ep in others if not hidden(ep)]
  out=[]
- dist=my_distributed();contq=cont_waiting_eps()  # SAM3 연속 모드
+ dist=my_distributed(view=True);contq=cont_waiting_eps()  # SAM3 연속 모드
  for ep in episodes:
   owner=owners.get(ep);row=raw_row(ep,owner,user)
   # 다른 작업자의 담당·진행 단계도 모두 보여 줍니다(실행·수정은 본인 것만).
@@ -1295,7 +1389,8 @@ def raw_episodes(req:Request):
   pc=elsewhere[ep];ran=started_other.get(ep)==pc
   out.append({'episode':ep,'operator':None,'assigned_to':None,'can_run':False,'done':False,'excluded_from_mine':False,'can_exclude':False,
               'elsewhere':pc.upper(),'elsewhere_started':ran,'progress':'다른 PC에서 실행' if ran else '제외됨 · '+excluded_by[ep] if ep in excluded_by else '다른 PC 배정 · 실행 전'})
- mine=queue_target_info(user['name'])
+ mine=queue_target_info(user['name'],view=True);mark('rows')
+ if marks[-1][1]-marks[0][1]>=SLOW_REQUEST_S:print('slow raw-episodes: '+', '.join(f'{b[0]} {b[1]-a[1]:.1f}s' for a,b in zip(marks,marks[1:])),flush=True)
  return {'episodes':out,'team':{'total_users':team['total'],'operators':team['operators'],'admins':team['admins'],
          'target':team['targets'].get(user['name'],mine['target']),'targets':team['targets'],'default_target':access.ASSIGN_TARGET,
          'my_queue':mine,'load':team['load'],'me':user['name'],'role':user['role']}}
@@ -1312,8 +1407,14 @@ def queue_target_of(name):
  with queue_db() as c:r=c.execute('SELECT target FROM queue_targets WHERE name=?',(name,)).fetchone()
  return r[0] if r else None
 
-def queue_target_info(name):
- v=queue_target_of(name)
+def queue_target_view(name):
+ """화면 표시·배정용: 기억해 둔 큐 크기(이 PC에서 바꾸면 바로 새로 읽음)."""
+ if not fleet.available():return queue_target_of(name)
+ try:return nas_view('queue:'+name,lambda:{'v':fleet.queue_target_get(name)})['v']
+ except OSError:return None
+
+def queue_target_info(name,view=False):
+ v=queue_target_view(name) if view else queue_target_of(name)
  return {'target':access.ASSIGN_TARGET if v is None else v,'custom':v is not None,'nas':fleet.available(),'min':fleet.QUEUE_MIN,'max':fleet.QUEUE_MAX}
 
 class QueueTarget(BaseModel):
@@ -1326,7 +1427,7 @@ def set_queue_target(data:QueueTarget,req:Request):
  guard(req);u=access.user(req)
  if not fleet.QUEUE_NAME.fullmatch(u['name']):raise HTTPException(400,'PC1~PC6 이름으로 로그인한 작업자만 정할 수 있습니다.')
  if fleet.available():
-  try:fleet.queue_target_set(u['name'],data.target,u.get('label') or u['name'])
+  try:fleet.queue_target_set(u['name'],data.target,u.get('label') or u['name']);forget('nas:queue:'+u['name'])
   except (OSError,ValueError) as e:raise HTTPException(503,'NAS에 저장하지 못했습니다: '+str(e)[:200])
  else:
   with queue_db() as c:c.execute('INSERT OR REPLACE INTO queue_targets VALUES(?,?,?)',(u['name'],data.target,time.time()))
@@ -1368,11 +1469,14 @@ def exclude_raw_episode(data:RawExclusion,req:Request):
    if data.excluded:fleet.raw_exclude(data.episode)
    elif not access.excluded_any(data.worker_id).get(data.episode):fleet.raw_unexclude(data.episode)
   except Exception:pass
+  forget('nas:excluded','nas:taken')
  return {'ok':True,'excluded':data.excluded}
 
-def global_excluded():
- """NAS에 기록된, 어느 PC에서든 '내 작업에서 제외'한 RAW → 제외한 PC"""
- try:return fleet.raw_excluded() if fleet.available() else {}
+def global_excluded(view=False):
+ """NAS에 기록된, 어느 PC에서든 '내 작업에서 제외'한 RAW → 제외한 PC. view=True: 화면 표시용(기억해 둔 값)."""
+ try:
+  if not fleet.available():return {}
+  return nas_view('excluded',fleet.raw_excluded) if view else fleet.raw_excluded()
  except Exception:return {}
 
 # 추적 결과가 지금 승인된 마스크와 맞지 않을 때(마스크를 고쳐 다시 승인했거나 아직 승인 전) 추적 검수에 나오는 사유.
@@ -1987,6 +2091,7 @@ def fleet_raw_reset(task,p):
   # SAM3 연속 모드: 이 PC에 분배된 시작 전 RAW와 실행 전 대기열 항목도 풉니다.
   dist=[e for e in my_distributed() if (not ep or e==ep) and not own.get(e)]
   for e in dist:fleet.raw_undistribute(e,fleet.PC_ID)
+  forget('nas:excluded','nas:distributed','nas:taken','nas:claims')
   with cont_db() as c:
    ncont=c.execute("UPDATE sam_queue SET state='cancelled' WHERE state IN ('waiting','failed')"+(' AND raw_episode=?' if ep else ''),(ep,) if ep else ()).rowcount
   # 겹침 정리: 남기는 PC가 따로 있으면 이 PC의 선점도 풉니다(이 PC가 실행한 RAW는 제외).
@@ -2270,7 +2375,7 @@ def fleet_view(pc):
 
 def free_raws(started):
  """어느 PC에서도 선점·시작하지 않은 RAW(촬영일 RAW_QUEUE_START 이후)."""
- try:raws=call('GET','/worker/info',worker_id=DEFAULT_WORKER)['episodes']
+ try:raws=raw_worker_info(DEFAULT_WORKER)['episodes']
  except Exception:raws=[]
  own=access.owners()
  return [e for e in raws if re.match(r'ep_(\d{8})_',e) and re.match(r'ep_(\d{8})_',e).group(1)>=RAW_QUEUE_START and e not in started and not own.get(e)]
@@ -2573,9 +2678,9 @@ def cont_db():
   except sqlite3.OperationalError:pass   # 다른 스레드가 방금 추가함
  return c
 
-def my_distributed():
- """이 PC에 분배된 RAW"""
- try:return {ep for ep,pc in fleet.raw_distributed().items() if pc==fleet.PC_ID} if fleet.available() else set()
+def my_distributed(view=False):
+ """이 PC에 분배된 RAW. view=True: 화면 표시용(기억해 둔 값)."""
+ try:return {ep for ep,pc in (nas_view('distributed',fleet.raw_distributed) if view else fleet.raw_distributed()).items() if pc==fleet.PC_ID} if fleet.available() else set()
  except Exception:return set()
 
 def cont_waiting_eps():
@@ -2663,16 +2768,18 @@ def cont_loop():
 def cont_status(req:Request):
  guard(req);u=access.user(req);wid=selected_worker(req)
  if wid!=DEFAULT_WORKER:return {'available':False}
- me=u['name'];own=access.owners();assigned=access.assignments();dist=my_distributed();excluded=access.excluded_raw(me,wid)
+ me=u['name'];own=access.owners();assigned=access.assignments();dist=my_distributed(view=True);excluded=access.excluded_raw(me,wid)
  with cont_db() as c:
   rows=[dict(r) for r in c.execute("SELECT id,raw_episode,operator,sam_prompt,state,run_id,dag_id,episode,error,created,started,target_fps FROM sam_queue "
                                   "WHERE worker_id=? AND state IN ('waiting','failed','started') ORDER BY created,id",(wid,))]
   # 목록에는 대기·시작 실패·RAW 전처리~SAM3 진행 중인 것만 둡니다. SAM3까지 끝난 실행(state='done')은 개수만 셉니다.
   started_today=c.execute("SELECT COUNT(*) FROM sam_queue WHERE worker_id=? AND state IN ('started','done') AND started>?",(wid,time.time()-86400)).fetchone()[0]
  active={r['raw_episode'] for r in rows if r['state'] in ('waiting','failed')}
- try:raws=set(call('GET','/worker/info',worker_id=wid)['episodes'])
+ try:raws=set(raw_worker_info(wid)['episodes'])
  except Exception:raws=None
- others=fleet.raw_taken_elsewhere() if fleet.available() else {}
+ # 화면 표시용이라 기억해 둔 NAS 기록을 씁니다(실제 시작할 때는 cont_tick이 NAS를 직접 확인).
+ try:others=nas_view('taken',fleet.raw_taken_elsewhere) if fleet.available() else {}
+ except OSError:others={}
  cand=dist|{ep for ep,op in assigned.items() if op==me}
  todo=sorted(ep for ep in cand if not own.get(ep) and ep not in active and ep not in excluded and ep not in others and (raws is None or ep in raws))
  cache={r['episode']:r for r in (raw_frames() or [])}
@@ -2764,11 +2871,11 @@ def cont_retry(data:ContItem,req:Request):
 def cont_started_all(pcs):
  return set(access.owners())|{e for p in pcs for e in (p.get('raw_started') or [])}
 
-def cont_pool(started,dist,date=''):
+def cont_pool(started,dist,date='',view=False):
  """어느 PC도 선점·시작·제외·분배하지 않은 RAW(촬영일 RAW_QUEUE_START 이후, date='YYYY-MM-DD'면 그날 촬영만)"""
- try:raws=call('GET','/worker/info',worker_id=DEFAULT_WORKER)['episodes']
+ try:raws=raw_worker_info(DEFAULT_WORKER)['episodes']
  except Exception as e:raise HTTPException(503,'RAW 목록을 불러오지 못했습니다.') from e
- claims=fleet.raw_claims();excl=global_excluded();day=date.replace('-','')
+ claims=nas_view('claims',fleet.raw_claims) if view else fleet.raw_claims();excl=global_excluded(view=view);day=date.replace('-','')
  out=[]
  for ep in raws:
   m=re.match(r'ep_(\d{8})_',ep)
@@ -2781,11 +2888,14 @@ def cont_pool(started,dist,date=''):
 def cont_distribution(req:Request):
  guard(req);access.admin(req)
  if not fleet.available():return {'available':False}
- pcs=fleet.read_all();dist=fleet.raw_distributed();started=cont_started_all(pcs)
+ # 관리자 분배 현황(조회): 기억해 둔 NAS 기록. 실제 분배(POST)는 NAS를 직접 읽습니다.
+ try:pcs=nas_view('pcs',fleet.read_all);dist=nas_view('distributed',fleet.raw_distributed)
+ except OSError as e:raise HTTPException(503,'NAS 관제 기록을 아직 읽고 있습니다. 잠시 뒤 다시 열어 주세요.') from e
+ started=cont_started_all(pcs)
  per={p['pc']:{'pc':p['pc'],'online':bool(p.get('online')),'waiting':0,'started':0} for p in pcs}
  for ep,pc in dist.items():
   if pc in per:per[pc]['started' if ep in started else 'waiting']+=1
- pool=cont_pool(started,dist);dates={}
+ pool=cont_pool(started,dist,view=True);dates={}
  for ep in pool:d=ep[3:7]+'-'+ep[7:9]+'-'+ep[9:11];dates[d]=dates.get(d,0)+1
  return {'available':True,'pcs':list(per.values()),'pool':len(pool),'dates':dict(sorted(dates.items(),reverse=True))}
 
@@ -2808,7 +2918,7 @@ def cont_distribute(data:ContDistribute,req:Request):
   given={pc:[] for pc in targets}
   for ep in cont_pool(started,dist,data.date):
    pc=min(targets,key=lambda p:(load[p],targets.index(p)))
-   if fleet.raw_distribute(ep,pc):load[pc]+=1;given[pc].append(ep)
+   if fleet.raw_distribute(ep,pc):load[pc]+=1;given[pc].append(ep);forget('nas:distributed','nas:taken','nas:claims')
  with access.db() as c:c.execute('INSERT INTO ui_audit VALUES(?,?,?)',(time.time(),admin['name'],'continuous distribute '+json.dumps({p:len(v) for p,v in given.items()})))
  return {'given':{p:len(v) for p,v in given.items()},'total':sum(len(v) for v in given.values()),'load':load}
 
@@ -2822,7 +2932,7 @@ def cont_recall(data:ContRecall,req:Request):
  if not fleet.available():raise HTTPException(503,'NAS 관제를 사용할 수 없습니다.')
  started=cont_started_all(fleet.read_all());n=0
  for ep,pc in fleet.raw_distributed().items():
-  if pc==data.pc and ep not in started:fleet.raw_undistribute(ep,pc);n+=1
+  if pc==data.pc and ep not in started:fleet.raw_undistribute(ep,pc);n+=1;forget('nas:distributed','nas:taken','nas:claims')
  with access.db() as c:c.execute('INSERT INTO ui_audit VALUES(?,?,?)',(time.time(),admin['name'],f'continuous recall {data.pc} {n}'))
  return {'recalled':n}
 

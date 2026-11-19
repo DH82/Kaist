@@ -43,9 +43,68 @@ def episodes(project):
     return sorted(found)
 
 
-def rsync(src, dst, dry=False):
+# ---- 업로드 속도 제한 (낮 시간대에만) ----
+# NAS 회선이 느린 PC(예: 100Mbps로 연결된 PC1)는 작업 폴더 업로드가 회선을 다 써서, 낮에는 RAW 목록 같은
+# 화면 조회까지 몇 분씩 밀립니다. worker/config/nas_upload_limit.json이 있으면 그 시간대에만 rsync 속도를 묶습니다.
+#   {"mb_per_s": 3, "from_hour": 8, "to_hour": 19, "weekdays_only": true}
+# 파일이 없으면 제한하지 않습니다. 올리는 도중 시간대가 바뀌면 rsync를 새 속도로 다시 시작합니다
+# (끝난 파일은 건너뛰고, 올리던 파일 하나만 처음부터 다시 올림).
+LIMIT_TZ = 'Asia/Seoul'
+
+
+def upload_limit(spec, now=None):
+    """지금 적용할 rsync --bwlimit 값(KiB/s). 0이면 제한 없음. 설정이 잘못됐으면 제한하지 않습니다."""
+    try:
+        rate = int(float(spec['mb_per_s']) * 1024)
+        start, end = int(spec.get('from_hour', 8)), int(spec.get('to_hour', 19))
+        if rate <= 0 or not (0 <= start <= 24 and 0 <= end <= 24) or start == end:
+            return 0
+        if now is None:
+            from zoneinfo import ZoneInfo
+            now = datetime.datetime.now(ZoneInfo(spec.get('tz') or LIMIT_TZ))
+        if spec.get('weekdays_only', True) and now.weekday() >= 5:
+            return 0
+        inside = start <= now.hour < end if start < end else (now.hour >= start or now.hour < end)
+        return rate if inside else 0
+    except (TypeError, KeyError, ValueError, AttributeError):
+        return 0
+
+
+def limit_text(rate):
+    return f'속도 제한 {rate / 1024:g} MB/s' if rate else '속도 제한 없음'
+
+
+def _rsync_limited(cmd, paths, limit, log, poll):
+    """속도 제한을 걸고 올립니다. 시간대가 바뀌어 적용할 속도가 달라지면 멈추고 새 속도로 다시 시작합니다."""
+    while True:
+        rate = upload_limit(limit)
+        proc = subprocess.Popen(cmd + ([f'--bwlimit={rate}'] if rate else []) + paths,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        while True:
+            try:
+                err = proc.communicate(timeout=poll)[1]
+                return proc.returncode, err
+            except subprocess.TimeoutExpired:
+                if upload_limit(limit) == rate:
+                    continue
+            proc.terminate()
+            try:
+                proc.communicate(timeout=60)
+            except subprocess.TimeoutExpired:
+                proc.kill(); proc.communicate()
+            log(f'업로드 시간대가 바뀌어 다시 시작합니다: {limit_text(rate)} → {limit_text(upload_limit(limit))}')
+            break
+
+
+def rsync(src, dst, dry=False, limit=None, log=print, poll=30):
     dst.parent.mkdir(parents=True, exist_ok=True)
-    cmd = RSYNC + (['--dry-run', '--itemize-changes'] if dry else []) + [str(src) + ('/' if src.is_dir() else ''), str(dst) + ('/' if src.is_dir() else '')]
+    paths = [str(src) + ('/' if src.is_dir() else ''), str(dst) + ('/' if src.is_dir() else '')]
+    if limit and not dry:
+        code, err = _rsync_limited(RSYNC, paths, limit, log, poll)
+        if code not in (0, 24):
+            raise RuntimeError(f'rsync 실패 ({code}): {src} → {dst}\n{(err or "")[-1500:]}')
+        return []
+    cmd = RSYNC + (['--dry-run', '--itemize-changes'] if dry else []) + paths
     r = subprocess.run(cmd, capture_output=True, text=True)
     # 24 = 전송 중 원본 파일이 사라짐(로그 회전 등). 다시 비교 단계에서 걸러집니다.
     if r.returncode not in (0, 24):
@@ -71,16 +130,19 @@ def history_dirs(project):
 HISTORY_SKIP = {'locks', 'staging', 'manifests', 'nas_sync'}
 
 
-def sync_episode(cfg, ep, log=print):
+def sync_episode(cfg, ep, log=print, limit=None):
     project = Path(cfg['project_dir'])
     nas = work_root(cfg)
     if not Path(cfg['nas_mount']).is_mount():
         raise RuntimeError('NAS가 마운트되어 있지 않습니다: ' + cfg['nas_mount'])
     copied, removed, total = [], [], 0
+    if limit:
+        log(f"업로드 {limit_text(upload_limit(limit))} (설정: {limit.get('from_hour', 8)}~{limit.get('to_hour', 19)}시"
+            f"{' 평일' if limit.get('weekdays_only', True) else ''}에 {limit.get('mb_per_s')} MB/s)")
     for d in list(dict.fromkeys(STAGE_DIRS + history_dirs(project))):
         src, dst = project / d / ep, nas / d / ep
         if src.is_dir() and not src.is_symlink():
-            rsync(src, dst)
+            rsync(src, dst, limit=limit, log=log)
             copied.append(f'{d}/{ep}'); total += size(src)
         elif dst.exists() and d in STATE_GROUPS and any((project / o / ep).is_dir() for o in STATE_GROUPS[d]):
             # 로컬에서는 다른 상태 폴더로 옮겨진 에피소드 → NAS의 이전 위치 사본 정리
@@ -89,7 +151,7 @@ def sync_episode(cfg, ep, log=print):
     for pattern in STAGE_FILES:
         rel = pattern.format(ep=ep)
         if (project / rel).is_file():
-            rsync(project / rel, nas / rel); copied.append(rel); total += size(project / rel)
+            rsync(project / rel, nas / rel, limit=limit, log=log); copied.append(rel); total += size(project / rel)
     if not copied:
         raise RuntimeError('로컬 작업 폴더에 이 에피소드가 없습니다: ' + ep)
     # 검증: 다시 비교했을 때 바뀔 파일이 없어야 합니다.

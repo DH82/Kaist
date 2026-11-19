@@ -256,7 +256,8 @@ function renderRawTable(){
  rawDateCal.refresh();
  const filter=rawDateFilter,groups={},me=rawTeam&&rawTeam.me;
  // 내 작업(시작 전 배정 + 3D 복원이 끝나지 않은 내 담당)은 날짜 필터와 상관없이 맨 위에 고정합니다.
- const isMine=e=>!e.excluded_from_mine&&rawTeam&&rawTeam.role!=='admin'&&(e.assigned_to===me||(e.operator===me&&!e.done));
+ // 처음 뜨는 간이 목록(/api/info)에는 done이 없습니다. 끝났는지 모르는 행은 내 작업으로 세지 않습니다(예전에는 끝난 담당까지 모두 세어 '47 / 5개'처럼 보였음).
+ const isMine=e=>!e.excluded_from_mine&&rawTeam&&rawTeam.role!=='admin'&&(e.assigned_to===me||(e.operator===me&&e.done===false));
  const mine=[];rawEpisodes.forEach((e,i)=>{if(isMine(e))mine.push(i)});
  rawEpisodes.forEach((e,i)=>{const d=rawCaptureDate(e.episode);if(e.excluded_from_mine&&!$('rawShowExcluded').checked)return;if(!isMine(e)&&(e.excluded_from_mine||!filter||filter===d))(groups[d]=groups[d]||[]).push(i)});
  renderRawTeam();
