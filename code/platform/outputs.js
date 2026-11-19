@@ -87,23 +87,28 @@ $('confirmed').onchange=updateLaunch;$('prompt').oninput=updateLaunch;
 
 // 선택 옵션: 첫 프레임 bbox 또는 포인트 + 텍스트 → 단일 물체 추적. RAW cam_1~4 첫 프레임에 그린 bbox(x,y,w,h)나
 // 클릭한 포인트([x,y,label], label 1=포함 0=제외)를 0~1로 정규화해 보냅니다.
-let objectBoxes={},objectPoints={},bboxLoaded=new Set(),bboxEpisode='',bboxGeneration=0;
-function objectMode(){return $('objectMode').value}
+let objectBoxes={},objectPoints={},handPoints={},pickTarget='object',bboxLoaded=new Set(),bboxEpisode='',bboxGeneration=0;
+// 분할 방식(선택 상자 값): text / bbox_track / point_track(물체 포인트 + 손 텍스트) / point_track_hand(물체 포인트 + 손 포인트).
+// 서버에는 물체 방식(sam_object_mode)과 손 방식(sam_hand_mode)으로 나눠 보냅니다.
+function samMode(){return $('objectMode').value}
+function handMode(){return samMode()==='point_track_hand'}
+function objectMode(){return handMode()?'point_track':samMode()}
 function camPointsReady(c){return (objectPoints[c]||[]).some(p=>p[2]===1)}
+function camHandReady(c){return (handPoints[c]||[]).some(p=>p[2]===1)}
 function objectModeReady(){
  const m=objectMode();if(m==='text')return true;if(bboxEpisode!==$('episode').value)return false;
- return [1,2,3,4].every(c=>m==='bbox_track'?objectBoxes[c]:camPointsReady(c));
+ return [1,2,3,4].every(c=>(m==='bbox_track'?objectBoxes[c]:camPointsReady(c))&&(!handMode()||camHandReady(c)));
 }
-function objectModeHint(){return objectMode()==='point_track'?'카메라 4개 모두 첫 프레임에서 물체를 클릭하세요(포함 포인트 1개 이상).':'카메라 4개 모두 첫 프레임에 bbox를 그리세요.'}
+function objectModeHint(){return handMode()?'카메라 4개 모두 첫 프레임에서 물체와 손을 각각 클릭하세요(포함 포인트 1개 이상씩).':objectMode()==='point_track'?'카메라 4개 모두 첫 프레임에서 물체를 클릭하세요(포함 포인트 1개 이상).':'카메라 4개 모두 첫 프레임에 bbox를 그리세요.'}
 function objectBboxPayload(){
  if(objectMode()!=='bbox_track')return null;
  const result={};for(const c of [1,2,3,4])result[String(c-1)]=objectBoxes[c].map(v=>Math.round(v*10000)/10000);return result;
 }
-function objectPointPayload(){
- if(objectMode()!=='point_track')return null;
- const result={};for(const c of [1,2,3,4])result[String(c-1)]=objectPoints[c].map(([x,y,l])=>[Math.round(x*10000)/10000,Math.round(y*10000)/10000,l]);return result;
-}
-function paintBox(canvas,box,points){
+function pointPayload(store){const result={};for(const c of [1,2,3,4])result[String(c-1)]=store[c].map(([x,y,l])=>[Math.round(x*10000)/10000,Math.round(y*10000)/10000,l]);return result}
+function objectPointPayload(){return objectMode()==='point_track'?pointPayload(objectPoints):null}
+function handPointPayload(){return handMode()?pointPayload(handPoints):null}
+// 물체 포인트: 초록(포함)/빨강(제외) 원. 손 포인트: 파랑(포함)/주황(제외) 네모.
+function paintBox(canvas,box,points,hands){
  const r=canvas.getBoundingClientRect(),dpr=window.devicePixelRatio||1;canvas.width=Math.round(r.width*dpr);canvas.height=Math.round(r.height*dpr);
  const ctx=canvas.getContext('2d');ctx.clearRect(0,0,canvas.width,canvas.height);
  if(box){
@@ -111,40 +116,64 @@ function paintBox(canvas,box,points){
   ctx.fillRect(x*canvas.width,y*canvas.height,w*canvas.width,h*canvas.height);ctx.strokeRect(x*canvas.width,y*canvas.height,w*canvas.width,h*canvas.height);
  }
  const rad=6*dpr;
- for(const [x,y,l] of points||[]){
+ const mark=(x,y,l,hand)=>{
   const cx=x*canvas.width,cy=y*canvas.height;
-  ctx.beginPath();ctx.arc(cx,cy,rad,0,Math.PI*2);ctx.fillStyle=l?'#22c55e':'#ef4444';ctx.fill();ctx.lineWidth=2*dpr;ctx.strokeStyle='white';ctx.stroke();
+  ctx.beginPath();if(hand)ctx.rect(cx-rad,cy-rad,rad*2,rad*2);else ctx.arc(cx,cy,rad,0,Math.PI*2);
+  ctx.fillStyle=hand?(l?'#3b82f6':'#f97316'):(l?'#22c55e':'#ef4444');ctx.fill();ctx.lineWidth=2*dpr;ctx.strokeStyle='white';ctx.stroke();
   ctx.beginPath();ctx.moveTo(cx-rad*.55,cy);ctx.lineTo(cx+rad*.55,cy);if(l){ctx.moveTo(cx,cy-rad*.55);ctx.lineTo(cx,cy+rad*.55)}ctx.stroke();
- }
+ };
+ for(const [x,y,l] of points||[])mark(x,y,l,false);
+ for(const [x,y,l] of hands||[])mark(x,y,l,true);
 }
-function paintCam(canvas){const c=+canvas.dataset.cam;paintBox(canvas,objectMode()==='bbox_track'?objectBoxes[c]:null,objectMode()==='point_track'?objectPoints[c]:null)}
+function paintCam(canvas){const c=+canvas.dataset.cam;paintBox(canvas,objectMode()==='bbox_track'?objectBoxes[c]:null,objectMode()==='point_track'?objectPoints[c]:null,handMode()?handPoints[c]:null)}
 function bboxStatus(){
- const point=objectMode()==='point_track',done=[1,2,3,4].filter(c=>point?camPointsReady(c):objectBoxes[c]).length,word=point?'포인트':'bbox';
- $('bboxStatus').textContent=bboxLoaded.size<4?'첫 프레임 사진을 불러오는 중…':done<4?word+' '+done+'/4 · 남은 카메라에도 '+(point?'물체를 클릭해야':'그려야')+' 실행할 수 있습니다.':word+' 4/4 완료. SAM3에서 카메라별 초기 마스크를 고른 뒤 그 물체만 추적합니다. 결과는 마스크 검수에서 확인합니다.';
+ const point=objectMode()==='point_track',hand=handMode(),done=[1,2,3,4].filter(c=>point?camPointsReady(c):objectBoxes[c]).length,handDone=[1,2,3,4].filter(camHandReady).length,word=point?'포인트':'bbox';
+ $('bboxStatus').textContent=bboxLoaded.size<4?'첫 프레임 사진을 불러오는 중…'
+  :hand&&(done<4||handDone<4)?'물체 '+done+'/4 · 손 '+handDone+'/4 · 카메라마다 물체와 손을 각각 클릭해야 실행할 수 있습니다. 지금 찍는 대상: '+(pickTarget==='hand'?'손':'물체')+' (H 키로 전환)'
+  :done<4?word+' '+done+'/4 · 남은 카메라에도 '+(point?'물체를 클릭해야':'그려야')+' 실행할 수 있습니다.'
+  :hand?'물체 4/4 · 손 4/4 완료. 손은 텍스트 분할 없이 클릭한 손을 추적합니다. 결과는 마스크 검수에서 확인합니다.'
+  :word+' 4/4 완료. SAM3에서 카메라별 초기 마스크를 고른 뒤 그 물체만 추적합니다. 결과는 마스크 검수에서 확인합니다.';
  updateLaunch();
 }
-function pointLabel(c){const pts=objectPoints[c]||[],pos=pts.filter(p=>p[2]===1).length;return pts.length?'<b>포함 '+pos+' · 제외 '+(pts.length-pos)+'</b> <button type="button" class="linkbtn" data-clear="'+c+'">지우기</button>':'포인트 없음'}
+function pointCount(pts){const pos=pts.filter(p=>p[2]===1).length;return '포함 '+pos+' · 제외 '+(pts.length-pos)}
+function pointLabel(c){
+ const pts=objectPoints[c]||[],hands=handPoints[c]||[];
+ if(!handMode())return pts.length?'<b>'+pointCount(pts)+'</b> <button type="button" class="linkbtn" data-clear="'+c+'">지우기</button>':'포인트 없음';
+ return '물체 '+(pts.length?'<b>'+pointCount(pts)+'</b>':'없음')+' · 손 '+(hands.length?'<b>'+pointCount(hands)+'</b>':'없음')+(pts.length||hands.length?' <button type="button" class="linkbtn" data-clear="'+c+'">지우기</button>':'');
+}
+function setPickTarget(target){
+ pickTarget=target==='hand'&&handMode()?'hand':'object';
+ for(const b of $('pickTarget').querySelectorAll('[data-target]')){const on=b.dataset.target===pickTarget;b.classList.toggle('current',on);b.setAttribute('aria-pressed',on)}
+ if(bboxLoaded.size===4)bboxStatus();
+}
+$('pickTarget').addEventListener('click',e=>{const b=e.target.closest('[data-target]');if(b)setPickTarget(b.dataset.target)});
+// H 키: 찍는 대상(물체 ↔ 손) 전환. 입력 칸에 글을 쓰는 중에는 무시합니다.
+document.addEventListener('keydown',e=>{
+ if(e.key.toLowerCase()!=='h'||e.ctrlKey||e.metaKey||e.altKey||/^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName))return;
+ if(page==='run'&&handMode()&&!$('bboxPicker').classList.contains('hidden'))setPickTarget(pickTarget==='hand'?'object':'hand');
+});
 function loadBboxPicker(){
- const episode=$('episode').value,mode=objectMode(),on=mode!=='text',point=mode==='point_track',generation=++bboxGeneration;
- objectBoxes={};objectPoints={};bboxLoaded=new Set();bboxEpisode='';$('bboxPicker').classList.toggle('hidden',!on);
- $('bboxHelpBox').hidden=point;$('bboxHelpPoint').hidden=!point;
+ const episode=$('episode').value,mode=objectMode(),on=mode!=='text',point=mode==='point_track',hand=handMode(),generation=++bboxGeneration;
+ objectBoxes={};objectPoints={};handPoints={};bboxLoaded=new Set();bboxEpisode='';$('bboxPicker').classList.toggle('hidden',!on);
+ $('bboxHelpBox').hidden=point;$('bboxHelpPoint').hidden=!point;$('bboxHelpHand').hidden=!hand;$('pickTarget').hidden=!hand;setPickTarget('object');
  if(!on){updateLaunch();return}
  if(!episode){$('bboxImages').textContent='에피소드를 선택하세요.';$('bboxStatus').textContent='';updateLaunch();return}
- $('bboxImages').innerHTML=[1,2,3,4].map(c=>'<figure><div class="bboxStage"><img alt="카메라 '+c+' 첫 프레임" data-cam="'+c+'"><canvas data-cam="'+c+'" role="img" aria-label="카메라 '+c+' 물체 '+(point?'포인트 찍기':'bbox 그리기')+'"></canvas></div><figcaption>카메라 '+c+' · 첫 프레임 · <span data-box="'+c+'">'+(point?'포인트 없음':'bbox 없음')+'</span></figcaption></figure>').join('');
+ $('bboxImages').innerHTML=[1,2,3,4].map(c=>'<figure><div class="bboxStage"><img alt="카메라 '+c+' 첫 프레임" data-cam="'+c+'"><canvas data-cam="'+c+'" role="img" aria-label="카메라 '+c+' '+(hand?'물체·손 포인트 찍기':'물체 '+(point?'포인트 찍기':'bbox 그리기'))+'"></canvas></div><figcaption>카메라 '+c+' · 첫 프레임 · <span data-box="'+c+'">'+(point?'포인트 없음':'bbox 없음')+'</span></figcaption></figure>').join('');
  for(const img of $('bboxImages').querySelectorAll('img')){
   const cam=+img.dataset.cam,canvas=img.nextElementSibling,label=$('bboxImages').querySelector('[data-box="'+cam+'"]');
   img.onload=()=>{if(generation!==bboxGeneration)return;bboxLoaded.add(cam);if(bboxLoaded.size===4)bboxEpisode=episode;paintCam(canvas);bboxStatus()};
   img.onerror=()=>{if(generation!==bboxGeneration)return;$('bboxStatus').textContent='첫 프레임 사진을 불러오지 못했습니다. 다시 불러오기를 눌러주세요.';updateLaunch()};
   const at=e=>{const r=canvas.getBoundingClientRect();return [Math.min(1,Math.max(0,(e.clientX-r.left)/r.width)),Math.min(1,Math.max(0,(e.clientY-r.top)/r.height))]};
   if(point){
-   // 왼쪽 클릭 = 포함(초록), Shift+클릭 또는 오른쪽 클릭 = 제외(빨강). 카메라당 최대 20개.
-   const refresh=()=>{label.innerHTML=pointLabel(cam);const b=label.querySelector('[data-clear]');if(b)b.onclick=()=>{objectPoints[cam]=[];refresh()};paintCam(canvas);bboxStatus()};
+   // 왼쪽 클릭 = 포함, Shift+클릭 또는 오른쪽 클릭 = 제외. 대상(물체/손)마다 카메라당 최대 20개.
+   const refresh=()=>{label.innerHTML=pointLabel(cam);const b=label.querySelector('[data-clear]');if(b)b.onclick=()=>{objectPoints[cam]=[];handPoints[cam]=[];refresh()};paintCam(canvas);bboxStatus()};
    canvas.oncontextmenu=e=>e.preventDefault();
    canvas.onpointerdown=e=>{
     if(!bboxLoaded.has(cam)||(e.button!==0&&e.button!==2))return;e.preventDefault();
-    const pts=objectPoints[cam]||(objectPoints[cam]=[]),neg=e.button===2||e.shiftKey;
-    if(neg&&!pts.some(p=>p[2]===1)){$('bboxStatus').textContent='카메라 '+cam+': 먼저 물체 위를 왼쪽 클릭해 포함 포인트를 찍으세요.';return}
-    if(pts.length>=20){$('bboxStatus').textContent='카메라 '+cam+': 포인트는 20개까지입니다. 지우기 후 다시 찍으세요.';return}
+    const onHand=hand&&pickTarget==='hand',store=onHand?handPoints:objectPoints,what=onHand?'손':'물체';
+    const pts=store[cam]||(store[cam]=[]),neg=e.button===2||e.shiftKey;
+    if(neg&&!pts.some(p=>p[2]===1)){$('bboxStatus').textContent='카메라 '+cam+': 먼저 '+what+' 위를 왼쪽 클릭해 포함 포인트를 찍으세요.';return}
+    if(pts.length>=20){$('bboxStatus').textContent='카메라 '+cam+': '+what+' 포인트는 20개까지입니다. 지우기 후 다시 찍으세요.';return}
     const [x,y]=at(e);pts.push([x,y,neg?0:1]);refresh();
    };
    canvas.style.cursor='copy';
@@ -162,7 +191,25 @@ function loadBboxPicker(){
  }
  bboxStatus();
 }
-$('objectMode').onchange=loadBboxPicker;
+$('objectMode').onchange=()=>{loadBboxPicker();samDefaultView()};
+// ---- 기본 분할 방식(이 PC 설정): 실행 화면을 열면 미리 선택됩니다. '기본값으로 저장'은 지금 고른 방식을 이 PC에 저장합니다. ----
+let samDefault=null;
+function samDefaultView(){
+ if(!samDefault){$('samDefaultNote').textContent='';$('samDefaultSave').hidden=true;return}
+ const same=samMode()===samDefault.mode;
+ $('samDefaultNote').textContent='이 PC 기본값: '+samDefault.label+(same?'':' · 지금 선택은 이번 실행에만 적용됩니다.');
+ $('samDefaultSave').hidden=same;
+}
+async function loadSamDefault(apply){
+ try{samDefault=await api('/api/sam-default')}catch(e){samDefault=null}
+ if(samDefault&&apply&&$('objectMode').value!==samDefault.mode){$('objectMode').value=samDefault.mode;loadBboxPicker()}
+ samDefaultView();
+ if(typeof contHandView==='function')contHandView();
+}
+$('samDefaultSave').onclick=async()=>{
+ try{samDefault=await api('/api/sam-default',{method:'POST',body:JSON.stringify({mode:samMode()})});notice('이 PC의 기본 분할 방식을 "'+samDefault.label+'"(으)로 저장했습니다.');samDefaultView();if(typeof contHandView==='function')contHandView()}
+ catch(e){notice(e.message,true)}
+};
 window.addEventListener('resize',()=>{for(const canvas of $('bboxImages').querySelectorAll('canvas'))paintCam(canvas)});
 
 function revealSamPreview(){ $('samPreview').classList.remove('hidden');$('prompt').setAttribute('aria-expanded','true') }

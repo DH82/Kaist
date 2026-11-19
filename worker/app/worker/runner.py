@@ -28,6 +28,9 @@ def folder(req):
  if 'target_fps' in req and req['target_fps']!=15:raise ValueError('Invalid target fps')
  if 'sam_object_bboxes' in req and len(json.dumps(req['sam_object_bboxes']))>1000:raise ValueError('Invalid SAM object bbox')
  if 'sam_object_points' in req and len(json.dumps(req['sam_object_points']))>6000:raise ValueError('Invalid SAM object points')
+ # 손 포인트 방식(선택): sam_hand_mode='point_track'와 sam_hand_points가 함께, 물체 bbox/포인트 추적일 때만 옵니다.
+ if ('sam_hand_mode' in req)!=('sam_hand_points' in req) or ('sam_hand_mode' in req and (req['sam_hand_mode']!='point_track' or mode not in need)):raise ValueError('Invalid SAM hand mode')
+ if 'sam_hand_points' in req and len(json.dumps(req['sam_hand_points']))>6000:raise ValueError('Invalid SAM hand points')
  return JOBS/hashlib.sha256((req['run_id']+'\0'+req['episode']+'\0'+req['stage']).encode()).hexdigest()[:32]
 def status(p):
  st=json.loads((p/'status.json').read_text()) if (p/'status.json').exists() else {'state':'not_started'}
@@ -113,6 +116,7 @@ def run(p):
    if req['stage']=='publish':cmd.append('--defer-work-sync')
    if req.get('sam_object_mode')=='point_track':cmd.extend(['--object-mode','point_track','--object-points',json.dumps(req['sam_object_points'])])
    elif req.get('sam_object_mode'):cmd.extend(['--object-mode',req['sam_object_mode'],'--object-bboxes',json.dumps(req['sam_object_bboxes'])])
+   if req.get('sam_hand_mode')=='point_track':cmd.extend(['--hand-points',json.dumps(req['sam_hand_points'])])
    print('WORKER stage='+req['stage']+' episode='+req['episode']+' run='+req['run_id']+' gpu_slot='+('-' if slot is None else str(slot)),flush=True)
    sys.path.insert(0,str(ADAPTER.parent))
    from pipeline_progress import parse

@@ -91,12 +91,15 @@ def views_load():
 
 def _remember_fetch(key,fetch):
  while True:
-  with _info_cond:gen=_info_cache[key]['gen']
+  with _info_cond:
+   if key not in _info_cache:return
+   gen=_info_cache[key]['gen']
   data=error=None
   try:data=fetch()
   except Exception as e:error=f'{type(e).__name__}: {e}'[:200]
   with _info_cond:
-   slot=_info_cache[key]
+   slot=_info_cache.get(key)
+   if slot is None:_info_cond.notify_all();return
    if slot['gen']!=gen:continue  # 읽는 사이 이 PC가 값을 바꿨음(forget): 바뀐 뒤 값으로 다시 읽음
    slot['busy']=False;slot['error']=error
    if error is None:slot.update(data=data,at=time.time(),have=True)
@@ -466,6 +469,8 @@ class Launch(BaseModel):
  sam_object_mode:str='text'
  sam_object_bboxes:dict|None=None
  sam_object_points:dict|None=None
+ sam_hand_mode:str='text'  # 손 분할: text(텍스트 기준선+손 ROI) 또는 point_track(첫 프레임 포인트 → 손 추적, 텍스트 손 분할 생략)
+ sam_hand_points:dict|None=None
  target_fps:int=15  # 처리 fps: 15(기본 · 30fps 촬영에서 프레임을 하나 걸러 하나 사용) 또는 30(모든 프레임)
  prep:bool=False  # True: RAW 전처리만 하고 'SAM3 설정 대기'에서 멈춤(분할 대상은 나중에 입력)
 
@@ -584,6 +589,48 @@ def object_bboxes(value):
   result[cam]=[x,y,w,h]
  return result
 
+def hand_points(data):
+ """손 포인트 방식(선택): 물체 bbox/포인트 추적과 함께만. 형식은 물체 포인트와 같습니다(카메라 4대 모두, 포함 포인트 1개 이상)."""
+ if data.sam_hand_mode not in ('text','point_track'):raise HTTPException(400,'손 분할 방식을 확인하세요.')
+ if data.sam_hand_mode=='text':
+  if data.sam_hand_points:raise HTTPException(400,'손 포인트는 손 포인트 방식에서만 보냅니다.')
+  return None
+ if data.sam_object_mode not in ('bbox_track','point_track'):raise HTTPException(400,'손 포인트 방식은 물체 포인트(또는 bbox) 추적과 함께만 쓸 수 있습니다.')
+ try:return object_points(data.sam_hand_points)
+ except HTTPException as e:raise HTTPException(400,'손 포인트: '+str(e.detail).replace('포인트 물체 추적은','손 포인트 방식은').replace('물체를 클릭','손을 클릭')) from e
+
+# ---- 기본 분할 방식(이 PC 설정) ----
+# 실행 화면을 열었을 때 미리 선택되는 분할 방식. 이 PC의 UI DB에만 저장합니다(PC마다 따로). 실행할 때마다 바꿀 수 있습니다.
+SAM_MODES={'point_track':'물체 포인트 + 손 텍스트','point_track_hand':'물체 포인트 + 손 포인트','text':'텍스트만','bbox_track':'물체 bbox + 손 텍스트 (테스트)'}
+SAM_MODE_DEFAULT='point_track'
+
+def settings_db():
+ c=access.db()
+ c.execute('CREATE TABLE IF NOT EXISTS ui_settings (key TEXT PRIMARY KEY,value TEXT NOT NULL,by TEXT,at REAL)')
+ return c
+
+def sam_default_mode():
+ with settings_db() as c:r=c.execute("SELECT value,by,at FROM ui_settings WHERE key='sam_default_mode'").fetchone()
+ mode=r['value'] if r and r['value'] in SAM_MODES else SAM_MODE_DEFAULT
+ return {'mode':mode,'label':SAM_MODES[mode],'by':r['by'] if r else None,'at':r['at'] if r else None,'modes':SAM_MODES}
+
+@app.get('/api/sam-default')
+def get_sam_default(req:Request):
+ guard(req)
+ return sam_default_mode()
+
+class SamDefault(BaseModel):
+ mode:str
+
+@app.post('/api/sam-default')
+def set_sam_default(data:SamDefault,req:Request):
+ """이 PC의 기본 분할 방식을 바꿉니다(이 PC에 로그인한 작업자·관리자)."""
+ guard(req);u=access.user(req)
+ if data.mode not in SAM_MODES:raise HTTPException(400,'분할 방식을 확인하세요.')
+ with settings_db() as c:c.execute("INSERT OR REPLACE INTO ui_settings VALUES('sam_default_mode',?,?,?)",(data.mode,u.get('label') or u['name'],time.time()))
+ access.audit(req,'sam-default '+data.mode)
+ return sam_default_mode()
+
 def object_points(value):
  # 선택 옵션: 첫 프레임 포인트(카메라 1~4 → 0~3, [x,y,label] 정규화, label 1=포함 0=제외). Worker에서도 다시 검사합니다.
  if not isinstance(value,dict) or sorted(value)!=['0','1','2','3']:raise HTTPException(400,'포인트 물체 추적은 카메라 4대 모두 첫 프레임에서 물체를 클릭해야 합니다.')
@@ -684,6 +731,7 @@ def _launch(data,req,bypass_limit=False):
    if data.target_fps not in (15,30):raise HTTPException(400,'처리 fps는 15 또는 30만 선택할 수 있습니다.')
    bboxes=object_bboxes(data.sam_object_bboxes) if data.mode=='pipeline' and data.sam_object_mode=='bbox_track' else None
    points=object_points(data.sam_object_points) if data.mode=='pipeline' and data.sam_object_mode=='point_track' else None
+   hands=hand_points(data) if data.mode=='pipeline' else None
    # Validate against live server episode list; no arbitrary path input.
    captures=raw_worker_info(data.worker_id)['episodes']
    used_names.update(ep for ep in captures if ep!=data.episode_id)
@@ -704,6 +752,7 @@ def _launch(data,req,bypass_limit=False):
    elif data.mode=='pipeline':conf.update(sam_prompt=data.sam_prompt.strip(),sam_scene='2d',sam_settings_confirmed=True)
    if bboxes:conf.update(sam_object_mode='bbox_track',sam_object_bboxes=bboxes)
    if points:conf.update(sam_object_mode='point_track',sam_object_points=points)
+   if hands:conf.update(sam_hand_mode='point_track',sam_hand_points=hands)
   ensure_worker_pool(pc)
   local_api('PATCH',f'/api/v2/dags/{dag}',json={'is_paused':False})
   now=datetime.now(timezone.utc);run='ui_'+now.strftime('%Y%m%dT%H%M%S_')+secrets.token_hex(3)
@@ -2675,9 +2724,14 @@ def cont_db():
            'sam_prompt TEXT NOT NULL,points TEXT NOT NULL,defer_mano INTEGER NOT NULL DEFAULT 0,created REAL NOT NULL,state TEXT NOT NULL,'
            'run_id TEXT,dag_id TEXT,episode TEXT,error TEXT,started REAL)')
  # 처리 fps(15/30). 이 열이 생기기 전에 넣어 둔 대기 항목은 기본값 15로 실행됩니다.
- if 'target_fps' not in {r[1] for r in c.execute('PRAGMA table_info(sam_queue)')}:
+ columns={r[1] for r in c.execute('PRAGMA table_info(sam_queue)')}
+ if 'target_fps' not in columns:
   try:c.execute('ALTER TABLE sam_queue ADD COLUMN target_fps INTEGER NOT NULL DEFAULT 15')
   except sqlite3.OperationalError:pass   # 다른 스레드가 방금 추가함
+ # 손 포인트(JSON, 없으면 NULL = 손은 텍스트 방식).
+ if 'hand_points' not in columns:
+  try:c.execute('ALTER TABLE sam_queue ADD COLUMN hand_points TEXT')
+  except sqlite3.OperationalError:pass
  return c
 
 def my_distributed(view=False):
@@ -2745,6 +2799,7 @@ def cont_tick():
   try:
    res=_launch(Launch(mode='pipeline',worker_id=nxt['worker_id'],episode_id=ep,sam_prompt=nxt['sam_prompt'],confirmed=True,preview_episode=ep,
                       defer_mano=bool(nxt['defer_mano']),sam_object_mode='point_track',sam_object_points=json.loads(nxt['points']),
+                      **({'sam_hand_mode':'point_track','sam_hand_points':json.loads(nxt['hand_points'])} if nxt['hand_points'] else {}),
                       target_fps=nxt['target_fps']),
                internal_request(tok),bypass_limit=True)
   except HTTPException as e:
@@ -2817,6 +2872,7 @@ class ContSubmit(BaseModel):
  episode:str=Field(pattern=r'^ep_[A-Za-z0-9_]+$')
  sam_prompt:str=Field(min_length=1,max_length=200)
  points:dict
+ hand_points:dict|None=None  # 손 포인트 방식일 때만(없으면 손은 텍스트 방식)
  defer_mano:bool=False
  target_fps:int=15
 
@@ -2824,6 +2880,7 @@ class ContSubmit(BaseModel):
 def cont_submit(data:ContSubmit,req:Request):
  guard(req);u=access.user(req);wid=DEFAULT_WORKER;ep=data.episode
  points=object_points(data.points)
+ hands=hand_points(Launch(mode='pipeline',sam_object_mode='point_track',sam_hand_mode='point_track',sam_hand_points=data.hand_points)) if data.hand_points else None
  if data.target_fps not in (15,30):raise HTTPException(400,'처리 fps는 15 또는 30만 선택할 수 있습니다.')
  if data.defer_mano and wid!=DEFAULT_WORKER:raise HTTPException(400,'MANO 나중에 실행은 이 PC에서만 선택할 수 있습니다.')
  if access.owners().get(ep):raise HTTPException(409,'이미 실행을 시작한 RAW입니다.')
@@ -2835,8 +2892,8 @@ def cont_submit(data:ContSubmit,req:Request):
  with cont_db() as c:
   c.execute('BEGIN IMMEDIATE')
   if c.execute("SELECT 1 FROM sam_queue WHERE raw_episode=? AND state IN ('waiting','failed')",(ep,)).fetchone():raise HTTPException(409,'이미 연속 모드 대기열에 있는 RAW입니다.')
-  c.execute("INSERT INTO sam_queue(raw_episode,operator,worker_id,sam_prompt,points,defer_mano,created,state,target_fps) VALUES(?,?,?,?,?,?,?,'waiting',?)",
-            (ep,u['name'],wid,data.sam_prompt.strip(),json.dumps(points),int(data.defer_mano),time.time(),data.target_fps))
+  c.execute("INSERT INTO sam_queue(raw_episode,operator,worker_id,sam_prompt,points,defer_mano,created,state,target_fps,hand_points) VALUES(?,?,?,?,?,?,?,'waiting',?,?)",
+            (ep,u['name'],wid,data.sam_prompt.strip(),json.dumps(points),int(data.defer_mano),time.time(),data.target_fps,json.dumps(hands) if hands else None))
  access.audit(req,'continuous submit '+ep+' '+data.sam_prompt.strip())
  cont_kick()
  return {'ok':True}

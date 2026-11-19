@@ -61,7 +61,8 @@ def code_drift(cfg, pin):
     if env != pin.get('config_env_sha256'):
         new['config_env_sha256'] = env; names.append('config.env')
     sam = dict(pin.get('sam_request') or {})
-    for key, path in (('object_tracker_sha256', rt.OBJECT_TRACKER), ('object_point_tracker_sha256', rt.OBJECT_POINT_TRACKER)):
+    for key, path in (('object_tracker_sha256', rt.OBJECT_TRACKER), ('object_point_tracker_sha256', rt.OBJECT_POINT_TRACKER),
+                      ('hand_point_tracker_sha256', rt.HAND_POINT_TRACKER)):
         if key in sam and sam[key] != rt.digest(path):
             sam[key] = rt.digest(path); new['sam_request'] = sam; names.append(path.name)
     return new, names

@@ -191,6 +191,8 @@ OBJECT_TRACKER = Path(__file__).resolve().with_name('sam_object_track.py')
 # point_track 전용. sam_object_track.py(진행 중 bbox 실행의 체크섬 고정 대상)는 그대로 두고 별도 파일로 둡니다.
 OBJECT_POINT_TRACKER = Path(__file__).resolve().with_name('sam_object_point_track.py')
 OBJECT_MULTI = Path(__file__).resolve().with_name('sam_object_multi.py')
+# 손 포인트 방식(선택 옵션): 텍스트 기준선·손 ROI 대신 첫 프레임 포인트에서 손을 추적합니다. 물체 bbox/포인트 추적과 함께만 씁니다.
+HAND_POINT_TRACKER = Path(__file__).resolve().with_name('sam_hand_point_track.py')
 
 
 def parse_object_points(value):
@@ -365,7 +367,7 @@ def object_bbox_track(scripts, project, episode, prompt, bboxes, gpu_uuid, point
     marker = '<!-- point_object_track -->' if points else '<!-- bbox_object_track -->'
     # 손만 계산한 기준선은 sam3_fast가 페이지 위에 따로 안내합니다.
     baseline_note = ('' if (dest / '_resume/baseline_groups.json').is_file()
-                     and set(read(dest / '_resume/baseline_groups.json').values()) == {'controller'}
+                     and all(v == 'controller' or str(v).startswith('points:') for v in read(dest / '_resume/baseline_groups.json').values())
                      else '왼쪽 기준선은 기존 텍스트 방식입니다. ')
     text = index.read_text()
     if points and marker not in text:
@@ -429,7 +431,7 @@ def resume_review_identity(pinned, identity, stage):
         value = dict(value)
         value.pop('code', None)
         request = dict(value.get('sam_request', {}))
-        for key in ('object_tracker_sha256', 'object_point_tracker_sha256'):
+        for key in ('object_tracker_sha256', 'object_point_tracker_sha256', 'hand_point_tracker_sha256'):
             request.pop(key, None)
         value['sam_request'] = request
         return value
@@ -445,7 +447,7 @@ def resume_review_identity(pinned, identity, stage):
 
 def execute(stage, episode, run_id, config_path, sam_prompt='', sam_scene='2d', sam_confirmed=False, raw_episode=None,
             object_mode='text', object_bboxes=None, object_points=None, result_pc=None,
-            transfer_from=None, transfer_key=None, target_fps=30, defer_work_sync=False):
+            transfer_from=None, transfer_key=None, target_fps=30, defer_work_sync=False, hand_points=None):
     # 처리 fps: 30(모든 프레임, 이 옵션이 생기기 전 실행과 같음) 또는 15(동기화된 프레임을 하나 걸러 하나 사용).
     if target_fps not in (15, 30):
         raise ValueError('Unsupported target fps')
@@ -463,6 +465,12 @@ def execute(stage, episode, run_id, config_path, sam_prompt='', sam_scene='2d', 
         raise ValueError('bbox is only used with object mode bbox_track')
     if object_mode != 'point_track' and object_points:
         raise ValueError('points are only used with object mode point_track')
+    if hand_points and object_mode == 'text':
+        raise ValueError('hand points need object mode bbox_track or point_track')
+    try:
+        hands = parse_object_points(hand_points) if hand_points else None
+    except ValueError as e:
+        raise ValueError('손 ' + str(e).replace('포인트 물체 추적은', '포인트 추적은')) from e
     if raw_episode is not None and (not re.fullmatch(r'ep_[A-Za-z0-9_]+', raw_episode) or not re.fullmatch(re.escape(raw_episode)+r'_[1-9][0-9]*',episode)):
         raise ValueError('Invalid RAW/output episode mapping')
     if not re.fullmatch(r'ep_[A-Za-z0-9_]+', episode):
@@ -491,6 +499,12 @@ def execute(stage, episode, run_id, config_path, sam_prompt='', sam_scene='2d', 
     elif object_mode == 'point_track':
         # 포인트 추적은 sam_object_track.py의 공통 함수도 가져다 쓰므로 두 파일 모두 고정합니다.
         identity['sam_request'].update(object_mode=object_mode, object_points=points,
+                                       object_tracker_sha256=digest(OBJECT_TRACKER),
+                                       object_point_tracker_sha256=digest(OBJECT_POINT_TRACKER))
+    if hands:
+        # 손 포인트 방식일 때만 키를 더합니다(다른 실행의 고정 내용은 그대로). 손 추적기는 물체 추적기 두 파일의 공통 함수도 씁니다.
+        identity['sam_request'].update(hand_mode='point_track', hand_points=hands,
+                                       hand_point_tracker_sha256=digest(HAND_POINT_TRACKER),
                                        object_tracker_sha256=digest(OBJECT_TRACKER),
                                        object_point_tracker_sha256=digest(OBJECT_POINT_TRACKER))
     if raw_episode:
@@ -569,8 +583,13 @@ def execute(stage, episode, run_id, config_path, sam_prompt='', sam_scene='2d', 
             park_object_tracks(scripts, project, episode)
         # 원본 05_sam3.py는 프로젝트 전체 잠금을 잡아 다른 에피소드의 SAM3·검수를 막으므로,
         # 같은 pipeline.sam3()를 에피소드 단위 잠금으로 실행합니다(동시 실행 2개 지원).
+        hand_file = receipt / 'hand_points.json'
+        if hands:
+            hand_file.write_text(json.dumps(hands))
         subprocess.run([python, str(Path(__file__).with_name('sam3_episode.py')), str(scripts), str(prepared), str(project),
                         *(['--new-attempt'] if changed else []),
+                        # 손 포인트 방식: 텍스트 기준선·손 ROI 대신 첫 프레임 포인트에서 손을 추적합니다.
+                        *(['--hand-points', str(hand_file)] if hands else []),
                         # bbox/포인트 모드는 물체를 추적기로 따로 계산하므로 기준선에서는 손만 계산합니다.
                         *(['--object-tracked'] if bboxes or points else [])], env=env, cwd=scripts, check=True)
         if bboxes or points:
@@ -651,13 +670,14 @@ if __name__ == '__main__':
     p.add_argument('--object-mode', choices=OBJECT_MODES, default='text')
     p.add_argument('--object-bboxes', default=None, help='JSON {"0".."3": [x,y,w,h]} normalized')
     p.add_argument('--object-points', default=None, help='JSON {"0".."3": [[x,y,label],...]} normalized')
+    p.add_argument('--hand-points', default=None, help='손 포인트 방식: JSON {"0".."3": [[x,y,label],...]} normalized')
     p.add_argument('--fps', type=int, choices=[15, 30], default=30, help='처리 fps (30fps 촬영을 15fps로 줄여 처리)')
     p.add_argument('--defer-work-sync', action='store_true',
                    help='publish: 작업 폴더 NAS 미러링을 하지 않고 끝냄(Worker가 백그라운드 업로드로 이어서 함)')
     a = p.parse_args()
     result = execute(a.stage, a.episode, a.run_id, a.config, a.sam_prompt, a.sam_scene, a.sam_confirmed, a.raw_episode,
                      a.object_mode, a.object_bboxes, a.object_points, a.result_pc, a.transfer_from, a.transfer_key, a.fps,
-                     a.defer_work_sync)
+                     a.defer_work_sync, a.hand_points)
     print(json.dumps(result))
     if result is False:
         sys.exit(75)

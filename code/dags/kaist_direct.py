@@ -27,7 +27,10 @@ for worker_id,mode,dag_id in dag_entries():
                       # point_track: 첫 프레임 포인트(포함/제외)+텍스트 단일 물체 추적(테스트 옵션)
                       sam_object_mode=Param('text',enum=['text','bbox_track','point_track']),
                       sam_object_bboxes=Param(None,type=['null','object']),
-                      sam_object_points=Param(None,type=['null','object']))
+                      sam_object_points=Param(None,type=['null','object']),
+                      # 손 분할 방식. text: 텍스트 기준선+손 ROI(기존) / point_track: 첫 프레임 포인트 → 손 추적(텍스트 손 분할 생략)
+                      sam_hand_mode=Param('text',enum=['text','point_track']),
+                      sam_hand_points=Param(None,type=['null','object']))
     with DAG(dag_id,schedule=None,catchup=False,start_date=datetime(2026,1,1,tzinfo=timezone.utc),
              max_active_runs=MAX_OPEN_RUNS,max_active_tasks=POOL_SLOTS,is_paused_upon_creation=True,
              params=params,tags=['kaist',worker_id,'연결됨' if pc['enabled'] else '미연결'],

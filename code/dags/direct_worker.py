@@ -40,6 +40,9 @@ def request_for(stage,run_id,params):
   req.update(sam_object_mode='point_track',sam_object_points=params.get('sam_object_points'))
  elif params.get('sam_object_mode','text')!='text':
   req.update(sam_object_mode=params['sam_object_mode'],sam_object_bboxes=params.get('sam_object_bboxes'))
+ # 손 포인트 방식(선택): 물체 bbox/포인트 추적과 함께일 때만 키를 넣습니다. 없으면 작업 요청이 그대로입니다.
+ if params.get('sam_hand_mode','text')=='point_track' and 'sam_object_mode' in req:
+  req.update(sam_hand_mode='point_track',sam_hand_points=params.get('sam_hand_points'))
  return req
 
 POKE_WAIT_SECONDS=8  # 한 번 확인할 때 짧은 작업의 완료를 기다리는 최대 시간

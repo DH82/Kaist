@@ -2,6 +2,10 @@
 // 작업자: 분배·배정받은 RAW를 하나씩 띄워 카메라 1~4 첫 프레임에 포인트(카메라당 최대 20개)와 분할 대상을 넣고 '완료'하면
 // 대기열에 쌓이고 바로 다음 RAW가 나옵니다. 대기열은 서버가 완료한 순서대로 하나씩(앞 RAW 전처리~SAM3가 끝나면 다음) 실행합니다.
 // 관리자: PC 현황 화면에서 남은 RAW를 고른 PC(작업자)들에 균등 분배·회수합니다.
+// 손 포인트: 이 PC 기본 분할 방식이 '물체 포인트 + 손 포인트'일 때만 함께 찍습니다(contHandOn). 찍는 대상은 버튼이나 H 키로 바꿉니다.
+let contHand={},contTarget='object';
+function contHandOn(){return typeof samDefault!=='undefined'&&!!samDefault&&samDefault.mode==='point_track_hand'}
+function contHandReady(c){return (contHand[c]||[]).some(p=>p[2]===1)}
 let contDeferInit=false,contData=null,contEp='',contPoints={},contHistory=[],contLoaded=new Set(),contGen=0,contBusy=false,contSubmitting=false;
 const contSkipped=[];  // 이번 화면에서 '건너뛰기'한 RAW(목록 뒤로)
 const CONT_MAX_POINTS=20;
@@ -10,23 +14,35 @@ function contTodo(){
  return list.filter(e=>!contSkipped.includes(e)).concat(contSkipped.filter(e=>list.includes(e)));
 }
 function contObject(ep){const t=(contData&&contData.todo||[]).find(x=>x.episode===ep);return t?t.object:null}
-function contReady(){return contEp&&contLoaded.size===4&&[1,2,3,4].every(c=>(contPoints[c]||[]).some(p=>p[2]===1))&&$('contPrompt').value.trim()}
+function contReady(){return contEp&&contLoaded.size===4&&[1,2,3,4].every(c=>(contPoints[c]||[]).some(p=>p[2]===1)&&(!contHandOn()||contHandReady(c)))&&$('contPrompt').value.trim()}
 function contStatus(text){$('contPickStatus').textContent=text||''}
 function contButtons(){
  $('contDone').disabled=contSubmitting||!contReady();$('contUndo').disabled=!contHistory.length;
  const done=[1,2,3,4].filter(c=>(contPoints[c]||[]).some(p=>p[2]===1)).length;
  if(!contEp)return;
- contStatus(contLoaded.size<4?'첫 프레임 사진을 불러오는 중…':done<4?'포인트 '+done+'/4 · 카메라마다 물체 위를 한 번 이상 클릭하세요.':!$('contPrompt').value.trim()?'분할 대상(텍스트)을 입력하세요.':'준비 완료 · "완료 · 다음"을 누르면 대기열에 넣고 다음 RAW로 넘어갑니다.');
+ const hand=contHandOn(),handDone=[1,2,3,4].filter(contHandReady).length;
+ contStatus(contLoaded.size<4?'첫 프레임 사진을 불러오는 중…':hand&&(done<4||handDone<4)?'물체 '+done+'/4 · 손 '+handDone+'/4 · 카메라마다 물체와 손을 각각 클릭하세요. 지금 찍는 대상: '+(contTarget==='hand'?'손':'물체')+' (H 키로 전환)':done<4?'포인트 '+done+'/4 · 카메라마다 물체 위를 한 번 이상 클릭하세요.':!$('contPrompt').value.trim()?'분할 대상(텍스트)을 입력하세요.':'준비 완료 · "완료 · 다음"을 누르면 대기열에 넣고 다음 RAW로 넘어갑니다.');
 }
-function contLabel(c){const pts=contPoints[c]||[],pos=pts.filter(p=>p[2]===1).length;return pts.length?'<b>포함 '+pos+' · 제외 '+(pts.length-pos)+'</b> <button type="button" class="linkbtn" data-cont-clear="'+c+'">지우기</button>':'포인트 없음'}
+function contLabel(c){
+ const pts=contPoints[c]||[],hands=contHand[c]||[],count=a=>{const pos=a.filter(p=>p[2]===1).length;return '포함 '+pos+' · 제외 '+(a.length-pos)},clear=' <button type="button" class="linkbtn" data-cont-clear="'+c+'">지우기</button>';
+ if(!contHandOn())return pts.length?'<b>'+count(pts)+'</b>'+clear:'포인트 없음';
+ return '물체 '+(pts.length?'<b>'+count(pts)+'</b>':'없음')+' · 손 '+(hands.length?'<b>'+count(hands)+'</b>':'없음')+(pts.length||hands.length?clear:'');
+}
+function contSetTarget(target){
+ contTarget=target==='hand'&&contHandOn()?'hand':'object';
+ for(const b of $('contTarget').querySelectorAll('[data-cont-target]')){const on=b.dataset.contTarget===contTarget;b.classList.toggle('current',on);b.setAttribute('aria-pressed',on)}
+ contButtons();
+}
+// 기본 분할 방식이 바뀌면(실행 화면의 '기본값으로 저장') 손 포인트 찍기를 켜거나 끕니다.
+function contHandView(){$('contTarget').hidden=!contHandOn();if(!contHandOn())contHand={};contSetTarget(contTarget);[1,2,3,4].forEach(contPaint)}
 function contPaint(c){
  const canvas=$('contImages').querySelector('canvas[data-cam="'+c+'"]');if(!canvas)return;
- paintBox(canvas,null,contPoints[c]||[]);
+ paintBox(canvas,null,contPoints[c]||[],contHandOn()?contHand[c]||[]:null);
  const label=$('contImages').querySelector('[data-cont-label="'+c+'"]');if(label)label.innerHTML=contLabel(c);
 }
 function contPrefetch(ep){if(!ep)return;for(const cam of [1,2,3,4]){const i=new Image();i.src=outputUrl('preview',{episode:ep,cam,position:0})}}
 async function contShow(ep){
- contEp=ep||'';contPoints={};contHistory=[];contLoaded=new Set();const gen=++contGen;
+ contEp=ep||'';contPoints={};contHand={};contHistory=[];contLoaded=new Set();const gen=++contGen;contSetTarget('object');
  const todo=contTodo();
  $('contPicker').hidden=!contEp;$('contEmpty').hidden=!!contEp;
  if(!contEp){contStatus('');contButtons();return}
@@ -44,20 +60,26 @@ async function contShow(ep){
   canvas.oncontextmenu=e=>e.preventDefault();canvas.style.cursor='copy';
   canvas.onpointerdown=e=>{
    if(!contLoaded.has(cam)||(e.button!==0&&e.button!==2))return;e.preventDefault();
-   const pts=contPoints[cam]||(contPoints[cam]=[]),neg=e.button===2||e.shiftKey;
-   if(neg&&!pts.some(p=>p[2]===1)){contStatus('카메라 '+cam+': 먼저 물체 위를 왼쪽 클릭해 포함 포인트를 찍으세요.');return}
-   if(pts.length>=CONT_MAX_POINTS){contStatus('카메라 '+cam+': 포인트는 '+CONT_MAX_POINTS+'개까지입니다.');return}
+   const onHand=contHandOn()&&contTarget==='hand',store=onHand?contHand:contPoints,what=onHand?'손':'물체';
+   const pts=store[cam]||(store[cam]=[]),neg=e.button===2||e.shiftKey;
+   if(neg&&!pts.some(p=>p[2]===1)){contStatus('카메라 '+cam+': 먼저 '+what+' 위를 왼쪽 클릭해 포함 포인트를 찍으세요.');return}
+   if(pts.length>=CONT_MAX_POINTS){contStatus('카메라 '+cam+': '+what+' 포인트는 '+CONT_MAX_POINTS+'개까지입니다.');return}
    const r=canvas.getBoundingClientRect();
    pts.push([Math.min(1,Math.max(0,(e.clientX-r.left)/r.width)),Math.min(1,Math.max(0,(e.clientY-r.top)/r.height)),neg?0:1]);
-   contHistory.push(cam);contPaint(cam);contButtons();
+   contHistory.push([cam,onHand]);contPaint(cam);contButtons();
   };
   img.src=outputUrl('preview',{episode:contEp,cam,position:0});
  }
  contPrefetch(todo[idx+1]);contButtons();
 }
-$('contImages').addEventListener('click',e=>{const b=e.target.closest('[data-cont-clear]');if(!b)return;const c=+b.dataset.contClear;contPoints[c]=[];contHistory=contHistory.filter(x=>x!==c);contPaint(c);contButtons()});
-$('contUndo').onclick=()=>{const c=contHistory.pop();if(c==null)return;(contPoints[c]||[]).pop();contPaint(c);contButtons()};
-$('contClearAll').onclick=()=>{contPoints={};contHistory=[];[1,2,3,4].forEach(contPaint);contButtons()};
+$('contImages').addEventListener('click',e=>{const b=e.target.closest('[data-cont-clear]');if(!b)return;const c=+b.dataset.contClear;contPoints[c]=[];contHand[c]=[];contHistory=contHistory.filter(x=>x[0]!==c);contPaint(c);contButtons()});
+$('contTarget').addEventListener('click',e=>{const b=e.target.closest('[data-cont-target]');if(b)contSetTarget(b.dataset.contTarget)});
+document.addEventListener('keydown',e=>{
+ if(e.key.toLowerCase()!=='h'||e.ctrlKey||e.metaKey||e.altKey||/^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName))return;
+ if(page==='run'&&contHandOn()&&contEp&&!$('contPicker').hidden)contSetTarget(contTarget==='hand'?'object':'hand');
+});
+$('contUndo').onclick=()=>{const last=contHistory.pop();if(!last)return;const [c,onHand]=last;((onHand?contHand:contPoints)[c]||[]).pop();contPaint(c);contButtons()};
+$('contClearAll').onclick=()=>{contPoints={};contHand={};contHistory=[];[1,2,3,4].forEach(contPaint);contButtons()};
 $('contPrompt').oninput=contButtons;
 $('contSkip').onclick=()=>{
  if(!contEp)return;const i=contSkipped.indexOf(contEp);if(i>=0)contSkipped.splice(i,1);contSkipped.push(contEp);
@@ -65,9 +87,10 @@ $('contSkip').onclick=()=>{
 };
 $('contDone').onclick=async()=>{
  if(!contReady()||contSubmitting)return;contSubmitting=true;contButtons();
- const ep=contEp,points={};for(const c of [1,2,3,4])points[String(c-1)]=contPoints[c].map(([x,y,l])=>[Math.round(x*10000)/10000,Math.round(y*10000)/10000,l]);
+ const round=a=>a.map(([x,y,l])=>[Math.round(x*10000)/10000,Math.round(y*10000)/10000,l]);
+ const ep=contEp,points={},hands=contHandOn()?{}:null;for(const c of [1,2,3,4]){points[String(c-1)]=round(contPoints[c]);if(hands)hands[String(c-1)]=round(contHand[c])}
  try{
-  await api('/api/continuous/submit',{method:'POST',body:JSON.stringify({episode:ep,sam_prompt:$('contPrompt').value.trim(),points,defer_mano:!$('contDeferBox').hidden&&$('contDefer').checked,target_fps:targetFps()})});
+  await api('/api/continuous/submit',{method:'POST',body:JSON.stringify({episode:ep,sam_prompt:$('contPrompt').value.trim(),points,hand_points:hands,defer_mano:!$('contDeferBox').hidden&&$('contDefer').checked,target_fps:targetFps()})});
   const i=contSkipped.indexOf(ep);if(i>=0)contSkipped.splice(i,1);
   if(contData)contData.todo=contData.todo.filter(t=>t.episode!==ep);
   notice(ep+' · 연속 모드 대기열에 넣었습니다. 순서대로 RAW 전처리 → SAM3를 실행합니다.');
