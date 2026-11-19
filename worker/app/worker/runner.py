@@ -100,11 +100,18 @@ def run(p):
   # GPU 슬롯(기본 2개) 중 빈 곳을 기다렸다가 잡습니다. 3번째 작업부터는 queued로 대기합니다.
   # GPU를 쓰지 않는 단계(NO_GPU_STAGES)는 슬롯 없이 바로 실행합니다(gpu_slot=None).
   import contextlib
+  # SAM3는 RTX 4090에서 한 번에 1개만 실행합니다(gpu_slots.acquire_sam). 순서를 GPU 슬롯보다 먼저 잡으므로
+  # 기다리는 SAM3가 슬롯을 차지하지 않고, 다른 단계는 남은 슬롯에서 SAM3와 함께 실행됩니다.
+  sam_lock=None
   if req['stage'] in NO_GPU_STAGES:lock,slot=None,None
   else:
-   from gpu_slots import acquire
+   from gpu_slots import acquire,acquire_sam
+   if req['stage']=='sam3':
+    try:uuid=json.loads(CONFIG.read_text()).get('gpu_uuid')
+    except (OSError,ValueError):uuid=None
+    sam_lock=acquire_sam(ROOT/'gpu_4090_a.lock',uuid,waiting=lambda:print('다른 SAM3 작업이 끝나기를 기다립니다(이 GPU는 SAM3를 한 번에 1개만 실행).',flush=True))
    lock,slot=acquire(ROOT/'gpu_4090_a.lock')
-  with lock or contextlib.nullcontext():
+  with sam_lock or contextlib.nullcontext(),lock or contextlib.nullcontext():
    write(p/'status.json',{**initial,'state':'running','started':time.time(),'pid':os.getpid(),'gpu_slot':slot})
    cmd=['/usr/bin/python3',str(ADAPTER),req['stage'],req['episode'],req['run_id'],'--config',str(CONFIG),'--sam-prompt',req.get('sam_prompt',''),'--sam-scene',req.get('sam_scene','2d')]
    if req.get('raw_episode'):cmd.extend(['--raw-episode',req['raw_episode']])
@@ -121,7 +128,7 @@ def run(p):
    sys.path.insert(0,str(ADAPTER.parent))
    from pipeline_progress import parse
    env=os.environ.copy();env['PYTHONUNBUFFERED']='1'
-   with subprocess.Popen(cmd,pass_fds=(lock.fileno(),) if lock else (),env=env,stdout=subprocess.PIPE,
+   with subprocess.Popen(cmd,pass_fds=tuple(f.fileno() for f in (lock,sam_lock) if f),env=env,stdout=subprocess.PIPE,
                          stderr=subprocess.STDOUT,text=True,errors='replace',bufsize=1) as proc:
     last_update=0;previous=None
     for line in proc.stdout:
