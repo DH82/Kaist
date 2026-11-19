@@ -23,6 +23,13 @@ code{background:#e9e9f6;border-radius:4px;padding:1px 5px;font-size:.92em}
 blockquote{margin:14px 0;padding:10px 14px;border-left:4px solid #6753d9;background:#efedfb;border-radius:0 8px 8px 0}
 blockquote p{margin:0}hr{border:0;border-top:1px solid #dfe1ee;margin:36px 0}
 li{margin:3px 0}a{color:#5a45cf}
+h2{scroll-margin-top:12px}
+/* 목차: 넓은 화면에서는 왼쪽에 고정, 좁은 화면에서는 문서 위에 */
+.toc{background:#fff;border:1px solid #dfe1ee;border-radius:10px;padding:12px 14px;margin:0 0 20px;font-size:14px}
+.toc b{display:block;margin-bottom:6px;color:#6a6d85;font-size:13px}.toc a{display:block;padding:3px 6px;border-radius:6px;text-decoration:none;color:#3d3f58}
+.toc a:hover{background:#efedfb;color:#5a45cf}
+@media(min-width:1280px){.toc{position:fixed;top:24px;left:max(16px,calc(50vw - 460px - 250px));width:220px;max-height:calc(100vh - 48px);overflow:auto;margin:0}main{margin-left:max(260px,calc(50vw - 460px))}}
+@media print{.toc{display:none}}
 """
 
 
@@ -101,8 +108,16 @@ def page():
     body = render((d / 'README.md').read_text(encoding='utf-8'))
     # 그림 주소(img/…)를 UI 경로로 바꿉니다.
     body = body.replace('src="img/', 'src="/guide/img/')
+    # 목차: 큰 제목(##)마다 이동 링크를 만듭니다.
+    titles = []
+
+    def _anchor(m):
+        titles.append(m[1])
+        return f'<h2 id="s{len(titles)}">{m[1]}</h2>'
+    body = re.sub(r'<h2>(.*?)</h2>', _anchor, body)
+    toc = '<nav class="toc" aria-label="목차"><b>목차</b>' + ''.join(f'<a href="#s{n}">{t}</a>' for n, t in enumerate(titles, 1)) + '</nav>'
     return ('<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
-            f'<title>작업자 가이드</title><style>{CSS}</style></head><body><main>{body}</main></body></html>')
+            f'<title>작업자 가이드</title><style>{CSS}</style></head><body>{toc}<main>{body}</main></body></html>')
 
 
 def image(name):

@@ -65,7 +65,7 @@ async function loadHcQueue(){
 async function openReview(episode,stage='mask'){
  if(page!=='review')hcReturnPage=page;
  else if(!$('hcQueuePanel').classList.contains('hidden'))hcReturnPage='review';
- $('hcBack').textContent=hcReturnPage==='review'?'← 검수 목록':hcReturnPage==='jobs'?(currentUser.role==='admin'?'← 전체 작업 현황':'← 내 작업 현황'):'← 이전 화면';
+ $('hcList').hidden=hcReturnPage==='review';$('hcBack').textContent=hcReturnPage==='review'?'← 검수 목록':hcReturnPage==='jobs'?(currentUser.role==='admin'?'← 전체 작업 현황':'← 내 작업 현황'):'← 이전 화면';
  const generation=++hcLoadGeneration;hcStop();hcFrameLoading=false;hcMeta=null;hcStage=stage;hcEpoch++;$('hcQueuePanel').classList.add('hidden');$('hcWorkspace').classList.remove('hidden');show('review');rememberPage('review/'+encodeURIComponent(episode)+'/'+stage);$('hcMedia').classList.add('hidden');$('hcDecision').classList.add('hidden');$('hcResult').textContent='';$('hcSpotNav')?.remove();hcFollowStop();$('hcNote').value='';
  $('hcState').textContent='검수 대상 확인 중';$('hcState').className='badge';$('hcEpisode').textContent=episode;$('hcTitle').textContent=stage==='mask'?'마스크 HC 검수':'추적 HC 검수';hcStatus('검수 대상과 최신 승인 상태를 확인하는 중…');
  try{

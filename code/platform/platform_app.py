@@ -923,7 +923,7 @@ def launch_mano(data:ManoSelection,req:Request):
    run=local_api('GET',f'/api/v2/dags/{mano_dag(run_id)}/dagRuns/'+quote(run_id,safe=''))
    conf=run['conf']
    access.require(req,conf['episode_id'])
-   if run['state']!='success' or not mano_progress(run,history)[1]:
+   if run['state']!='success' or not mano_progress(run,history,fresh=True)[1]:
     raise HTTPException(409,'추적 검수까지 끝나 3D 복원 대기(또는 MANO 대기) 중인 실행만 선택하세요.')
    sources.append({'run_id':run_id,'conf':conf})
   for source in sources:
@@ -952,6 +952,7 @@ def finished_tasks(dag,run_id,state,end_date,refresh_window):
  # Clearing/retrying a run changes state; also bound the lifetime of terminal snapshots.
  return run_tasks(dag,run_id)
 
+JOB_LIST_LIMIT=100   # 작업 현황에 보이는 DAG별 최근 실행 수(하루 40개 안팎 → 이틀 치 이상)
 @app.get('/api/jobs')
 def jobs(req:Request):
  guard(req);out=[]
@@ -967,7 +968,7 @@ def jobs(req:Request):
  history=None;deferred=deferred_runs()
  entries=active_dags()+([(DEFAULT_WORKER,'test',DIRECT_DAGS['test'])] if 'test' in DIRECT_DAGS else [])
  for wid,mode,dag in entries:
-  d=local_api('GET',f'/api/v2/dags/{dag}/dagRuns',params={'limit':12,'order_by':'-logical_date'})
+  d=local_api('GET',f'/api/v2/dags/{dag}/dagRuns',params={'limit':JOB_LIST_LIMIT,'order_by':'-logical_date'})
   for r in d['dag_runs']:
    if user['role']!='admin' and owners.get(r.get('conf',{}).get('episode_id',''))!=user['name']:continue
    item={'dag_id':dag,'run_id':r['dag_run_id'],'state':r['state'],'start':r.get('start_date') or r.get('queued_at'),'mode':mode,'episode':r.get('conf',{}).get('episode_id','GPU 연결 테스트')}
@@ -1268,6 +1269,11 @@ def review_script(req:Request):
  guard(req)
  return FileResponse(Path(__file__).parent/'reviews.js',media_type='application/javascript',headers={'Cache-Control':'no-store'})
 
+
+@app.get('/assets/uploads.js')
+def uploads_script(req:Request):
+ guard(req)
+ return FileResponse(Path(__file__).parent/'uploads.js',media_type='application/javascript',headers={'Cache-Control':'no-store'})
 
 @app.get('/assets/episode-actions.js')
 def episode_actions_script(req:Request):
@@ -1851,6 +1857,121 @@ def upload_status(req:Request,episode:str):
  access.require(req,episode)
  return worker_action('sync-status',{'episode':episode},access.execution_worker(episode))
 
+# ---- NAS 업로드 현황(작업 현황 화면 'NAS 업로드' · 사이드바): 이 PC Worker의 업로드 기록 jobs/_nas_sync/<ep>/{status.json,sync.log} ----
+# 업로드는 한 번에 하나씩이라(runner.sync_run의 upload.lock) 기록이 running이어도 대부분은 순서 대기입니다 → 로그로 구분합니다.
+# 진행률 = NAS work/<pc>에 올라간 크기 / 로컬 작업 폴더 크기(파일 크기 합). 속도는 최근 2분의 증가량.
+UPLOAD_DONE_HOURS=24      # 끝난 업로드를 목록에 남겨 두는 시간
+UPLOAD_FAILED_DAYS=3
+UPLOAD_NAS_SCAN=20        # 올리는 중인 에피소드의 NAS 크기를 다시 재는 간격(초)
+UPLOAD_LOCAL_SCAN=600     # 로컬 작업 폴더 크기를 다시 재는 간격(초)
+_upload_lock=threading.Lock()
+_upload_local={}          # episode → (잰 시각, 바이트)
+_upload_nas={}            # episode → [(시각, 바이트), …] 최근 표본
+
+def _tree_bytes(path):
+ total=0;stack=[str(path)]
+ while stack:
+  try:
+   with os.scandir(stack.pop()) as it:
+    for e in it:
+     try:
+      if e.is_symlink():continue
+      if e.is_dir(follow_symlinks=False):stack.append(e.path)
+      else:total+=e.stat(follow_symlinks=False).st_size
+     except OSError:continue
+  except OSError:continue
+ return total
+
+def _episode_bytes(root,ep):
+ """작업 폴더 root 아래 이 에피소드의 폴더들(<단계>/<ep>, <단계>/<상태>/<ep>) 크기 합. sync_work가 올리는 범위와 같습니다."""
+ root=Path(root);total=0
+ for pattern in ('*/'+ep,'*/*/'+ep):
+  try:dirs=[d for d in root.glob(pattern) if d.is_dir() and not d.is_symlink()]
+  except OSError:dirs=[]
+  total+=sum(_tree_bytes(d) for d in dirs)
+ return total
+
+def _upload_local_bytes(ep):
+ now=time.monotonic();hit=_upload_local.get(ep)
+ if hit and now-hit[0]<UPLOAD_LOCAL_SCAN:return hit[1]
+ size=_episode_bytes(WORK_DIR,ep) if WORK_DIR else 0
+ _upload_local[ep]=(now,size);return size
+
+def _upload_nas_progress(ep):
+ """(NAS에 올라간 바이트, 초당 바이트 또는 None). NAS는 UPLOAD_NAS_SCAN초에 한 번만 잽니다."""
+ now=time.monotonic();samples=_upload_nas.setdefault(ep,[])
+ if not samples or now-samples[-1][0]>=UPLOAD_NAS_SCAN:
+  samples.append((now,_episode_bytes(Path(os.environ.get('NAS_MOUNT','/mnt/kaist-data'))/'work'/fleet.PC_ID,ep)))
+  while len(samples)>2 and now-samples[1][0]>=120:samples.pop(0)
+ (t0,b0),(t1,b1)=samples[0],samples[-1]
+ return b1,((b1-b0)/(t1-t0) if t1-t0>=UPLOAD_NAS_SCAN*0.9 and b1>=b0 else None)
+
+def _upload_log_state(d):
+ """sync.log의 마지막 시도 기록 → (올리는 중인지, 차례가 온 시각 문구, 속도 제한 문구)."""
+ try:
+  with (d/'sync.log').open('rb') as f:
+   f.seek(max(0,(d/'sync.log').stat().st_size-6000));text=f.read().decode('utf-8','replace')
+ except OSError:return False,None,None
+ last=text.rsplit('NAS 업로드 시작:',1)[-1]
+ waiting='기다립니다' in last and '업로드 차례:' not in last
+ turn=next((l.rsplit(' ',2)[-2]+' '+l.rsplit(' ',2)[-1] for l in reversed(last.splitlines()) if l.startswith('업로드 차례:')),None)
+ limit=next((l.split(' (설정',1)[0].replace('업로드 ','',1) for l in reversed(last.splitlines()) if l.startswith('업로드 속도 제한') or l.startswith('업로드 시간대')),None)
+ if limit and '→' in limit:limit=limit.rsplit('→',1)[-1].strip()
+ return not waiting,turn,limit
+
+@app.get('/api/uploads')
+def uploads(req:Request):
+ guard(req);user=access.user(req)
+ root=worker_jobs_dir()
+ sync=root/'_nas_sync' if root else None
+ if not sync or not sync.is_dir():return {'available':False,'items':[],'summary':{}}
+ owners=access.owners();now=time.time();items=[]
+ native=not os.environ.get('KAIST_WORKER_JOBS_DIR')   # 컨테이너에서는 Worker 프로세스가 보이지 않아 생존 확인을 하지 않습니다
+ with _upload_lock:
+  try:dirs=sorted(d for d in sync.iterdir() if d.is_dir())
+  except OSError:dirs=[]
+  for d in dirs:
+   try:
+    mtime=(d/'status.json').stat().st_mtime
+    if now-mtime>UPLOAD_FAILED_DAYS*86400:continue
+    st=json.loads((d/'status.json').read_text())
+   except (OSError,ValueError):continue
+   ep=st.get('episode') or d.name
+   if user['role']!='admin' and owners.get(ep)!=user['name']:continue
+   item={'episode':ep,'operator':owners.get(ep) or '—','started':st.get('started'),'auto':bool(st.get('auto')),'tries':st.get('tries',1)}
+   if st.get('state')=='running':
+    alive=True
+    if native and now-(st.get('started') or 0)>20:
+     try:alive=b'sync-run' in (Path('/proc')/str(st.get('pid'))/'cmdline').read_bytes()
+     except OSError:alive=False
+    if not alive:
+     item.update(state='failed',error='업로드 프로세스가 중단되었습니다. 다시 올려 주세요.',finished=mtime)
+    else:
+     active,turn,limit=_upload_log_state(d)
+     item.update(state='uploading' if active else 'waiting',total=_upload_local_bytes(ep))
+     if active:
+      done,speed=_upload_nas_progress(ep)
+      item.update(done=min(done,item['total']) if item['total'] else done,speed=speed,turn=turn,limit=limit)
+   elif st.get('state')=='success':
+    if now-(st.get('finished') or mtime)>UPLOAD_DONE_HOURS*3600:continue
+    item.update(state='success',finished=st.get('finished'),total=st.get('bytes'),local_deleted=bool(st.get('local_deleted')))
+   else:
+    item.update(state='failed',finished=st.get('finished'),error=str(st.get('error') or '')[-300:])
+   items.append(item)
+  live={i['episode'] for i in items if i['state']=='uploading'}
+  for ep in [e for e in _upload_nas if e not in live]:_upload_nas.pop(ep,None)
+ order={'uploading':0,'waiting':1,'failed':2,'success':3}
+ items.sort(key=lambda i:(order[i['state']],-(i.get('finished') or 0) if i['state'] in ('success','failed') else 0,i['episode']))
+ active=[i for i in items if i['state']=='uploading'];waiting=[i for i in items if i['state']=='waiting']
+ remaining=sum(max(0,(i.get('total') or 0)-(i.get('done') or 0)) for i in active)+sum(i.get('total') or 0 for i in waiting)
+ speed=next((i['speed'] for i in active if i.get('speed')),None)
+ t=time.localtime(now);midnight=time.mktime((t.tm_year,t.tm_mon,t.tm_mday,0,0,0,0,0,-1))
+ for i in active:
+  if i.get('speed') and i.get('total'):i['eta']=max(0,i['total']-i['done'])/i['speed']
+ return {'available':True,'items':items,'summary':{'uploading':len(active),'waiting':len(waiting),
+  'failed':sum(i['state']=='failed' for i in items),'done_today':sum(i['state']=='success' and (i.get('finished') or 0)>=midnight for i in items),
+  'remaining':remaining,'speed':speed,'eta':remaining/speed if speed and remaining else None}}
+
 HIDE_SCOPES=('jobs','outputs','review')
 class HideRequest(BaseModel):
  scope:str
@@ -2042,10 +2163,22 @@ def mano_transfer_of(run_id):
  return dict(r) if r else None
 
 _mano_progress_base=mano_progress
-def mano_progress(run,history):
- t=mano_transfer_of(run['dag_run_id'])
+# 일괄 실행 진행 표시는 에피소드마다 Worker 상태를 단계별로 물어봅니다(에피소드당 최대 5번). 작업 현황은 5초마다 수십 개를 그리므로
+# 잠깐 기억해 둡니다: 일괄 실행 중인 에피소드는 MANO_PROGRESS_TTL[0]초, 멈춰 있는 에피소드는 [1]초(만료가 한꺼번에 몰리지 않게 조금씩 다르게).
+# 일괄 실행을 새로 시작하면(history 상태가 바뀜) 바로 다시 확인합니다.
+MANO_PROGRESS_TTL=(8,45)
+_mano_progress_cache={}
+def mano_progress(run,history,fresh=False):
+ run_id=run['dag_run_id']
+ t=mano_transfer_of(run_id)
  if t:return ('다른 PC로 이관 중 → '+t['target'] if t['state']=='exporting' else '이관됨 → '+t['target']+' (MANO는 그 PC에서 실행)'),False
- return _mano_progress_base(run,history)
+ state=history.get(run_id);now=time.monotonic();hit=_mano_progress_cache.get(run_id)
+ if hit and not fresh and hit[0]==state and now<hit[1]:return hit[2]
+ out=_mano_progress_base(run,history)
+ if state:
+  ttl=MANO_PROGRESS_TTL[0 if state in ('running','queued') else 1]
+  _mano_progress_cache[run_id]=(state,now+ttl*(1+(hash(run_id)%50)/100),out)
+ return out
 
 def task_update(task_id,**fields):
  fields['updated']=time.time()
@@ -2073,7 +2206,7 @@ def fleet_mano_export(task,p):
  if not task['step']:
   run=local_api('GET',f'/api/v2/dags/{mano_dag(run_id)}/dagRuns/'+quote(run_id,safe=''))
   if run['conf'].get('episode_id')!=ep or run['state']!='success':raise RuntimeError('복원이 끝난 실행이 아닙니다.')
-  label,ready=mano_progress(run,batch_history())
+  label,ready=mano_progress(run,batch_history(),fresh=True)
   if not ready:raise RuntimeError('MANO 대기 상태가 아닙니다: '+label)
   if not recon_done(run):raise RuntimeError('3D 복원 전(3D 복원 대기)이라 이관할 수 없습니다. 이 PC에서 3D 복원 일괄 실행을 하거나, 3D 복원까지 끝난 뒤 이관하세요.')
   with fleet_db() as c:c.execute('INSERT INTO mano_transfers VALUES(?,?,?,?,?,?)',(run_id,ep,target,'exporting',task['id'],time.time()))
