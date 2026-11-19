@@ -47,16 +47,19 @@ function hcEditControls(){
  // 분할 중에도 Enter(적용)를 받을 수 있습니다. 끝나는 대로 적용·저장합니다.
  $('hcWandApply').disabled=busy||!(ready.length||hcWandBusyCams().length);$('hcWandClear').disabled=busy||!we?.wand.points.length;$('hcWandClearAll').disabled=busy||!pending.length;
  $('hcWandUndo').disabled=busy||!we?.wand.points.length;
- if(hcBatch.running)$('hcBatchBox').open=true;
  hcEmptyNavControls();
- $('hcBatchApply').textContent='빈 '+($('hcEditObj').value==='0'?'물체':'손')+' 마스크 일괄 적용';
+ $('hcBatchApply').textContent='빈 '+($('hcEditObj').value==='0'?'물체':'손')+' 마스크 프레임만 채우기';
  $('hcBatchApply').disabled=busy||hcBatch.running||!we?.wand.points.some(x=>x[2]===1)||we.wand.busy;$('hcBatchStop').hidden=!hcBatch.running||hcBatch.track;
  // 추적 일괄 교체는 '마스크 수정 → 대상'에서 고른 마스크(손·분홍 / 물체·초록)에만 진행합니다.
  const trackObj=$('hcEditObj').value==='0';
- $('hcTrackApply').textContent=(trackObj?'● 물체(초록)':'● 손(분홍)')+' 추적 일괄 교체';
+ // 구간을 비우면 '전체 프레임', 입력하면 그 구간을 버튼에 그대로 보여 줍니다.
+ const ranged=$('hcBatchFrom').value.trim()!==''||$('hcBatchTo').value.trim()!=='',span=ranged&&hcMeta?hcBatchRange():null;
+ $('hcBatchTarget').textContent=trackObj?'● 물체(초록)':'● 손(분홍)';
+ $('hcBatchTarget').classList.toggle('hcTrackObject',trackObj);$('hcBatchTarget').classList.toggle('hcTrackHand',!trackObj);
+ $('hcTrackApply').textContent=(span?'프레임 '+(span[0]+1)+'~'+(span[1]+1):'전체 프레임')+' 교체';
  $('hcTrackApply').classList.toggle('hcTrackObject',trackObj);$('hcTrackApply').classList.toggle('hcTrackHand',!trackObj);
  $('hcTrackApply').disabled=busy||hcBatch.running||!we?.wand.mask||we.wand.busy;
- $('hcTrackForward').textContent=(trackObj?'● 물체(초록)':'● 손(분홍)')+' 현재 프레임 이후만 일괄 교체';
+ $('hcTrackForward').textContent='현재 프레임 이후만 교체'+(span?' (~'+(span[1]+1)+')':'');
  $('hcTrackForward').classList.toggle('hcTrackObject',trackObj);$('hcTrackForward').classList.toggle('hcTrackHand',!trackObj);
  $('hcTrackForward').disabled=$('hcTrackApply').disabled;
  $('hcWandApply').textContent=(ready.length>1?'마법봉 결과 적용·저장 · '+ready.map(c=>'카메라 '+(c+1)).join(', '):'마법봉 결과 적용·저장')+' (Enter)';
@@ -428,9 +431,8 @@ $('hcRadius').oninput=()=>$('hcRadiusLabel').textContent=$('hcRadius').value+'px
 // [ ] 로 브러시 반경을 줄이고 키웁니다(작을 때는 1px, 클수록 크게).
 function hcRadiusStep(dir){const el=$('hcRadius'),v=Number(el.value),step=v<10?1:v<30?2:5;el.value=Math.max(Number(el.min),Math.min(Number(el.max),v+dir*step));el.oninput()}
 $('hcWandUndo').onclick=hcWandUndoPoint;
-// 일괄 적용 영역은 접어 둘 수 있고, 펼친 상태는 이 브라우저에 기억합니다.
-try{$('hcBatchBox').open=localStorage.getItem('hcBatchOpen')==='1'}catch(_){}
-$('hcBatchBox').ontoggle=()=>{try{localStorage.setItem('hcBatchOpen',$('hcBatchBox').open?'1':'0')}catch(_){}};
+// 일괄 적용 영역은 마법봉 패널에 항상 보입니다. 구간을 바꾸면 버튼 문구도 바로 바뀝니다.
+$('hcBatchFrom').oninput=$('hcBatchTo').oninput=hcEditControls;
 $('hcEditUndo').onclick=hcEditUndo;$('hcEditRedo').onclick=hcEditRedo;
 $('hcDiscardEdits').onclick=hcEditDiscard;$('hcSaveEdits').onclick=()=>hcSaveEdits();
 $('hcTrackApply').onclick=()=>hcTrackRun(false);$('hcTrackForward').onclick=()=>hcTrackRun(true);$('hcWandApply').onclick=hcWandApply;$('hcBatchApply').onclick=hcBatchRun;$('hcBatchStop').onclick=()=>{hcBatch.stop=true;hcWandMessage('일괄 적용을 중지하는 중… 지금 처리 중인 프레임까지만 저장합니다.')};$('hcWandClear').onclick=hcWandClear;$('hcWandClearAll').onclick=hcWandClearAll;
@@ -663,7 +665,7 @@ async function hcTrackRun(forward){
  const body=hcWandRequestBody(e),obj=e.obj,path=hcPath,token=hcToken,episode=hcMeta.episode,objName=obj===0?'물체(초록)':'손(분홍)';
  // 마법봉 결과를 만든 뒤 대상을 바꿨다면 진행하지 않습니다(대상 전환 시 점이 지워지지만 한 번 더 확인).
  if(String(obj)!==$('hcEditObj').value){hcWandMessage('마스크 수정 대상이 바뀌었습니다. 지금 대상으로 마법봉을 다시 클릭하세요.',true);return}
- const range=hcBatchRange(),to=range[1],from=forward?body.frame:range[0],label=forward?'현재 프레임 이후 일괄 교체':'추적 일괄 교체';
+ const range=hcBatchRange(),to=range[1],from=forward?body.frame:range[0],label=forward?'현재 프레임 이후 일괄 교체':'전체 프레임 일괄 교체';
  if(body.frame<range[0]&&!forward||body.frame>to){hcWandMessage('클릭한 프레임('+(body.frame+1)+')이 일괄 프레임 구간('+(range[0]+1)+'~'+(to+1)+') 안에 있어야 합니다.',true);return}
  if(!confirm('카메라 '+(body.cam+1)+' · '+objName+' 마스크 '+label+'\n(마스크 수정 대상: '+objName+' — 다른 대상의 마스크는 바뀌지 않습니다)\n\n프레임 '+(body.frame+1)+'의 마법봉 결과(노란 영역)를 시작점으로 SAM3가 '+(forward?'다음 프레임들을':'앞뒤 프레임을')+' 따라가며, 프레임 '+(from+1)+'~'+(to+1)+'('+(to-from+1)+'개)의 '+objName+' 마스크를 모두 새 결과로 바꿉니다.'+(forward&&from>0?' 프레임 1~'+from+'은 바꾸지 않습니다.':'')+'\n\n· 기존 마스크가 있어도 교체합니다. 추적에서 '+objName+'이 안 보인 프레임은 빈 마스크가 됩니다.\n· 이전 마스크는 수정 이력에 보관됩니다.\n· 프레임 수에 따라 수십 초~몇 분 걸립니다.'+(hcApproved()?'\n· 저장하면 기존 승인이 해제되고 다시 검수해야 합니다.':'')))return;
  if(!await hcEditResolve(label))return;
