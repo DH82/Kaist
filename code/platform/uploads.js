@@ -1,6 +1,6 @@
 // NAS 업로드 현황 (작업 현황 화면 'NAS 업로드' 카드 · 사이드바 'NAS 업로드')
 // 업로드는 한 번에 하나씩 진행됩니다: 올리는 중 1개 + 순서 대기. 10초마다 갱신합니다.
-let upBusy=false,upDoneOpen=false,upWaitOpen=true;
+let upBusy=false,upDoneOpen=false,upWaitOpen=true,upBadOpen=true;
 const upTime=t=>t?new Date(t*1000).toLocaleTimeString('ko-KR',{hour:'2-digit',minute:'2-digit'}):'—';
 const upSpeed=s=>s==null?'속도 측정 중':(s/1048576).toFixed(1)+' MB/s';
 const upLeft=sec=>sec==null?'':'약 '+actDur(sec)+' 남음';
@@ -31,12 +31,12 @@ function renderUploads(d){
  if(!cur.length&&wait.length)h+='<p class="help">다른 업로드가 끝나기를 기다리는 중입니다.</p>';
  if(wait.length)h+='<details class="upSection" data-up="wait"'+(upWaitOpen?' open':'')+'><summary>순서 대기 <small>'+wait.length+'개 · '+fmtBytes(wait.reduce((n,i)=>n+(i.total||0),0))+' · 한 번에 하나씩 올립니다</small></summary><div class="upChips">'
   +wait.map(i=>'<span>'+escape(i.episode)+who(i)+'<small>'+fmtBytes(i.total||0)+'</small></span>').join('')+'</div></details>';
- if(bad.length)h+='<details class="upSection" open><summary>실패 · 중단 <small>'+bad.length+'개 · 에피소드의 \'⇪ NAS에 올리기\'로 다시 올릴 수 있습니다</small></summary><div class="upChips">'
+ if(bad.length)h+='<details class="upSection" data-up="bad"'+(upBadOpen?' open':'')+'><summary>실패 · 중단 <small>'+bad.length+'개 · 에피소드의 \'⇪ NAS에 올리기\'로 다시 올릴 수 있습니다</small></summary><div class="upChips">'
   +bad.map(i=>'<span class="bad" title="'+escape(i.error||'')+'">'+escape(i.episode)+who(i)+'<small>'+escape((i.error||'').slice(0,60))+'</small></span>').join('')+'</div></details>';
  if(done.length)h+='<details class="upSection" data-up="done"'+(upDoneOpen?' open':'')+'><summary>최근 24시간 완료 <small>'+done.length+'개 · '+fmtBytes(done.reduce((n,i)=>n+(i.total||0),0))+'</small></summary><div class="upChips">'
   +done.map(i=>'<span title="'+(i.local_deleted?'로컬 작업 파일 정리됨':'로컬 작업 파일 유지')+'">'+escape(i.episode)+who(i)+'<small>'+upTime(i.finished)+' · '+fmtBytes(i.total||0)+'</small></span>').join('')+'</div></details>';
  $('uploadBody').innerHTML=h;
- $('uploadBody').querySelectorAll('details[data-up]').forEach(el=>el.ontoggle=()=>{if(el.dataset.up==='wait')upWaitOpen=el.open;else upDoneOpen=el.open});
+ $('uploadBody').querySelectorAll('details[data-up]').forEach(el=>el.ontoggle=()=>{if(el.dataset.up==='wait')upWaitOpen=el.open;else if(el.dataset.up==='bad')upBadOpen=el.open;else upDoneOpen=el.open});
 }
 let upLast=null;
 async function loadUploads(){

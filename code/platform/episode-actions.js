@@ -61,7 +61,7 @@ function bindEpisodeActions(container,onChange){
     hide?hiddenKeys[d.scope].add(d.key):hiddenKeys[d.scope].delete(d.key);
     notice(hide?ep+'을(를) 목록에서 삭제했습니다.':ep+'을(를) 목록에 다시 표시했습니다.');onChange&&onChange();
    }
-  }catch(err){notice(err.message,true);b.disabled=false}
+  }catch(err){notice(err.message,true);b.disabled=false;if(d.ea==='stop')b.textContent='■ 강제 종료'}
   finally{epActionBusy.delete(id)}
  });
  container.querySelectorAll('[data-hidden-toggle]').forEach(c=>c.onchange=()=>{showHidden[c.dataset.hiddenToggle]=c.checked;onChange&&onChange(true)});

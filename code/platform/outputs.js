@@ -74,11 +74,11 @@ async function loadEpisodePreview(){
   $('episodeImages').innerHTML=info.cameras.slice(0,2).map((cam,i)=>'<figure><a target="_blank" rel="noopener"><img alt="사진 '+(i+1)+'" data-cam="'+cam+'"></a><figcaption>사진 '+(i+1)+'</figcaption></figure>').join('');
   for(const img of $('episodeImages').querySelectorAll('img')){
    const cam=+img.dataset.cam;const url=outputUrl('preview',{episode,cam,position:0.5});img.parentNode.href=url;
-   img.onload=()=>{if(generation!==previewGeneration)return;previewLoaded.add(cam);if(previewLoaded.size===2){previewEpisode=episode;$('confirmed').disabled=false;$('previewStatus').textContent='사진 2장를 보고 분할 대상을 입력하세요.'}updateLaunch()};
+   img.onload=()=>{if(generation!==previewGeneration)return;previewLoaded.add(cam);if(previewLoaded.size===2){previewEpisode=episode;$('confirmed').disabled=false;$('previewStatus').textContent='사진 2장을 보고 분할 대상을 입력하세요.'}updateLaunch()};
    img.onerror=()=>{if(generation!==previewGeneration)return;$('previewStatus').textContent='일부 이미지를 불러오지 못했습니다. 다시 불러오기를 눌러주세요.';updateLaunch()};
    img.src=url;
   }
-  $('previewStatus').textContent='사진 2장를 불러오는 중…';
+  $('previewStatus').textContent='사진 2장을 불러오는 중…';
  }catch(e){if(generation!==previewGeneration)return;$('episodeImages').textContent=e.message;$('previewStatus').textContent='이미지를 확인한 뒤 전체 파이프라인을 실행할 수 있습니다.'}
 }
 $('episode').onchange=()=>{$('prompt').value='';loadEpisodePreview()};
@@ -334,7 +334,7 @@ function renderRawTable(){
  const mineHtml=mine.length?'<tr class="rawDateGroup rawMineGroup"><td colspan="6">👤 내 작업 · '+mine.length+' / '+rawTeam.target+'개 (날짜 필터와 무관)</td></tr>'+mine.map(i=>row(i).replace('<tr ','<tr data-mine="1" ')).join(''):'';
  $('rawRows').innerHTML=mineHtml+(dates.map(d=>'<tr class="rawDateGroup"><td colspan="6">📅 '+(d==='—'?'날짜 미상':escape(d))+' · '+groups[d].length+'개</td></tr>'+groups[d].map(row).join('')).join('')||('<tr><td colspan="6">'+(filter&&rawEpisodes.length?escape(filter)+' 촬영 RAW 에피소드가 없습니다. 📅에서 다른 날짜나 전체 보기를 선택하세요.':'RAW 에피소드가 없습니다.')+'</td></tr>'));
  $('rawRows').querySelectorAll('tr[data-mine]').forEach(r=>r.classList.add('rawMine'));
- rawBatchControls();$('rawRows').querySelectorAll('[data-raw-index]').forEach(row=>row.onclick=event=>{if(event.target.closest('[data-raw-exclude],[data-raw-pick],[data-raw-gate]'))return;const e=rawEpisodes[+row.dataset.rawIndex];$('episode').value=e.episode;$('episode').dispatchEvent(new Event('change'));renderRawTable();if(event.target.closest('[data-raw-preview]'))revealSamPreview()});
+ rawBatchControls();$('rawRows').querySelectorAll('[data-raw-index]').forEach(row=>row.onclick=event=>{if(event.target.closest('[data-raw-exclude],[data-raw-pick],[data-raw-gate]'))return;const e=rawEpisodes[+row.dataset.rawIndex];if($('episode').value!==e.episode){$('episode').value=e.episode;$('episode').dispatchEvent(new Event('change'));renderRawTable()}if(event.target.closest('[data-raw-preview]'))revealSamPreview()});
 }
 async function refreshRawBoard(force=false){
  if((rawBoardBusy&&!force)||!currentUser)return;rawBoardBusy=true;const generation=++rawBoardGeneration;
@@ -359,7 +359,8 @@ $('rawRows').addEventListener('click',async event=>{
  }catch(error){notice(error.message,true)}
  finally{rawExcludeBusy.delete(row.episode);renderRawTable()}
 });
-setInterval(()=>{if(currentUser&&page==='run')refreshRawBoard()},15000);
+setInterval(()=>{if(currentUser&&page==='run'&&!document.hidden)refreshRawBoard()},15000);
+document.addEventListener('visibilitychange',()=>{if(!document.hidden&&currentUser&&page==='run')refreshRawBoard()});
 
 $('outputWorker').onchange=()=>{outputSeq++;outputPath='';outputRoot='project';outputRootsReady=false;openOutputExplorer()};
 
@@ -409,7 +410,7 @@ $('samWaitRefresh').onclick=()=>{samWaitSnap='';loadSamWaiting()};
 $('samWaitRows').addEventListener('keydown',e=>{if(e.key==='Enter'&&e.target.matches('[data-sam-input]')){const b=$('samWaitRows').querySelector('[data-sam-go="'+CSS.escape(e.target.dataset.samInput)+'"]');if(b)b.click()}});
 $('samWaitRows').addEventListener('click',async e=>{
  const pv=e.target.closest('[data-sam-preview]');
- if(pv){const ep=pv.dataset.samPreview;if([...$('episode').options].some(o=>o.value===ep)){$('episode').value=ep;$('episode').dispatchEvent(new Event('change'))}else notice('이 RAW는 실행 목록에 없어 미리보기를 열 수 없습니다.',true);return}
+ if(pv){const ep=pv.dataset.samPreview;if($('episode').value===ep)revealSamPreview();else if([...$('episode').options].some(o=>o.value===ep)){$('episode').value=ep;$('episode').dispatchEvent(new Event('change'))}else notice('이 RAW는 실행 목록에 없어 미리보기를 열 수 없습니다.',true);return}
  const b=e.target.closest('[data-sam-go]');if(!b)return;
  const input=$('samWaitRows').querySelector('[data-sam-input="'+CSS.escape(b.dataset.samGo)+'"]'),prompt=input.value.trim();
  if(!prompt){notice('SAM3 분할 대상을 입력하세요.',true);input.focus();return}

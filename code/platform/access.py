@@ -57,7 +57,8 @@ def admin(req):
 def owners():
  with db() as c:out={r['episode']:r['operator'] for r in c.execute('SELECT * FROM episode_owners')}
  with db() as c:out.update({r['episode']:r['operator'] for r in c.execute('SELECT episode,operator FROM execution_versions')})
- out.update({r['episode']:r['operator'] for r in intake.rows() if r['operator']})
+ # 입고 명세(metadata, 파일별 해시라 큼)는 읽지 않습니다. 이 함수는 목록의 행마다 불립니다.
+ with db() as c:out.update({r['episode']:r['operator'] for r in c.execute("SELECT episode,operator FROM episodes WHERE operator IS NOT NULL AND operator!='' ORDER BY updated")})
  return out
 
 def allowed(req,episode):

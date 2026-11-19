@@ -32,7 +32,7 @@ function hcEnable(){
   complete=Boolean(reviewed&&reviewed.checked)&&events.every(x=>x.checked)&&(!hcMeta.events.length||$('hcNote').value.trim());
  }
  $('hcApprove').disabled=hcBusy||approved||!complete;$('hcHold').disabled=hcBusy||approved;$('hcNote').disabled=hcBusy||approved;
- $('hcApprove').textContent=approved?'승인 완료':hcStage==='mask'?'마스크 승인 · 추적 진행':'추적 승인 · 복원 진행';
+ $('hcApprove').textContent=approved?'승인 완료':hcStage==='mask'?'마스크 승인 · 추적 진행':'추적 승인 · 다음 단계로';
 }
 let hcQueueFilter='pending',hcQueueGeneration=0,hcReturnPage='review';
 const hcQueueLabels={'pending':'검수 대기','mask-approved':'마스크 승인 완료','tracking-approved':'추적 승인 완료'};
@@ -76,7 +76,7 @@ async function openReview(episode,stage='mask'){
   $('hcMeta').textContent='';
   $('hcState').textContent=hcApproved()?'승인 완료 · 결과 조회':'HC 검수 필요';$('hcState').className='badge '+(hcApproved()?'success':'hcNeeded');
   $('hcMedia').classList.remove('hidden');$('hcDecision').classList.remove('hidden');$('hcChecks').classList.toggle('hidden',stage!=='mask');$('hcViewChecks').classList.toggle('hidden',stage!=='tracking');$('hcMask').classList.toggle('hidden',stage!=='mask');$('hcTracking').classList.toggle('hidden',stage!=='tracking');
-  $('hcTips').textContent=stage==='mask'?'카메라별 모든 프레임을 확인하면 검수 완료를 체크할 수 있습니다.':'천·손의 추적점이 배경으로 벗어나거나 미끄러지는지 확인하세요. 표시된 이상 후보 구간도 함께 검수하세요.';
+  $('hcTips').textContent=stage==='mask'?'카메라별 모든 프레임을 확인하면 검수 완료를 체크할 수 있습니다.':'물체·손의 추적점이 배경으로 벗어나거나 미끄러지는지 확인하세요. 표시된 이상 후보 구간도 함께 검수하세요.';
   if(stage==='mask'){
    hcVisited=[new Set(),new Set(),new Set(),new Set()];$('hcMaskMode').value='overlay';$('hcSlider').max=hcMeta.frames-1;
    $('hcImages').classList.remove('hcSolo');hcEdit.solo=null;
@@ -90,7 +90,7 @@ async function openReview(episode,stage='mask'){
    $('hcViewChecks').onchange=hcEnable;
    $('hcObject').src=hcPath+'/video/cotracker';$('hcHand').src=hcPath+'/video/cotracker_hand';
    const reason={outside_mask:'마스크 밖으로 벗어난 추적점',outside_image:'영상 밖으로 벗어난 추적점',jump:'급격한 점 이동',low_visibility:'가림 또는 낮은 가시성',low_coverage:'낮은 추적 범위'};
-   $('hcEvents').innerHTML=hcMeta.events.map((event,i)=>'<div class="hcEvent"><strong>'+escape(event.group==='cotracker_hand'?'손':'천')+' · 카메라 '+event.camera+'</strong><p>'+escape(reason[event.reason]||event.reason)+' · 프레임 '+event.start_frame+'–'+event.end_frame+'</p><button class="smallbtn" data-event="'+i+'">이 구간 보기</button><label><input class="hcEventCheck" type="checkbox" '+(hcApproved()?'disabled':'')+'>구간 확인 완료</label></div>').join('')||'<p class="help">자동 검사에서 이상 후보가 표시되지 않았습니다. 4개 카메라는 직접 확인하세요.</p>';
+   $('hcEvents').innerHTML=hcMeta.events.map((event,i)=>'<div class="hcEvent"><strong>'+escape(event.group==='cotracker_hand'?'손':'물체')+' · 카메라 '+event.camera+'</strong><p>'+escape(reason[event.reason]||event.reason)+' · 프레임 '+event.start_frame+'–'+event.end_frame+'</p><button class="smallbtn" data-event="'+i+'">이 구간 보기</button><label><input class="hcEventCheck" type="checkbox" '+(hcApproved()?'disabled':'')+'>구간 확인 완료</label></div>').join('')||'<p class="help">자동 검사에서 이상 후보가 표시되지 않았습니다. 4개 카메라는 직접 확인하세요.</p>';
    // 자동 검사에서 표시된 이상 구간을 검수 의견 칸에 영어로 미리 적어 둡니다(비어 있고 아직 승인 전일 때만). 검수자가 고쳐 쓸 수 있습니다.
    const reasonEn={outside_mask:'Tracking points outside the mask',outside_image:'Tracking points outside the image',jump:'Sudden point jump',low_visibility:'Occlusion or low visibility',low_coverage:'Low tracking coverage'};
    if(!hcApproved()&&!$('hcNote').value.trim()&&hcMeta.events.length)$('hcNote').value=hcMeta.events.map(event=>(event.group==='cotracker_hand'?'Hand':'Object')+' · Camera '+event.camera+' · '+(reasonEn[event.reason]||event.reason)+' · Frames '+event.start_frame+'–'+event.end_frame).join('\n');
@@ -146,7 +146,7 @@ async function hcDecide(decision){
  else{data.checked_views=Array(8).fill($('hcTrackingReviewed').checked);data.checked=[...document.querySelectorAll('.hcEventCheck')].map(c=>c.checked)}
  try{
   const result=await hcRequest(hcPath+'/decision',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':hcToken},body:JSON.stringify(data)});
-  $('hcResult').textContent=result.message;$('hcSpotNav')?.remove();hcMeta.approval.status=result.status;if(result.status==='approved')hcFollowStart();hcStatus(result.status==='approved'?'승인 완료. 중앙 Airflow가 결과를 확인한 뒤 다음 단계를 진행합니다.':'보류되었습니다. 후속 단계는 대기합니다.');loadJobs();
+  $('hcResult').textContent=result.message;$('hcSpotNav')?.remove();hcMeta.approval.status=result.status;if(result.status==='approved')hcFollowStart();hcStatus(result.status==='approved'?(hcStage==='mask'?'승인 완료. 확인이 끝나는 대로 추적을 시작합니다.':'승인 완료. 추적 검수까지만 실행한 작업은 \'3D 복원 대기\'가 되어 3D 복원 일괄 실행에서 이어지고, 전체 실행은 바로 3D 복원으로 넘어갑니다.'):'보류되었습니다. 후속 단계는 대기합니다.');loadJobs();
  }catch(e){
   // 누락·빈 마스크로 승인이 거부되면 서버가 붙인 위치 목록([빈마스크:카메라,대상,프레임;...])으로 이동 버튼을 보여 주고 첫 위치로 이동합니다.
   const spots=hcParseMaskSpots(e.message);
@@ -183,7 +183,7 @@ $('hcMissing').onclick=()=>{if(!hcMeta||hcFrameLoading)return;hcStop();$('hcMask
 // ---- 승인 후 다음 단계 진행 로그 ----
 // 승인 메시지 아래에 이 에피소드 실행의 단계 흐름과 현재 단계 로그를 3초마다 보여 줍니다(작업 현황 로그와 같은 API).
 const hcFollow={timer:null,episode:'',generation:0,job:null,state:{stick:true},busy:false};
-function hcFollowStop(){clearInterval(hcFollow.timer);hcFollow.timer=null;hcFollow.job=null;$('hcFollow').hidden=true}
+function hcFollowStop(){clearInterval(hcFollow.timer);hcFollow.timer=null;hcFollow.job=null;hcFollow.jobAt=0;$('hcFollow').hidden=true}
 function hcFollowStart(){
  hcFollowStop();if(!hcMeta)return;
  hcFollow.episode=hcMeta.episode;hcFollow.generation=hcLoadGeneration;hcFollow.state={stick:true};
@@ -219,8 +219,11 @@ async function hcFollowTick(){
    job=rows.filter(r=>r.episode===hcFollow.episode&&r.mode!=='raw'&&r.mode!=='test'&&!r.legacy).sort((a,b)=>String(b.start||'').localeCompare(String(a.start||'')))[0];
    if(!job){box.querySelector('.jobLogText').textContent='이 에피소드의 실행을 찾지 못했습니다. 본인이 실행한 작업만 표시됩니다.';return}
   }
-  const rows=await api('/api/jobs?'+new URLSearchParams([['summary','1'],['expanded',jobKey(job)]]));
-  job=rows.find(r=>r.dag_id===job.dag_id&&r.run_id===job.run_id)||job;hcFollow.job=job;
+  // 단계 상태는 9초마다, 로그는 3초마다 새로 받습니다(작업 목록 조회가 무거움).
+  if(!hcFollow.jobAt||Date.now()-hcFollow.jobAt>=9000){
+   const rows=await api('/api/jobs?'+new URLSearchParams([['summary','1'],['expanded',jobKey(job)]]));
+   job=rows.find(r=>r.dag_id===job.dag_id&&r.run_id===job.run_id)||job;hcFollow.job=job;hcFollow.jobAt=Date.now();
+  }
   if(hcFollow.generation!==hcLoadGeneration)return;
   $('hcFollowFlow').innerHTML='실행 '+escape(stateName(job.state))+' · '+hcFollowFlowText(job);
   // 2) 현재 단계 로그
@@ -314,10 +317,12 @@ async function hcAlertPoll(){
  try{
   if(hcAlertUser!==currentUser.name+'/'+currentUser.role){
    hcAlertUser=currentUser.name+'/'+currentUser.role;$('hcAlerts').querySelectorAll('.hcAlert:not(.fail)').forEach(hcAlertClose);
-   try{hcAlertSeen=new Set(JSON.parse(sessionStorage.getItem('kaistAlertSeen:'+hcAlertUser)||'null')||[])}catch(e){hcAlertSeen=null}
+   // 저장된 기록이 없으면 null로 둬야 아래 '첫 확인' 요약이 뜹니다(빈 Set으로 두면 대기 건마다 알림이 하나씩 쌓임).
+   try{const saved=JSON.parse(sessionStorage.getItem('kaistAlertSeen:'+hcAlertUser)||'null');hcAlertSeen=Array.isArray(saved)?new Set(saved):null}catch(e){hcAlertSeen=null}
   }
   const d=await hcRequest(HC_BASE+'/queue');if(!currentUser||currentUser.role==='admin')return;
-  const pending=(d.reviews||[]).filter(x=>x.status!=='approved'&&(x.stage==='mask'||x.stage==='tracking'));
+  // 검수 목록에서 숨긴 항목은 알리지 않습니다.
+  const pending=(d.reviews||[]).filter(x=>x.status!=='approved'&&(x.stage==='mask'||x.stage==='tracking')&&!(typeof isHidden==='function'&&isHidden('review',JSON.stringify([x.episode,x.stage]))));
   const keys=new Set(pending.map(hcAlertKey));
   // 검수가 끝나 대기 목록에서 빠진 항목의 알림은 닫습니다.
   $('hcAlerts').querySelectorAll('.hcAlert[data-key]:not(.fail)').forEach(el=>{if(!keys.has(el.dataset.key))hcAlertClose(el)});

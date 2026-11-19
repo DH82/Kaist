@@ -237,15 +237,15 @@ function dashVersion(p){
  if(msg)h+='<span class="dbVerMsg">'+escape(msg)+'</span>';
  h+=rq?'<button class="dbLink" data-upd-cancel="'+p.pc+'" title="재시작 전이면 업데이트를 보류합니다. 새 실행 시작 차단도 풀립니다.">요청 취소</button>'
       :'<button class="dbLink" data-upd-pc="'+p.pc+'" title="GitHub 최신 코드를 이 PC에 반영합니다. 진행 중인 작업이 끝난 뒤 재시작하며, 그동안 이 PC에서 새 실행 시작이 막힙니다.">업데이트</button>';
- if(!(rq&&rq.force))h+='<button class="dbLink bad" data-upd-force="'+p.pc+'" title="진행 중인 작업이 있어도 기다리지 않습니다. 빌드가 끝나면 실행·MANO 일괄 실행·GPU 작업을 강제 종료하고 바로 재시작합니다.">⚡ '+(rq?'강제로 전환':'강제 업데이트')+'</button>';
+ if(!(rq&&rq.force))h+='<button class="dbLink bad" data-upd-force="'+p.pc+'" title="진행 중인 작업이 있어도 기다리지 않습니다. 빌드가 끝나면 실행·3D 복원 일괄 실행·GPU 작업을 강제 종료하고 바로 재시작합니다.">⚡ '+(rq?'강제로 전환':'강제 업데이트')+'</button>';
  return h;
 }
 async function dashUpdate(pcs,action){
  if(!pcs.length){alert('업데이트할 PC가 없습니다. (업데이트 타이머가 설치되어 있고 '+(action==='force'?'강제 업데이트가 아직 걸리지 않은 PC':'요청 대기 중이 아닌 PC')+')');return}
  const names=pcs.map(dashPcName).join(', ');
- if(action==='request'&&!confirm(names+'에 GitHub 최신 코드를 반영합니다.\n\n· 각 PC는 진행 중인 GPU 작업이 끝난 뒤 서비스를 재시작합니다.\n· 업데이트가 끝날 때까지 해당 PC에서 새 RAW 실행·MANO 일괄 실행을 시작할 수 없습니다.\n\n진행할까요?'))return;
+ if(action==='request'&&!confirm(names+'에 GitHub 최신 코드를 반영합니다.\n\n· 각 PC는 진행 중인 GPU 작업이 끝난 뒤 서비스를 재시작합니다.\n· 업데이트가 끝날 때까지 해당 PC에서 새 RAW 실행·3D 복원 일괄 실행을 시작할 수 없습니다.\n\n진행할까요?'))return;
  if(action==='force'){
-  if(!confirm('⚡ 강제 업데이트: '+names+'\n\n진행 중인 작업을 기다리지 않습니다. 새 이미지 빌드가 끝나면(그동안 작업은 계속 진행)\n· 파이프라인 실행(SAM3·추적·3D 복원·MANO 등)\n· MANO 일괄 실행\n· 그 밖의 GPU 작업(이관 MANO·다시 실행 등)\n을 모두 강제 종료하고 바로 재시작합니다.\n\n· 계산 중이던 결과는 잃고, 종료된 실행은 업데이트 뒤 \'실패 단계 다시 실행\'으로 그 단계부터 다시 합니다.\n· 검수·설정 입력 대기 중인 실행은 그대로 둡니다.\n· NAS 업로드는 재시작으로 끊기므로 다시 올려야 합니다.\n\n강제 업데이트할까요?'))return;
+  if(!confirm('⚡ 강제 업데이트: '+names+'\n\n진행 중인 작업을 기다리지 않습니다. 새 이미지 빌드가 끝나면(그동안 작업은 계속 진행)\n· 파이프라인 실행(SAM3·추적·3D 복원·MANO 등)\n· 3D 복원 일괄 실행\n· 그 밖의 GPU 작업(이관 MANO·다시 실행 등)\n을 모두 강제 종료하고 바로 재시작합니다.\n\n· 계산 중이던 결과는 잃고, 종료된 실행은 업데이트 뒤 \'실패 단계 다시 실행\'으로 그 단계부터 다시 합니다.\n· 검수·설정 입력 대기 중인 실행은 그대로 둡니다.\n· NAS 업로드는 재시작으로 끊기므로 다시 올려야 합니다.\n\n강제 업데이트할까요?'))return;
   if(prompt('확인을 위해 \'강제\'를 입력하세요.')!=='강제')return;
  }
  try{const r=await api('/api/fleet/update',{method:'POST',body:JSON.stringify({pcs,action})});$('dashMsg').hidden=false;$('dashMsg').textContent=({request:'업데이트 요청: ',force:'⚡ 강제 업데이트 요청: ',cancel:'요청 취소: '}[action])+(r.pcs.map(dashPcName).join(', ')||'없음');loadDash(true);loadUpd(true)}

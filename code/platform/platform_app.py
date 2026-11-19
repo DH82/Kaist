@@ -71,7 +71,7 @@ def views_save(force=False):
  if VIEW_FILE is None or not _view_save_lock.acquire(blocking=force):return
  try:
   if not force and time.time()-_view_saved[0]<VIEW_SAVE_EVERY:return
-  with _info_cond:snap={k:{'data':v['data'],'at':v['at']} for k,v in _info_cache.items() if v['have']}
+  with _info_cond:snap={k:{'data':v['data'],'at':v['at'] or v.get('saved',0.0)} for k,v in _info_cache.items() if v['have']}  # 파일에서 올린 뒤 아직 새로 못 읽은 값은 원래 시각 유지
   tmp=VIEW_FILE.with_name(VIEW_FILE.name+f'.{os.getpid()}.tmp')
   tmp.write_text(json.dumps(snap,ensure_ascii=False));os.replace(tmp,VIEW_FILE);_view_saved[0]=time.time()
  except (OSError,TypeError,ValueError):pass
@@ -86,7 +86,7 @@ def views_load():
  with _info_cond:
   for key,v in snap.items() if isinstance(snap,dict) else []:
    if not isinstance(v,dict) or time.time()-float(v.get('at') or 0)>VIEW_KEEP or key in _info_cache:continue
-   _info_cache[key]={'data':v.get('data'),'have':True,'at':0.0,'busy':False,'error':None,'gen':0};n+=1
+   _info_cache[key]={'data':v.get('data'),'have':True,'at':0.0,'saved':float(v.get('at') or 0),'busy':False,'error':None,'gen':0};n+=1
  return n
 
 def _remember_fetch(key,fetch):
@@ -126,6 +126,12 @@ def forget(*keys):
    if slot:slot.update(have=False,data=None,at=0.0,gen=slot['gen']+1)
 
 views_load()
+
+_project_dirs={}
+def worker_project_dir(wid):
+ """Worker 작업 폴더 경로(바뀌지 않는 값). 한 번 알아내면 기억해, 로그 조회가 RAW 목록 갱신을 기다리지 않게 합니다."""
+ if wid not in _project_dirs:_project_dirs[wid]=raw_worker_info(wid,first=15)['project_dir']
+ return _project_dirs[wid]
 
 def raw_worker_info(wid=DEFAULT_WORKER,first=150):
  data,have,error=remembered(wid,lambda:call('GET','/worker/info',worker_id=wid,timeout=INFO_TIMEOUT),first=first)
@@ -850,14 +856,14 @@ def mano_removed(batch_run_id=None):
 
 MANO_DONE=set()  # publish까지 끝난 실행(run_id)은 다시 묻지 않습니다.
 
-RECON_DONE=set();_recon_seen={}  # 3D 복원이 끝난 실행(run_id) · 아직인 실행은 60초 동안 다시 묻지 않음
+RECON_DONE=set();_recon_seen={}  # 3D 복원이 끝난 실행(run_id) · 아직인 실행은 2~3분 동안 다시 묻지 않음(실행마다 시각을 흩어 한 요청에 몰리지 않게)
 
 def recon_done(run):
  """이 실행의 3D 복원이 끝났는지(예전 'MANO 대기'처럼 3D까지 끝난 실행인지)."""
  run_id=run['dag_run_id']
  if run_id in RECON_DONE:return True
  hit=_recon_seen.get(run_id)
- if hit and time.monotonic()-hit<60:return False
+ if hit and time.monotonic()-hit<120*(1+(hash(run_id)%50)/100):return False
  try:ok=call('POST','/worker/jobs/status',json=request_for('reconstruct',run_id,run['conf']),timeout=15)['state']=='success'
  except (httpx.HTTPError,OSError,ValueError):ok=False
  if ok:RECON_DONE.add(run_id)
@@ -1109,7 +1115,7 @@ def stage_log(wid,stage,run_id,conf):
  subs=re.findall(r'로그: (\S+\.log)',_ANSI.sub('',text))
  if subs:
   try:
-   project=raw_worker_info(wid,first=15)['project_dir'].rstrip('/')+'/'
+   project=worker_project_dir(wid).rstrip('/')+'/'
    path=subs[-1]
    if path.startswith(project):
     rel=path[len(project):]
@@ -1124,7 +1130,7 @@ def stage_log(wid,stage,run_id,conf):
     for bar in sbars:  # 이름 없는 tqdm 막대는 세부 로그 파일 이름으로 표시 (예: 19_mano)
      if bar['label']=='진행':bar['label']=Path(rel).stem+' · 프레임';bar['unit']='프레임'
     out['sub']={'path':rel,'log':slines,'bars':sbars}
-  except (httpx.HTTPError,KeyError,ValueError):pass
+  except (httpx.HTTPError,HTTPException,KeyError,ValueError):pass   # 세부 로그만 생략(본 로그는 그대로 보여 줌)
  return out
 
 @app.api_route('/kaist-review/{path:path}',methods=['GET','POST'])
@@ -1183,6 +1189,7 @@ async def review_proxy(path:str,req:Request):
 
 
 
+_preview_cache={}
 def nas_preview(action, params, raw):
  episode=params.get("episode", "")
  if not re.fullmatch(r"ep_[A-Za-z0-9_]+", episode):
@@ -1203,8 +1210,12 @@ def nas_preview(action, params, raw):
  if video.is_symlink() or not video.is_file():
   raise HTTPException(404, "NAS에서 해당 카메라 영상을 찾을 수 없습니다.")
  try:
-  duration=float(subprocess.check_output(["ffprobe","-v","error","-show_entries","format=duration","-of","csv=p=0",str(video)],timeout=15))
-  timestamp=max(0,min(duration-.1,duration*position))
+  cached=_preview_cache.get((episode,cam,position))
+  if cached:return Response(cached,media_type="image/jpeg",headers={"Cache-Control":"private, max-age=3600"})
+  if position==0:timestamp=0.0   # 첫 프레임은 영상 길이를 물을 필요가 없음
+  else:
+   duration=float(subprocess.check_output(["ffprobe","-v","error","-show_entries","format=duration","-of","csv=p=0",str(video)],timeout=15))
+   timestamp=max(0,min(duration-.1,duration*position))
   jpeg=subprocess.check_output(["ffmpeg","-nostdin","-v","error","-ss",str(timestamp),"-i",str(video),"-frames:v","1","-vf","scale=848:-2","-f","image2pipe","-vcodec","mjpeg","pipe:1"],timeout=25)
  except FileNotFoundError:
   raise HTTPException(503, "NAS UI에 영상 디코더가 설치되지 않았습니다.")
@@ -1212,7 +1223,10 @@ def nas_preview(action, params, raw):
   raise HTTPException(422, "NAS RAW 영상에서 사진을 추출할 수 없습니다.")
  if not jpeg:
   raise HTTPException(422, "해당 시점에 읽을 수 있는 프레임이 없습니다.")
- return Response(jpeg,media_type="image/jpeg",headers={"Cache-Control":"no-store"})
+ # RAW 영상은 바뀌지 않으므로 같은 사진은 다시 뽑지 않습니다(최근 200장).
+ if len(_preview_cache)>=200:_preview_cache.pop(next(iter(_preview_cache)),None)
+ _preview_cache[(episode,cam,position)]=jpeg
+ return Response(jpeg,media_type="image/jpeg",headers={"Cache-Control":"private, max-age=3600"})
 
 @app.get('/api/outputs/{action}')
 async def output_proxy(action:str,req:Request):
@@ -1222,7 +1236,7 @@ async def output_proxy(action:str,req:Request):
   return await asyncio.to_thread(nas_preview,action,req.query_params,raw)
  wid=selected_worker(req);remote=worker(wid)['url']
  if access.user(req)['role']!='admin':
-  return operator_output(action,req)
+  return await asyncio.to_thread(operator_output,action,req)   # 동기 함수(NAS·Worker 대기): 다른 요청을 막지 않게 별도 스레드에서
  if action not in ('catalog','list','text','file','preview-info','preview','roots','picker'):raise HTTPException(404)
  headers={'Authorization':'Bearer '+token(wid)}
  if req.headers.get('range'):headers['Range']=req.headers['range']
@@ -1379,7 +1393,8 @@ def raw_episodes(req:Request):
  guard(req);marks=[('start',time.time())];mark=lambda name:marks.append((name,time.time()))
  episodes=raw_worker_info(selected_worker(req))['episodes'];owners=access.owners();user=access.user(req);latest={};mark('worker')
  for wid,mode,dag in active_dags():
-  runs=local_api('GET',f'/api/v2/dags/{dag}/dagRuns',params={'limit':100,'order_by':'-logical_date'})['dag_runs']
+  # 실행 전체를 봅니다(최근 100개만 보면, 밀려난 완료 RAW가 '진행 중'으로 세어져 자동 배정이 멈춤).
+  runs=airflow_runs(dag)
   for r in runs:
    ep=r.get('conf',{}).get('raw_episode_id') or r.get('conf',{}).get('episode_id');stamp=r.get('logical_date') or r.get('queued_at') or ''
    if ep in episodes and (ep not in latest or stamp>latest[ep][0]):latest[ep]=(stamp,dag,r,mode)
@@ -2030,6 +2045,17 @@ def mano_source_state(src,redo=False):
  if states['publish']['state']=='success':MANO_DONE.add(src['run_id'])
  return states
 
+_mano_state_cache={}
+def mano_source_state_view(src,redo,active):
+ """표시용. 끝난 일괄 실행의 에피소드 상태는 30~45초 기억합니다(3초마다 에피소드 수만큼 Worker에 다시 묻지 않게)."""
+ if active:return mano_source_state(src,redo)
+ key=(src['run_id'],redo);hit=_mano_state_cache.get(key);now=time.monotonic()
+ if hit and now<hit[0]:return hit[1]
+ states=mano_source_state(src,redo)
+ if len(_mano_state_cache)>2000:_mano_state_cache.clear()
+ _mano_state_cache[key]=(now+30*(1+(hash(src['run_id'])%50)/100),states)
+ return states
+
 def mano_line(n,total,episode,states,waiting=''):
  head=f'[{n}/{total}] {episode}'
  if states['publish']['state']=='success':return head+'  ✔ 전체 완료'
@@ -2062,9 +2088,9 @@ def mano_status(req:Request,run_id:str=''):
   if src not in sources:continue
   if src['run_id'] in removed:
    lines.append(f'[{n}/{total}] {src["conf"].get("episode_id")}  ⊘ 대기열에서 제거됨 (일괄 실행 대기로 돌아감)');continue
-  try:states=mano_source_state(src,redo)
-  except (httpx.HTTPError,OSError,ValueError):lines.append(f'[{n}/{total}] {src["conf"].get("episode_id")}  ? GPU PC 연결 확인 필요');continue
   active=b['state'] in ('queued','running')
+  try:states=mano_source_state_view(src,redo,active)
+  except (httpx.HTTPError,OSError,ValueError):lines.append(f'[{n}/{total}] {src["conf"].get("episode_id")}  ? GPU PC 연결 확인 필요');continue
   if states['publish']['state']=='success':done_lines.append(len(lines))  # 화면의 '완료 항목 지우기'가 숨길 줄
   lines.append(mano_line(n,total,src['conf'].get('episode_id'),states,'대기' if active else f'대기 · 시작 안 함 (평일 오전 {MANO_CUTOFF_HOUR}시 이후 또는 중단) → 목록에서 다시 선택'))
   if active and states['publish']['state']!='success':queue.append({'n':n,'episode':src['conf'].get('episode_id'),'run_id':src['run_id'],
@@ -2087,7 +2113,7 @@ def mano_status(req:Request,run_id:str=''):
  if current:
   src,stage,n=current
   try:log=stage_log(DEFAULT_WORKER,stage,src['run_id'],src['conf'])
-  except (httpx.HTTPError,OSError,ValueError) as e:log={'state':'unavailable','log':['로그를 불러오지 못했습니다: '+str(e)[:200]],'bars':[],'sub':None}
+  except (httpx.HTTPError,HTTPException,OSError,ValueError) as e:log={'state':'unavailable','log':['로그를 불러오지 못했습니다: '+str(getattr(e,'detail',e))[:200]],'bars':[],'sub':None}
   sel['current']={'episode':src['conf'].get('episode_id'),'stage':stage,'label':MANO_LABELS[stage],'index':n,**log}
  out['selected']=sel
  return out
@@ -2442,7 +2468,7 @@ def fleet_snapshot():
  runs=[];started=set(access.owners())
  for wid,mode,dag in active_dags():
   if wid!=DEFAULT_WORKER:continue
-  for r in local_api('GET',f'/api/v2/dags/{dag}/dagRuns',params={'limit':100,'order_by':'-logical_date'})['dag_runs']:
+  for r in airflow_runs(dag):
    conf=r.get('conf') or {};raw=conf.get('raw_episode_id') or conf.get('episode_id')
    if raw:started.add(raw)
    stage=None
@@ -2479,13 +2505,15 @@ def reconcile_raw_claims(snap):
  with access._assign_lock:
   started=set(snap.get('raw_started') or []);mine=started|{e for e in access.owners() if fleet.RAW_NAME.fullmatch(e)}
   mine|=my_distributed()|cont_waiting_eps()  # SAM3 연속 모드: 분배받은 RAW·대기열 RAW는 배정 행이 없어도 선점 유지
-  for ep in mine:fleet.raw_claim(ep)
+  claims=fleet.raw_claims()   # 한 번만 읽고, 아직 이 PC 선점이 아닌 RAW만 NAS에 선점을 씁니다(매번 전부 다시 쓰지 않음)
+  for ep in mine:
+   if claims.get(ep)!=fleet.PC_ID:fleet.raw_claim(ep)
   assigned=access.assignments()
   for ep in list(assigned):
    if not fleet.raw_claim(ep):
     with access.db() as c:c.execute('DELETE FROM raw_assignments WHERE episode=?',(ep,))
     del assigned[ep]
-  for ep,pc in fleet.raw_claims().items():
+  for ep,pc in claims.items():
    if pc==fleet.PC_ID and ep not in mine and ep not in assigned:fleet.raw_release(ep)
 
 # ---- 강제 업데이트: updater가 빌드를 마치고 stop.json을 쓰면, 이 PC의 진행 중인 작업을 모두 강제 종료합니다 ----

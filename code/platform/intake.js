@@ -13,12 +13,15 @@ function renderMyWork(){const name=$('myOperator').value.trim();localStorage.set
 }
 $('intakeScan').onclick=()=>scanIntake(true);
 $('myOperator').value=localStorage.getItem('kaistOperatorFilter')||'';$('myRefresh').onclick=loadIntake;
-async function scanIntake(manual){const b=$('intakeScan');b.disabled=true;$('intakeMessage').textContent='NAS 파일·캘리브레이션을 검증 중입니다. 큰 에피소드는 시간이 걸릴 수 있습니다.';try{
+let intakeScanning=false;
+async function scanIntake(manual){if(intakeScanning)return;intakeScanning=true;const b=$('intakeScan');
+ // 자동 확인(20초마다)은 버튼·안내를 건드리지 않고 조용히 합니다.
+ if(manual){b.disabled=true;$('intakeMessage').textContent='NAS 파일·캘리브레이션을 검증 중입니다. 큰 에피소드는 시간이 걸릴 수 있습니다.'}try{
   let status=await api('/api/intake/scan?include_manual='+manual+'&background='+manual,{method:'POST'});
   while(status.running){await new Promise(resolve=>setTimeout(resolve,2000));status=await api('/api/intake/scan-status')}
   if(status.error)throw new Error(status.error);
   await loadIntake()
- }catch(e){notice(e.message,true)}finally{b.disabled=false}};
+ }catch(e){if(manual)notice(e.message,true)}finally{intakeScanning=false;if(manual)b.disabled=false}};
 setInterval(()=>{if(page==='mywork')loadIntake()},15000);
 
-setInterval(()=>{if(page==='intake'&&!$('intakeScan').disabled)scanIntake(false)},20000);
+setInterval(()=>{if(page==='intake'&&!document.hidden&&!intakeScanning)scanIntake(false)},20000);
