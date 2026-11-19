@@ -839,7 +839,7 @@ def mano_progress(run,history):
    break
   if status in ('queued','running'):return label+' · 진행 중',False
  if in_batch:return '일괄 실행 순서 대기',False
- # 일괄 실행이 끝났는데 시작하지 않은 에피소드(평일 오전 8시 이후 대기로 남김 등)
+ # 일괄 실행이 끝났는데 시작하지 않은 에피소드(평일 오전 9시 이후 대기로 남김 등)
  return (waiting_label(run),True) if status=='not_started' else ('일괄 실행 재개 대기',True)
 
 class ManoSelection(BaseModel):

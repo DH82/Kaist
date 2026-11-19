@@ -46,28 +46,55 @@ def episodes(project):
 # ---- 업로드 속도 제한 (낮 시간대에만) ----
 # NAS 회선이 느린 PC(예: 100Mbps로 연결된 PC1)는 작업 폴더 업로드가 회선을 다 써서, 낮에는 RAW 목록 같은
 # 화면 조회까지 몇 분씩 밀립니다. worker/config/nas_upload_limit.json이 있으면 그 시간대에만 rsync 속도를 묶습니다.
-#   {"mb_per_s": 3, "from_hour": 8, "to_hour": 19, "weekdays_only": true}
+#   {"mb_per_s": 8, "from": "09:30", "to": "18:30", "weekdays_only": true}
+#   (예전 형식 "from_hour": 8, "to_hour": 19도 읽습니다)
 # 파일이 없으면 제한하지 않습니다. 올리는 도중 시간대가 바뀌면 rsync를 새 속도로 다시 시작합니다
 # (끝난 파일은 건너뛰고, 올리던 파일 하나만 처음부터 다시 올림).
 LIMIT_TZ = 'Asia/Seoul'
+
+
+def _minute(value):
+    """'09:30' 또는 9 또는 9.5 → 하루 중 분(0~1440)."""
+    if isinstance(value, str) and ':' in value:
+        h, m = value.split(':', 1)
+        h, m = int(h), int(m)
+    else:
+        h, m = divmod(round(float(value) * 60), 60)
+    if not (0 <= h <= 24 and 0 <= m < 60 and h * 60 + m <= 1440):
+        raise ValueError(value)
+    return h * 60 + m
+
+
+def limit_window(spec):
+    """제한 시간대 (시작 분, 끝 분). "from"/"to"('HH:MM')가 우선이고, 없으면 예전 형식 from_hour/to_hour."""
+    return _minute(spec.get('from', spec.get('from_hour', 8))), _minute(spec.get('to', spec.get('to_hour', 19)))
 
 
 def upload_limit(spec, now=None):
     """지금 적용할 rsync --bwlimit 값(KiB/s). 0이면 제한 없음. 설정이 잘못됐으면 제한하지 않습니다."""
     try:
         rate = int(float(spec['mb_per_s']) * 1024)
-        start, end = int(spec.get('from_hour', 8)), int(spec.get('to_hour', 19))
-        if rate <= 0 or not (0 <= start <= 24 and 0 <= end <= 24) or start == end:
+        start, end = limit_window(spec)
+        if rate <= 0 or start == end:
             return 0
         if now is None:
             from zoneinfo import ZoneInfo
             now = datetime.datetime.now(ZoneInfo(spec.get('tz') or LIMIT_TZ))
         if spec.get('weekdays_only', True) and now.weekday() >= 5:
             return 0
-        inside = start <= now.hour < end if start < end else (now.hour >= start or now.hour < end)
+        minute = now.hour * 60 + now.minute
+        inside = start <= minute < end if start < end else (minute >= start or minute < end)
         return rate if inside else 0
     except (TypeError, KeyError, ValueError, AttributeError):
         return 0
+
+
+def window_text(spec):
+    try:
+        start, end = limit_window(spec)
+        return f"{start // 60:02d}:{start % 60:02d}~{end // 60:02d}:{end % 60:02d}{' 평일' if spec.get('weekdays_only', True) else ''}에 {spec.get('mb_per_s')} MB/s"
+    except (TypeError, ValueError, AttributeError):
+        return '설정을 읽을 수 없음'
 
 
 def limit_text(rate):
@@ -137,8 +164,7 @@ def sync_episode(cfg, ep, log=print, limit=None):
         raise RuntimeError('NAS가 마운트되어 있지 않습니다: ' + cfg['nas_mount'])
     copied, removed, total = [], [], 0
     if limit:
-        log(f"업로드 {limit_text(upload_limit(limit))} (설정: {limit.get('from_hour', 8)}~{limit.get('to_hour', 19)}시"
-            f"{' 평일' if limit.get('weekdays_only', True) else ''}에 {limit.get('mb_per_s')} MB/s)")
+        log(f"업로드 {limit_text(upload_limit(limit))} (설정: {window_text(limit)})")
     for d in list(dict.fromkeys(STAGE_DIRS + history_dirs(project))):
         src, dst = project / d / ep, nas / d / ep
         if src.is_dir() and not src.is_symlink():

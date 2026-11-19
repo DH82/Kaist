@@ -140,10 +140,10 @@ def redo_stages(request):
             return 'pending', REDO_LABELS[stage] + ' ' + state + detail
     return 'done', '3D 복원 다시 완료'
 
-# 평일(월~금) 오전 8시가 되면 그때 진행 중인 에피소드까지만 끝내고, 다음 에피소드는 시작하지 않습니다.
-# 기준 시각은 일괄 실행을 시작한 뒤 처음 오는 평일 오전 8시입니다(예: 금 18시 시작 → 월 08:00).
+# 평일(월~금) 오전 9시가 되면 그때 진행 중인 에피소드까지만 끝내고, 다음 에피소드는 시작하지 않습니다.
+# 기준 시각은 일괄 실행을 시작한 뒤 처음 오는 평일 오전 9시입니다(예: 금 18시 시작 → 월 09:00).
 MANO_TZ = 'Asia/Seoul'
-MANO_CUTOFF_HOUR = 8
+MANO_CUTOFF_HOUR = 9
 
 def mano_cutoff(started):
     import datetime as dt
@@ -204,10 +204,10 @@ def poll_mano_batch(**ctx):
                 continue
             need3d = request('reconstruct', 'status')['state'] != 'success'
             check3d = redo or need3d
-            # 이번 일괄 실행이 이미 3D 복원 다시를 시작한 에피소드는 오전 8시 마감과 관계없이 끝까지 진행합니다.
+            # 이번 일괄 실행이 이미 3D 복원 다시를 시작한 에피소드는 오전 9시 마감과 관계없이 끝까지 진행합니다.
             reset = worker_call('reset-status', {'episode': conf['episode_id'], 'run_id': run, 'start': REDO_START}) if check3d else None
             redoing = bool(reset) and redo_started(reset, since)
-            # 이번 일괄 실행에서 아직 아무 단계도 시작하지 않은 에피소드: 평일 오전 8시가 지났으면 여기서 멈추고 나머지는 대기로 남깁니다.
+            # 이번 일괄 실행에서 아직 아무 단계도 시작하지 않은 에피소드: 평일 오전 9시가 지났으면 여기서 멈추고 나머지는 대기로 남깁니다.
             # 앞에서 실패해 건너뛴 에피소드는 대기 목록에 넣지 않습니다(이미 실패로 표시됨).
             if not redoing and dt.datetime.now(cutoff.tzinfo) >= cutoff and not started_in_batch(request, since):
                 left = [s['conf']['episode_id'] for s in sources[n - 1:]]
