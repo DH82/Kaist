@@ -174,6 +174,7 @@ import fcntl,shlex,threading,time,uuid
 WAND_IDLE=int(os.environ.get('KAIST_WAND_IDLE','180'))
 # 마법봉(SAM3.1)을 띄우기 위해 남아 있어야 하는 GPU 메모리(MiB). KAIST_WAND_MIN_FREE_MB로 조정합니다.
 WAND_MIN_FREE_MB=int(os.environ.get('KAIST_WAND_MIN_FREE_MB','8192'))
+WAND_WANT_SECONDS=600
 def gpu_free_mb(uuid=None):
     try:
         out=subprocess.check_output(['nvidia-smi','--query-gpu=uuid,memory.free','--format=csv,noheader,nounits'],text=True,timeout=10)
@@ -184,7 +185,7 @@ def gpu_free_mb(uuid=None):
     return None
 class Wand:
     def __init__(self):
-        self.lock=threading.Lock();self.proc=None;self.gpu=None;self.last=0.0
+        self.lock=threading.Lock();self.proc=None;self.gpu=None;self.last=0.0;self.want=None;self.want_at=0.0
         threading.Thread(target=self._reaper,daemon=True).start()
     def _env(self,cfg):
         scripts=Path(cfg['scripts_dir'])
@@ -202,11 +203,25 @@ class Wand:
         self.proc=None
         if self.gpu:
             self.gpu.close();self.gpu=None
+    def _sam_unit(self,cfg):
+        # RTX 5090처럼 SAM3를 2개까지 함께 돌리는 GPU: 마법봉이 그중 한 자리를 씁니다(gpu_slots 설명 참고).
+        # SAM3 2개가 이미 돌고 있으면 '마법봉 대기' 표시를 켜 두어, 하나가 끝난 뒤 다음 SAM3가 그 자리를 채우지 않게 합니다.
+        from gpu_slots import acquire_wand,want_wand
+        path=WORKER_ROOT/'gpu_4090_a.lock'
+        shared,unit=acquire_wand(path,cfg.get('gpu_uuid'))
+        if shared and not unit:
+            self.want=self.want or want_wand(path);self.want_at=time.monotonic()
+            raise HTTPException(409,'SAM3 작업 2개가 함께 실행 중이라 지금은 마법봉을 쓸 수 없습니다. 하나가 끝나면 그 자리를 마법봉용으로 10분 동안 비워 두니, 잠시 뒤 다시 눌러 주세요.')
+        self.gpu=unit;self._unwant()
+    def _unwant(self):
+        if self.want:self.want.close();self.want=None
     def _start(self,cfg):
+        self._sam_unit(cfg)
         # 다른 GPU 작업이 돌고 있는지가 아니라, 남은 GPU 메모리로 판단합니다.
         # (MANO 등은 메모리를 적게 써서, 작업 중에도 마법봉을 함께 쓸 수 있습니다.)
         free=gpu_free_mb(cfg.get('gpu_uuid'))
         if free is not None and free<WAND_MIN_FREE_MB:
+            self._stop()
             raise HTTPException(409,f'GPU 메모리가 부족해 마법봉을 쓸 수 없습니다. (남은 메모리 {free/1024:.1f}GB, 필요 {WAND_MIN_FREE_MB/1024:.0f}GB 이상) 브러시를 쓰거나 작업이 끝난 뒤 다시 시도하세요.')
         env,cwd=self._env(cfg)
         log=(WORKER_ROOT/'sam_wand.log').open('ab')
@@ -243,6 +258,8 @@ class Wand:
             time.sleep(10)
             with self.lock:
                 if self.proc and time.monotonic()-self.last>WAND_IDLE:self._stop()
+                # 마법봉을 다시 누르지 않으면 대기 표시를 10분 뒤 꺼서 SAM3가 다시 2개씩 돌게 합니다.
+                if self.want and time.monotonic()-self.want_at>WAND_WANT_SECONDS:self._unwant()
 wand=Wand()
 
 @app.post('/dags/{dag_id}/episodes/{episode}/wand',dependencies=[Depends(requires_access_dag(method='POST'))])

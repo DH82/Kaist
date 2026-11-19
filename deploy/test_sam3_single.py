@@ -1,4 +1,5 @@
 """RTX 4090에서는 SAM3 단계를 한 번에 1개만 실행하고, 그동안 다른 GPU 단계는 남은 슬롯에서 함께 실행됩니다.
+RTX 5090에서는 SAM3 2개까지 실행하되 마법봉이 그중 한 자리를 함께 씁니다.
 
 실제 runner.py·gpu_slots.py를 임시 폴더에 복사하고 어댑터(kaist_runtime.py)만 가짜로 바꿔 실행합니다.
   python3 -m unittest deploy/test_sam3_single.py
@@ -91,6 +92,60 @@ class Sam3Single(unittest.TestCase):
         sys.modules.pop('gpu_slots', None)
         import gpu_slots
         os.environ.pop('KAIST_SAM3_SLOTS', None)
-        for name, want in (('NVIDIA GeForce RTX 4090', 1), ('NVIDIA GeForce RTX 5090', None), ('', None)):
+        for name, want in (('NVIDIA GeForce RTX 4090', 1), ('NVIDIA GeForce RTX 5090', 2), ('NVIDIA RTX A6000', None), ('', None)):
             gpu_slots.gpu_name = lambda uuid=None, name=name: name
             self.assertEqual(gpu_slots.sam_limit(), want)
+
+    def slots(self):
+        sys.path.insert(0, str(self.tmp / 'worker'))
+        self.addCleanup(sys.path.remove, str(self.tmp / 'worker'))
+        sys.modules.pop('gpu_slots', None)
+        import gpu_slots
+        return gpu_slots
+
+    def test_wand_shares_the_second_sam3_place(self):
+        # RTX 5090 설정(SAM3 2개): 마법봉이 떠 있으면 SAM3는 1개만 실행됩니다.
+        self.env['KAIST_SAM3_SLOTS'] = '2'
+        os.environ['KAIST_SAM3_SLOTS'] = '2'
+        self.addCleanup(os.environ.pop, 'KAIST_SAM3_SLOTS', None)
+        g = self.slots()
+        lock = self.tmp / 'worker/gpu_4090_a.lock'
+        shared, wand = g.acquire_wand(lock)
+        self.assertTrue(shared and wand)
+        jobs = [('sam3', 'ep_a'), ('sam3', 'ep_b')]
+        for j in jobs:
+            self.act('start', self.req(*j))
+        time.sleep(1)
+        self.assertEqual(sorted(self.act('status', self.req(*j))['state'] for j in jobs), ['queued', 'running'])
+        wand.close()                                         # 마법봉을 내리면 두 번째 SAM3가 이어서 실행
+        self.finish(jobs)
+
+    def test_waiting_wand_keeps_next_sam3_out(self):
+        self.env['KAIST_SAM3_SLOTS'] = '2'
+        os.environ['KAIST_SAM3_SLOTS'] = '2'
+        self.addCleanup(os.environ.pop, 'KAIST_SAM3_SLOTS', None)
+        g = self.slots()
+        lock = self.tmp / 'worker/gpu_4090_a.lock'
+        for ep in ('ep_a', 'ep_b'):
+            self.act('start', self.req('sam3', ep))
+        time.sleep(1)
+        self.assertEqual(g.acquire_wand(lock), (True, None))   # SAM3 2개 실행 중: 마법봉 자리 없음
+        want = g.want_wand(lock)                             # 마법봉 대기 표시
+        self.assertTrue(want and g.wand_wanted(lock))
+        for ep in ('ep_c', 'ep_d'):
+            self.act('start', self.req('sam3', ep))
+        self.finish([('sam3', 'ep_a'), ('sam3', 'ep_b')])
+        time.sleep(4)                                        # 자리가 비어도 기다리던 SAM3는 1개만 시작(마법봉 자리는 비워 둠)
+        later = [('sam3', 'ep_c'), ('sam3', 'ep_d')]
+        self.assertIn('queued', [self.act('status', self.req(*j))['state'] for j in later])
+        unit = g.acquire_wand(lock)[1]
+        self.assertTrue(unit)                                # 마법봉이 그 자리를 잡음
+        want.close()
+        self.assertFalse(g.wand_wanted(lock))
+        unit.close()
+        self.finish(later)
+
+    def test_4090_wand_needs_no_place(self):
+        os.environ['KAIST_SAM3_SLOTS'] = '1'
+        self.addCleanup(os.environ.pop, 'KAIST_SAM3_SLOTS', None)
+        self.assertEqual(self.slots().acquire_wand(self.tmp / 'worker/gpu_4090_a.lock'), (False, None))
