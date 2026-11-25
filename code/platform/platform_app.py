@@ -854,6 +854,34 @@ def mano_removed(batch_run_id=None):
   rows=c.execute('SELECT batch_run_id,run_id FROM mano_removed'+(' WHERE batch_run_id=?' if batch_run_id else ''),(batch_run_id,) if batch_run_id else ()).fetchall()
  return {(r[0],r[1]) for r in rows}
 
+# ---- 3D 복원 일괄 실행 '대기 목록'에서 에피소드 제거(시작 전) ----
+# 제거 = 작업 환경 전체에서 내리고 작업 데이터를 바로 지웁니다(되돌릴 수 없음):
+#  - 이 PC 작업 폴더와 NAS 작업 사본의 이 에피소드 삭제(Worker purge). RAW 원본과 NAS 최종 결과는 그대로.
+#  - 대기 목록·전체 실행·다른 PC 이관 대상·작업 현황·RAW 목록에서 빠지고, RAW는 모든 PC에서 제외(NAS control/excluded).
+# 실행 기록(Airflow)은 지우지 않고 '데이터 삭제됨'으로 남깁니다(작업 현황의 '제외·삭제한 항목 보기').
+def mano_excluded_db():
+ c=access.db()
+ c.execute('CREATE TABLE IF NOT EXISTS mano_excluded (run_id TEXT PRIMARY KEY,episode TEXT,name TEXT,at REAL)')
+ cols={r[1] for r in c.execute('PRAGMA table_info(mano_excluded)')}
+ for col in ('dag_id','raw_episode'):
+  if col not in cols:
+   try:c.execute(f'ALTER TABLE mano_excluded ADD COLUMN {col} TEXT')
+   except sqlite3.OperationalError:pass
+ return c
+
+# 기록은 두 종류입니다. dag_id가 있으면 데이터까지 삭제한 것(되돌릴 수 없음), 없으면 삭제 기능 이전에
+# '목록에서만 제외'해 둔 것(데이터 그대로 · 되돌리기 가능 · 삭제하려면 다시 확인을 받아야 함).
+_mano_excluded=[0.0,frozenset(),frozenset()]
+def mano_excluded(fresh=False):
+ """대기 목록에서 뺀 실행(run_id) 전체. 목록을 그릴 때 실행마다 묻기 때문에 2초 동안 기억합니다."""
+ if fresh or time.time()-_mano_excluded[0]>2:
+  with mano_excluded_db() as c:rows=c.execute('SELECT run_id,dag_id FROM mano_excluded').fetchall()
+  _mano_excluded[:]=[time.time(),frozenset(r[0] for r in rows),frozenset(r[0] for r in rows if r[1])]
+ return _mano_excluded[1]
+def mano_purged(fresh=False):
+ """그중 작업 데이터까지 삭제한 실행."""
+ mano_excluded(fresh);return _mano_excluded[2]
+
 MANO_DONE=set()  # publish까지 끝난 실행(run_id)은 다시 묻지 않습니다.
 
 RECON_DONE=set();_recon_seen={}  # 3D 복원이 끝난 실행(run_id) · 아직인 실행은 2~3분 동안 다시 묻지 않음(실행마다 시각을 흩어 한 요청에 몰리지 않게)
@@ -877,6 +905,7 @@ def mano_progress(run,history):
  """3D 복원 일괄 실행 기준 진행 표시. (표시, 일괄 실행에 고를 수 있는지)
  첫 실행(낮 실행)은 추적 검수까지만 하므로 대기 중이면 '3D 복원 대기', 이미 3D까지 끝난 예전 실행은 'MANO 대기'."""
  run_id=run['dag_run_id']
+ if run_id in mano_purged():return '데이터 삭제됨',False
  state=history.get(run_id)
  if not state:return waiting_label(run),True
  if BATCH_OF.get(run_id) and (BATCH_OF[run_id],run_id) in mano_removed(BATCH_OF[run_id]):
@@ -905,20 +934,81 @@ class ManoSelection(BaseModel):
 @app.get('/api/pc1/mano')
 def mano_candidates(req:Request):
  guard(req)
- history=batch_history()
+ history=batch_history();excluded=mano_excluded()
  rows=[]
  for run in mano_ready_runs():
   conf=run['conf']
-  if not access.allowed(req,conf['episode_id']):continue
+  if not access.allowed(req,conf['episode_id']) or run['dag_run_id'] in excluded:continue
   label,ready=mano_progress(run,history)
   # ready_at: MANO 대기가 된 시각(3D 복원까지 끝난 실행의 종료 시각) · UI가 날짜별로 나눠 보여 줍니다.
   if ready:rows.append({'run':run['dag_run_id'],'episode':conf['episode_id'],'status':label,'ready_at':run.get('end_date') or run.get('start_date')})
  return list(reversed(rows))
 
+@app.get('/api/pc1/mano/deleted')
+def mano_deleted(req:Request):
+ """대기 목록에서 제거(데이터 삭제)한 에피소드와 삭제 진행 상태. 최근 30일."""
+ guard(req)
+ with mano_excluded_db() as c:rows=[dict(r) for r in c.execute('SELECT run_id,episode,name,at,dag_id FROM mano_excluded WHERE at>? ORDER BY at DESC',(time.time()-30*86400,))]
+ out=[]
+ for r in rows:
+  if not access.allowed(req,r['episode']):continue
+  if not r['dag_id']:  # 목록에서만 제외해 둔 것: 데이터는 그대로
+   out.append({'run':r['run_id'],'episode':r['episode'],'by':r['name'],'at':r['at'],'state':'listed_only'});continue
+  try:st=worker_action('purge-status',{'episode':r['episode']},DEFAULT_WORKER)
+  except Exception as e:st={'state':'unknown','error':str(getattr(e,'detail',e))[:200]}
+  out.append({'run':r['run_id'],'episode':r['episode'],'by':r['name'],'at':r['at'],'state':st.get('state'),'bytes':st.get('bytes'),'error':st.get('error')})
+ return out
+
+class ManoDelete(BaseModel):
+ run_id:str=Field(min_length=1,max_length=250)
+
+@app.post('/api/pc1/mano/delete')
+def mano_delete(data:ManoDelete,req:Request):
+ """대기 목록에서 제거: 작업 환경 전체에서 내리고 작업 데이터를 바로 지웁니다. 이미 제거한 것을 다시 부르면 삭제만 다시 시도합니다."""
+ guard(req)
+ with lock:
+  dag=mano_dag(data.run_id)
+  try:run=local_api('GET',f'/api/v2/dags/{dag}/dagRuns/'+quote(data.run_id,safe=''))
+  except httpx.HTTPStatusError:raise HTTPException(404,'실행을 찾지 못했습니다. 목록을 새로고침하세요.')
+  conf=run['conf'];ep=conf.get('episode_id','');raw=conf.get('raw_episode_id') or ep;access.require(req,ep)
+  again=data.run_id in mano_purged(fresh=True)
+  if not again:
+   if run['state']!='success' or not mano_progress(run,batch_history())[1]:raise HTTPException(409,'3D 복원 대기(또는 MANO 대기) 중인 실행만 제거할 수 있습니다. 목록을 새로고침하세요.')
+   reset_busy(data.run_id)
+   if active_batch_sources(episode=ep) or active_runs(ep):raise HTTPException(409,'이 에피소드의 대기·실행 중인 작업이 있습니다. 먼저 강제 종료하세요.')
+  # Worker가 실행 중인 단계·업로드·초기화를 다시 확인한 뒤 삭제를 시작합니다. 여기서 거절되면 아무것도 바꾸지 않습니다.
+  st=worker_action('purge',{'episode':ep},DEFAULT_WORKER)
+  who=access.user(req)['name']
+  with mano_excluded_db() as c:
+   if not again:c.execute('INSERT OR REPLACE INTO mano_excluded(run_id,episode,name,at,dag_id,raw_episode) VALUES(?,?,?,?,?,?)',(data.run_id,ep,who,time.time(),dag,raw))
+   # 작업 현황에서도 내립니다('제외·삭제한 항목 보기'에 '데이터 삭제됨'으로 남음).
+   c.execute('INSERT OR REPLACE INTO ui_hidden VALUES(?,?,?,?,?)',('jobs',json.dumps([dag,data.run_id],separators=(',',':'),ensure_ascii=False),ep,who,time.time()))
+  mano_excluded(fresh=True)
+  # RAW는 어느 PC에도 다시 배정·표시되지 않게 NAS에 제외 표시를 남깁니다.
+  try:fleet.raw_exclude(raw);forget('nas:excluded','nas:taken')
+  except Exception:pass
+  access.audit(req,'mano-delete '+ep+' '+data.run_id+(' retry' if again else ''))
+  return {'ok':True,'episode':ep,'state':st.get('state'),'again':again}
+
+@app.post('/api/pc1/mano/restore')
+def mano_restore(data:ManoDelete,req:Request):
+ """목록에서만 제외해 둔 에피소드를 대기 목록으로 되돌립니다. 데이터를 삭제한 것은 되돌릴 수 없습니다."""
+ guard(req)
+ with mano_excluded_db() as c:
+  row=c.execute('SELECT episode,dag_id FROM mano_excluded WHERE run_id=?',(data.run_id,)).fetchone()
+  if not row:raise HTTPException(404,'제외 기록이 없습니다. 목록을 새로고침하세요.')
+  access.require(req,row['episode'])
+  if row['dag_id']:raise HTTPException(409,'작업 데이터를 삭제한 에피소드는 되돌릴 수 없습니다.')
+  c.execute('DELETE FROM mano_excluded WHERE run_id=?',(data.run_id,))
+ mano_excluded(fresh=True)
+ access.audit(req,'mano-include '+row['episode']+' '+data.run_id)
+ return {'ok':True,'episode':row['episode']}
+
 @app.post('/api/pc1/mano')
 def launch_mano(data:ManoSelection,req:Request):
  guard(req);update_block()
  if len(set(data.runs))!=len(data.runs):raise HTTPException(400,'중복된 실행입니다.')
+ if set(data.runs)&mano_excluded():raise HTTPException(409,'대기 목록에서 제거한 에피소드가 들어 있습니다. 목록을 새로고침하세요.')
  with lock:
   check_batch_idle()
   # MANO 일괄 실행은 동시 실행 한도(MAX_PARALLEL_RUNS)와 무관하게 시작합니다. GPU 연산 겹침은 Worker GPU 슬롯이 조절합니다.
@@ -1403,6 +1493,8 @@ def raw_episodes(req:Request):
  # 내 작업 고정 칸·큐 부하에서 빠지고 '제외·삭제한 항목 보기'에서만 보입니다. 다시 실행하거나 삭제를 되돌리면 원래대로 돌아옵니다.
  with access.db() as c:hidden_jobs={r['key'] for r in c.execute("SELECT key FROM ui_hidden WHERE scope='jobs'")}
  dropped={ep for ep,(_,dag,r,_m) in latest.items() if r['state']=='failed' and json.dumps([dag,r['dag_run_id']],separators=(',',':'),ensure_ascii=False) in hidden_jobs} if hidden_jobs else set()
+ # 3D 복원 대기 목록에서 제거해 데이터를 삭제한 실행이 마지막 실행인 RAW도 같은 방식으로 내립니다.
+ gone=mano_purged();dropped|={ep for ep,(_,dag,r,_m) in latest.items() if r['dag_run_id'] in gone}
  batch_states=batch_history() if any((v[3]=='day' or v[2]['dag_run_id'] in deferred) and v[2]['state']=='success' for v in latest.values()) else {}
  labels={'prepare_raw':'RAW 전처리','sam_settings_ready':'분할 설정 확인','sam3':'SAM3','mask_approved':'마스크 검수','preflight':'추적 사전 검사','track':'추적','tracking_approved':'추적 검수','prepare_reconstruction':'복원 준비','reconstruct':'3D 복원','hands':'MANO 피팅','validate':'결과 검사','publish':'최종 저장'}
  # 3D 복원까지 끝난 RAW(낮 실행 성공 → MANO 대기/완료, 또는 전체 파이프라인 성공)는 배정 부하에서 빠집니다.
@@ -1689,6 +1781,7 @@ def start_reset(data,req=None,who=None):
  start=RESET_START.get(data.stage)
  wid=dag_worker(data.dag_id)
  if not start or data.dag_id not in [d for w,m,d in active_dags()]:raise HTTPException(400,'초기화할 단계를 확인하세요.')
+ if data.run_id in mano_purged(fresh=True):raise HTTPException(409,'대기 목록에서 제거해 작업 데이터를 삭제한 실행입니다. 다시 하려면 RAW 제외를 풀고 처음부터 실행하세요.')
  with lock:
   reset_busy(data.run_id)
   base=f'/api/v2/dags/{data.dag_id}/dagRuns/'+quote(data.run_id,safe='')
@@ -2483,8 +2576,9 @@ def fleet_snapshot():
    runs.append({'run_id':r['dag_run_id'],'dag':dag,'mode':mode,'episode':conf.get('episode_id'),'raw_episode':raw,'operator':conf.get('operator_id'),
                 'sam_prompt':conf.get('sam_prompt'),'state':r['state'],'stage':stage,'started':r.get('start_date') or r.get('queued_at'),'ended':r.get('end_date')})
  snap['runs']=runs;snap['raw_started']=sorted(e for e in started if e and re.fullmatch(r'ep_\d{8}_\d{6}',e))
- history=batch_history();waiting=[]
+ history=batch_history();waiting=[];excluded=mano_excluded()
  for r in mano_ready_runs():
+  if r['dag_run_id'] in excluded:continue  # 대기 목록에서 제거한 것은 다른 PC 이관 대상에도 넣지 않습니다.
   label,ready=mano_progress(r,history);conf=r['conf']
   if ready:waiting.append({'run_id':r['dag_run_id'],'episode':conf['episode_id'],'raw_episode':conf.get('raw_episode_id'),'operator':conf.get('operator_id'),'sam_prompt':conf.get('sam_prompt'),'status':label})
  snap['mano_waiting']=waiting
@@ -3174,3 +3268,7 @@ def cont_recall(data:ContRecall,req:Request):
 def continuous_script(req:Request):
  guard(req)
  return FileResponse(Path(__file__).parent/'continuous.js',media_type='application/javascript',headers={'Cache-Control':'no-store'})
+
+# ---- 완료된 에피소드 3D 시각화(/viz): MANO 손 메시 · 물체 3D 추적점 · RGB ----
+import viz
+viz.install(app,guard,access)

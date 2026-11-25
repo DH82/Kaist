@@ -113,6 +113,8 @@ services:
       KAIST_WORKER_JOBS_DIR: /var/lib/kaist-worker-jobs
       # 관리자 'RAW 프레임': 단계별 프레임 수(03_prepared/trim·preparation.json, 04_masks/mask_validation.json)를 읽습니다.
       KAIST_WORK_DIR: ${GPU_PROJECT_DIR:-/home/cw-wfm/kaist_work/pc1}
+      # 완료 에피소드 3D 시각화(/viz): MANO 면 정보(모델 weight, 읽기 전용). 변환본은 intake_state/viz_cache에 둡니다.
+      KAIST_MANO_FACES: /opt/kaist-weights/mano_faces.pkl
     group_add: ["${NAS_GID:-65536}"]
     volumes:
       - type: bind
@@ -127,6 +129,7 @@ services:
       - ${NAS_RAW_HOST_PATH:?run ./start.sh first}:/data/raw:ro
       - ${GPU_STATE_DIR:-./gpu_state}/worker/jobs:/var/lib/kaist-worker-jobs:ro
       - ${GPU_PROJECT_DIR:-/home/cw-wfm/kaist_work/pc1}:${GPU_PROJECT_DIR:-/home/cw-wfm/kaist_work/pc1}:ro
+      - {type: bind, read_only: true, bind: {create_host_path: false}, source: "${WEIGHT_MANO_FACES:-${KAIST_WEIGHTS_ROOT:-/home/cw-wfm/Documents/Codex/2026-10-20/https-drive-google-com-drive-folders/outputs/WFM_KAIST/workspace}/kaist-full/PhysTwin/data/mano_faces.pkl}", target: /opt/kaist-weights/mano_faces.pkl}
 
 
   # ---- GPU 파이프라인 컨테이너 (SAM3 → 추적 → 3D 복원 → HaMBA·MANO → NAS 저장) ----

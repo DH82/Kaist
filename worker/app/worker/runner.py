@@ -432,6 +432,54 @@ def reset_run(d):
 # ---- SAM3 분할 대상 저장 (UI 'SAM3 설정 대기' → 이어서 실행) ----
 # RAW 전처리만 하고 sam_settings_ready에서 기다리는 실행에, 파이프라인의 sam_local_setup.approve_only로
 # 03_prepared/<ep>/sam3_settings.json 을 저장합니다. 다음 확인 때 sam_settings_ready가 통과하고 SAM3가 시작됩니다.
+# ---- 에피소드 작업 데이터 삭제 (UI 3D 복원 일괄 실행 대기 목록의 '⊘ 제거') ----
+# 이 PC 작업 폴더와 NAS 작업 사본의 이 에피소드만 바로 지웁니다(RAW 원본·NAS 최종 결과는 그대로, dags/episode_purge.py).
+# NAS 삭제가 오래 걸릴 수 있어 업로드처럼 별도 프로세스로 실행하고 purge-status로 확인합니다.
+PURGE=JOBS/'_purge'
+def _purge_dir(req):
+ if not re.fullmatch('ep_[A-Za-z0-9_]+',req.get('episode','')):raise ValueError('Invalid episode')
+ return PURGE/req['episode']
+def purge_status(req):
+ d=_purge_dir(req)
+ if not (d/'status.json').exists():return {'state':'not_started','episode':req['episode']}
+ st=json.loads((d/'status.json').read_text())
+ if st['state']=='running':
+  pid=st.get('pid')
+  try:alive=bool(pid and b'purge-run' in (Path('/proc')/str(pid)/'cmdline').read_bytes())
+  except OSError:alive=False
+  if not alive and time.time()-st.get('started',0)>20:
+   st={**st,'state':'failed','error':'삭제 프로세스가 중단되었습니다. 다시 시도하세요.'};write(d/'status.json',st)
+ return st
+def purge_start(req):
+ d=_purge_dir(req);ep=req['episode'];d.mkdir(parents=True,exist_ok=True)
+ with (d/'launch.lock').open('a') as lock:
+  fcntl.flock(lock,fcntl.LOCK_EX)
+  st=purge_status(req)
+  if st['state']=='running':return st
+  if any(s.get('episode')==ep and s.get('state') in ('queued','running') for s in _active_jobs()):raise ValueError('이 에피소드의 단계 작업이 실행 중입니다. 끝나거나 강제 종료한 뒤 제거하세요.')
+  if sync_status({'episode':ep})['state']=='running':raise ValueError('이 에피소드를 NAS에 올리는 중입니다. 업로드가 끝난 뒤 제거하세요.')
+  for p in RESET.iterdir() if RESET.is_dir() else []:
+   try:
+    if json.loads((p/'status.json').read_text()).get('state')=='running' and json.loads((p/'request.json').read_text()).get('episode')==ep:raise ValueError('이 에피소드는 단계 초기화 중입니다. 끝난 뒤 제거하세요.')
+   except (OSError,json.JSONDecodeError):continue
+  base={'state':'running','episode':ep,'started':time.time()}
+  write(d/'status.json',base)
+  with (d/'purge.log').open('ab') as log:
+   proc=subprocess.Popen(['/usr/bin/python3',str(__file__),'purge-run',ep],stdin=subprocess.DEVNULL,stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
+  write(d/'status.json',{**base,'pid':proc.pid})
+ return purge_status(req)
+def purge_run(episode):
+ d=_purge_dir({'episode':episode});started=json.loads((d/'status.json').read_text()).get('started',time.time())
+ print('작업 데이터 삭제 시작:',episode,time.strftime('%Y-%m-%d %H:%M:%S'),flush=True)
+ try:
+  sys.path.insert(0,str(ADAPTER.parent))
+  import episode_purge
+  rec=episode_purge.purge(json.loads(CONFIG.read_text()),episode,lambda m:print(m,flush=True))
+  write(d/'status.json',{'state':'success','episode':episode,'started':started,'pid':os.getpid(),'finished':time.time(),'bytes':rec['bytes'],'paths':len(rec['removed']),'nas':rec['nas']})
+ except Exception as e:
+  traceback.print_exc()
+  write(d/'status.json',{'state':'failed','episode':episode,'started':started,'pid':os.getpid(),'finished':time.time(),'error':str(e)[-600:]})
+
 def sam_settings(req):
  ep=req.get('episode','');prompt=str(req.get('prompt') or '').strip()
  if not re.fullmatch('ep_[A-Za-z0-9_]+',ep):raise ValueError('Invalid episode')
@@ -448,6 +496,7 @@ if __name__=='__main__':
  if sys.argv[1]=='run':run(Path(sys.argv[2]))
  elif sys.argv[1]=='sync-run':sync_run(sys.argv[2])
  elif sys.argv[1]=='reset-run':reset_run(Path(sys.argv[2]))
+ elif sys.argv[1]=='purge-run':purge_run(sys.argv[2])
  else:
   req=json.load(sys.stdin);action=sys.argv[1]
   if action=='stop':print(json.dumps(stop(req)))
@@ -459,6 +508,8 @@ if __name__=='__main__':
   elif action=='reset-status':print(json.dumps(reset_status(req),ensure_ascii=False))
   elif action=='drift':print(json.dumps(drift(req),ensure_ascii=False))
   elif action=='stop-all':print(json.dumps(stop_all(req),ensure_ascii=False))
+  elif action=='purge':print(json.dumps(purge_start(req),ensure_ascii=False))
+  elif action=='purge-status':print(json.dumps(purge_status(req),ensure_ascii=False))
   else:
    p=folder(req)
    print(json.dumps(start(req) if action=='start' else retry(req) if action=='retry' else rewind(req) if action=='rewind' else status(p)))

@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WFM · Local 3D review</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23111925'/%3E%3Cpath d='M5 9l5 15 6-11 6 11 5-15' fill='none' stroke='%237cb5ed' stroke-width='3'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="style.css">
+  <script type="importmap">{"imports":{"three":"./vendor/three.module.js"}}</script>
+</head>
+<body>
+  <header><a class="brand" href="#">WFM <span>LAB</span></a><div class="headtitle"><h1>Episode <span>/ 3D review</span></h1><p id="episode">산출물 불러오는 중</p></div><span class="local">OFFLINE VIEWER</span></header>
+  <main>
+    <div id="alert" role="alert" hidden></div>
+    <section class="workspace">
+      <div class="scene-panel">
+        <div class="panel-title"><span>3D SCENE</span><div><button id="reset">시점 초기화</button><button id="top">위에서 보기</button></div></div>
+        <div id="scene"><div id="loading">3D 산출물을 준비하고 있습니다…</div></div>
+        <div class="scene-caption"><span><i class="dot hand"></i>MANO 손 메시</span><span><i class="dot object"></i>물체 3D 추적점</span><span class="hint">드래그 회전 · 휠 확대 · 우클릭 이동</span></div>
+      </div>
+      <aside class="rgb-panel">
+        <div class="panel-title"><span>RGB REFERENCE</span><select id="camera" aria-label="RGB 카메라"></select></div>
+        <div class="rgb-stage"><canvas id="rgb" role="img" aria-label="동일 프레임의 카메라 RGB 영상"></canvas><span class="frame-badge" id="rgb-frame"></span></div>
+        <div class="settings">
+          <h2>표시 설정</h2>
+          <label><span><i class="dot hand"></i>손 메시</span><input id="show-hand" type="checkbox" checked></label>
+          <label><span><i class="dot object"></i>물체 추적점</span><input id="show-object" type="checkbox" checked></label>
+          <label><span>손 와이어프레임</span><input id="wireframe" type="checkbox"></label>
+          <label><span>물체 원본 색상</span><input id="original-color" type="checkbox"></label>
+          <label><span>바닥 격자</span><input id="grid" type="checkbox" checked></label>
+          <label><span>점 크기</span><input id="point-size" type="range" min="1" max="6" value="3" step="0.5"></label>
+        </div>
+      </aside>
+    </section>
+    <section class="transport">
+      <div class="playback"><button id="previous" aria-label="이전 프레임">◀</button><button id="play" class="primary" aria-label="재생">재생</button><button id="next" aria-label="다음 프레임">▶</button><div class="time"><strong id="frame">—</strong><span id="time">—</span></div><label class="speed">재생 속도<select id="speed"><option value="0.25">0.25×</option><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="2">2×</option></select></label></div>
+      <input id="timeline" aria-label="프레임 탐색" type="range" min="0" max="0" value="0" step="1"><div class="timeline-label"><span>START</span><span id="duration"></span><span>END</span></div>
+    </section>
+    <footer><p id="source"></p><p id="status">원본 데이터 프레임에 맞춰 재생합니다.</p></footer>
+  </main>
+  <script type="module" src="app.js"></script>
+</body>
+</html>

@@ -2,10 +2,15 @@
 // 작업자: 분배·배정받은 RAW를 하나씩 띄워 카메라 1~4 첫 프레임에 포인트(카메라당 최대 20개)와 분할 대상을 넣고 '완료'하면
 // 대기열에 쌓이고 바로 다음 RAW가 나옵니다. 대기열은 서버가 완료한 순서대로 하나씩(앞 RAW 전처리~SAM3가 끝나면 다음) 실행합니다.
 // 관리자: PC 현황 화면에서 남은 RAW를 고른 PC(작업자)들에 균등 분배·회수합니다.
-// 손 포인트: 이 PC 기본 분할 방식이 '물체 포인트 + 손 포인트'일 때만 함께 찍습니다(contHandOn). 찍는 대상은 버튼이나 H 키로 바꿉니다.
+// 손 포인트: '찍는 대상: 물체 / 손' 버튼은 항상 보입니다(H 키로 전환). 손을 카메라 4대 모두에 찍으면 손 포인트 방식,
+// 하나도 안 찍으면 손 텍스트 방식으로 실행합니다. 이 PC 기본 분할 방식이 '물체 포인트 + 손 포인트'이면 손 포인트가 필수입니다(contHandMust).
 let contHand={},contTarget='object';
-function contHandOn(){return typeof samDefault!=='undefined'&&!!samDefault&&samDefault.mode==='point_track_hand'}
+function contHandOn(){return true}
+function contHandMust(){return typeof samDefault!=='undefined'&&!!samDefault&&samDefault.mode==='point_track_hand'}
 function contHandReady(c){return (contHand[c]||[]).some(p=>p[2]===1)}
+function contHandUsed(){return [1,2,3,4].some(c=>(contHand[c]||[]).length)}
+// 손 포인트는 4대 모두 찍거나(손 포인트 방식), 기본값이 손 포인트가 아니면 하나도 안 찍어도(손 텍스트 방식) 됩니다.
+function contHandOk(){return [1,2,3,4].every(contHandReady)||(!contHandMust()&&!contHandUsed())}
 let contDeferInit=false,contData=null,contEp='',contPoints={},contHistory=[],contLoaded=new Set(),contGen=0,contBusy=false,contSubmitting=false;
 const contSkipped=[];  // 이번 화면에서 '건너뛰기'한 RAW(목록 뒤로)
 const CONT_MAX_POINTS=20;
@@ -14,14 +19,15 @@ function contTodo(){
  return list.filter(e=>!contSkipped.includes(e)).concat(contSkipped.filter(e=>list.includes(e)));
 }
 function contObject(ep){const t=(contData&&contData.todo||[]).find(x=>x.episode===ep);return t?t.object:null}
-function contReady(){return contEp&&contLoaded.size===4&&[1,2,3,4].every(c=>(contPoints[c]||[]).some(p=>p[2]===1)&&(!contHandOn()||contHandReady(c)))&&$('contPrompt').value.trim()}
+function contReady(){return contEp&&contLoaded.size===4&&[1,2,3,4].every(c=>(contPoints[c]||[]).some(p=>p[2]===1))&&contHandOk()&&$('contPrompt').value.trim()}
 function contStatus(text){$('contPickStatus').textContent=text||''}
 function contButtons(){
  $('contDone').disabled=contSubmitting||!contReady();$('contUndo').disabled=!contHistory.length;
  const done=[1,2,3,4].filter(c=>(contPoints[c]||[]).some(p=>p[2]===1)).length;
  if(!contEp)return;
- const hand=contHandOn(),handDone=[1,2,3,4].filter(contHandReady).length;
- contStatus(contLoaded.size<4?'첫 프레임 사진을 불러오는 중…':hand&&(done<4||handDone<4)?'물체 '+done+'/4 · 손 '+handDone+'/4 · 카메라마다 물체와 손을 각각 클릭하세요. 지금 찍는 대상: '+(contTarget==='hand'?'손':'물체')+' (H 키로 전환)':done<4?'포인트 '+done+'/4 · 카메라마다 물체 위를 한 번 이상 클릭하세요.':!$('contPrompt').value.trim()?'분할 대상(텍스트)을 입력하세요.':'준비 완료 · "완료 · 다음"을 누르면 대기열에 넣고 다음 RAW로 넘어갑니다.');
+ const must=contHandMust(),used=contHandUsed(),handDone=[1,2,3,4].filter(contHandReady).length;
+ const how=must?'카메라마다 물체와 손을 각각 클릭하세요.':used?'손 포인트는 카메라 4대 모두에 찍거나 모두 지우세요(지우면 손은 텍스트로 분할).':'카메라마다 물체를 클릭하세요. 손도 포인트로 지정하려면 "손"을 눌러 4대 모두 찍으세요(안 찍으면 손은 텍스트로 분할).';
+ contStatus(contLoaded.size<4?'첫 프레임 사진을 불러오는 중…':done<4||!contHandOk()?'물체 '+done+'/4 · 손 '+handDone+'/4 · '+how+' 지금 찍는 대상: '+(contTarget==='hand'?'손':'물체')+' (H 키로 전환)':!$('contPrompt').value.trim()?'분할 대상(텍스트)을 입력하세요.':'준비 완료 · 손은 '+(handDone===4?'포인트':'텍스트')+'로 분할 · "완료 · 다음"을 누르면 대기열에 넣고 다음 RAW로 넘어갑니다.');
 }
 function contLabel(c){
  const pts=contPoints[c]||[],hands=contHand[c]||[],count=a=>{const pos=a.filter(p=>p[2]===1).length;return '포함 '+pos+' · 제외 '+(a.length-pos)},clear=' <button type="button" class="linkbtn" data-cont-clear="'+c+'">지우기</button>';
@@ -33,7 +39,7 @@ function contSetTarget(target){
  for(const b of $('contTarget').querySelectorAll('[data-cont-target]')){const on=b.dataset.contTarget===contTarget;b.classList.toggle('current',on);b.setAttribute('aria-pressed',on)}
  contButtons();
 }
-// 기본 분할 방식이 바뀌면(실행 화면의 '기본값으로 저장') 손 포인트 찍기를 켜거나 끕니다.
+// 기본 분할 방식이 바뀌면(실행 화면의 '기본값으로 저장') 손 포인트가 필수인지 여부가 바뀝니다.
 function contHandView(){$('contTarget').hidden=!contHandOn();if(!contHandOn())contHand={};contSetTarget(contTarget);[1,2,3,4].forEach(contPaint)}
 function contPaint(c){
  const canvas=$('contImages').querySelector('canvas[data-cam="'+c+'"]');if(!canvas)return;
@@ -88,7 +94,7 @@ $('contSkip').onclick=()=>{
 $('contDone').onclick=async()=>{
  if(!contReady()||contSubmitting)return;contSubmitting=true;contButtons();
  const round=a=>a.map(([x,y,l])=>[Math.round(x*10000)/10000,Math.round(y*10000)/10000,l]);
- const ep=contEp,points={},hands=contHandOn()?{}:null;for(const c of [1,2,3,4]){points[String(c-1)]=round(contPoints[c]);if(hands)hands[String(c-1)]=round(contHand[c])}
+ const ep=contEp,points={},hands=[1,2,3,4].every(contHandReady)?{}:null;for(const c of [1,2,3,4]){points[String(c-1)]=round(contPoints[c]);if(hands)hands[String(c-1)]=round(contHand[c])}
  try{
   await api('/api/continuous/submit',{method:'POST',body:JSON.stringify({episode:ep,sam_prompt:$('contPrompt').value.trim(),points,hand_points:hands,defer_mano:!$('contDeferBox').hidden&&$('contDefer').checked,target_fps:targetFps()})});
   const i=contSkipped.indexOf(ep);if(i>=0)contSkipped.splice(i,1);
