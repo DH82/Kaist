@@ -496,6 +496,35 @@ class Wand:
 
 
 wand = Wand()
+_mesh_lock = threading.Lock()
+MESH_CODE = r'''
+import json, sys, pickle, io
+import numpy as np, torch
+sys.path.insert(0, 'data_process')
+from models.mano_wrapper import MANO
+class U(pickle.Unpickler):
+    def find_class(self, m, n):
+        if m == 'torch.storage' and n == '_load_from_bytes': return lambda b: torch.load(io.BytesIO(b), map_location='cpu', weights_only=False)
+        return super().find_class(m, n)
+a = json.loads(sys.argv[1])
+regs = []
+for p in a['regs']:
+    with open(p, 'rb') as f: regs.append(U(f).load())
+frames = sorted(set.intersection(*[set(r) for r in regs]))
+V = np.stack([np.stack([np.asarray(r[f]['right'], np.float32) for f in frames]) for r in regs])   # [방식, 프레임, 778, 3] (m)
+faces = np.asarray(MANO(data_dir='data_process/Hamba/_DATA/data/', model_path='data_process/Hamba/_DATA/data/mano', gender='neutral', num_hand_joints=15,
+                        mean_params='data_process/Hamba/_DATA/data/mano_mean_params.npz', create_body_pose=False).faces, np.int32)
+dist = np.linalg.norm(V[0] - V[1], axis=2) * 1000                                                # [프레임, 778] mm
+center = V.reshape(-1, 3).mean(0)
+out = a['out']
+(V - center).astype('<f4').tofile(out + '/mesh.bin.tmp')
+import os; os.replace(out + '/mesh.bin.tmp', out + '/mesh.bin')
+meta = {'names': a['names'], 'frames': frames, 'vertices': int(V.shape[2]), 'faces': faces.reshape(-1).tolist(), 'center': center.tolist(),
+        'dist_mean_mm': [round(float(x), 2) for x in dist.mean(1)], 'dist_max_mm': [round(float(x), 2) for x in dist.max(1)],
+        'dist_vertex_mean_mm': [round(float(x), 2) for x in dist.mean(0)]}
+with open(out + '/mesh.json.tmp', 'w') as f: json.dump(meta, f)
+os.replace(out + '/mesh.json.tmp', out + '/mesh.json')
+'''
 
 
 def preview(ep, f):
@@ -745,6 +774,46 @@ def setup(app, guard, access, csrf):
         p = COMPARE_OUT / ep / ('compare.mp4' if v == 'compare' else f'{v}/review/mano_review.mp4')
         if not p.is_file(): raise HTTPException(404, '영상이 없습니다.')
         return FileResponse(p, media_type='video/mp4', headers={'Cache-Control': 'no-store'})
+
+    @app.get('/mano-beta/compare')
+    def compare_page(req: Request, ep: str = ''):
+        guard(req)
+        html = (HERE / 'hand-compare.html').read_text().replace('__CSRF__', csrf)
+        return HTMLResponse(html, headers={'Cache-Control': 'no-store', 'Content-Security-Policy':
+                            "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self'; frame-ancestors 'self'"})
+
+    @app.get('/mano-beta/vendor/{name}')
+    def compare_vendor(req: Request, name: str):
+        guard(req)
+        if name not in ('three.module.js', 'OrbitControls.js'): raise HTTPException(404, '없음')
+        return FileResponse(REPO / 'code/viewer/app/vendor' / name, media_type='application/javascript', headers={'Cache-Control': 'max-age=3600'})
+
+    @app.get('/api/hand-shape/compare/mesh')
+    def compare_mesh(req: Request, ep: str, part: str = 'json'):
+        """두 방식 손 메시(프레임별 778점)를 3D 비교용으로 변환: Set2/<ep>/viewer/mesh.json + mesh.bin(float32 [방식,프레임,778,3])."""
+        guard(req)
+        if not EP.fullmatch(ep) or part not in ('json', 'bin'): raise HTTPException(400, '잘못된 요청입니다.')
+        d = COMPARE_OUT / ep; v = d / 'viewer'
+        try: summ = json.loads((d / 'summary.json').read_text())
+        except (OSError, ValueError): raise HTTPException(404, '비교 결과가 없습니다.')
+        names = list(summ['variants'])
+        regs = [d / n / 'hand_v1/hand_reg.pkl' for n in names]
+        fresh = (v / 'mesh.json').exists() and (v / 'mesh.bin').exists() and all((v / 'mesh.json').stat().st_mtime >= r.stat().st_mtime for r in regs)
+        if not fresh:
+            with _mesh_lock:
+                if not ((v / 'mesh.json').exists() and all((v / 'mesh.json').stat().st_mtime >= r.stat().st_mtime for r in regs)):
+                    v.mkdir(exist_ok=True)
+                    r = subprocess.run([str(workspace() / 'hamba-env/bin/python'), '-c', MESH_CODE, json.dumps({'regs': [str(x) for x in regs], 'names': names, 'out': str(v)})],
+                                       cwd=mono(), env=hands_env(), capture_output=True, text=True, timeout=300)
+                    if r.returncode: raise HTTPException(500, '메시 변환 실패: ' + r.stderr[-400:])
+        if part == 'bin': return FileResponse(v / 'mesh.bin', media_type='application/octet-stream', headers={'Cache-Control': 'no-store'})
+        meta = json.loads((v / 'mesh.json').read_text())
+        meta['summary'] = summ
+        try:
+            a = json.loads((COMPARE_OUT / 'shape_analysis.json').read_text())
+            meta['analysis'] = next((e for e in a['episodes'] if e['episode'] == ep), None); meta['profile_size'] = a['profile']['size']
+        except (OSError, ValueError, KeyError): pass
+        return meta
 
     @app.get('/api/hand-profiles')
     def profiles(req: Request, fresh: int = 0):
