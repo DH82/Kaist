@@ -190,6 +190,9 @@ function hcEditBind(cam){
   if(ev.button!==0&&!(wand&&ev.button===2))return;
   const blocked=hcEditBlocked();if(blocked){hcEditMessage(blocked,true);return}
   ev.preventDefault();hcStop();$('hcEditState').classList.remove('error');
+  // preventDefault로 브라우저가 포커스를 옮기지 않으므로, '대상'(물체 · 초록) 선택칸이나 물체 이름 칸에 포커스가 남아
+  // Enter(적용·저장)·Esc·Backspace 단축키가 입력칸 몫으로 무시되던 문제를 막습니다. 화면을 누르면 입력칸 포커스를 풉니다.
+  const focused=document.activeElement;if(focused&&focused!==document.body&&focused.closest('#hcWorkspace'))focused.blur();
   const p=hcEditPoint(cam,ev);
   // 마법봉 오른쪽 클릭은 더블클릭과 겹치지 않으므로 바로 '제외' 점으로 씁니다.
   if(wand&&ev.button===2){hcWandClick(cam,p,0);return}
@@ -427,7 +430,9 @@ function hcSetTool(tool){
  for(let c=0;c<4;c++)hcEditRing(c,null);
 }
 $('hcBrush').onclick=()=>hcSetTool('add');$('hcEraser').onclick=()=>hcSetTool('erase');$('hcWand').onclick=()=>hcSetTool('wand');
-$('hcRadius').oninput=()=>$('hcRadiusLabel').textContent=$('hcRadius').value+'px';
+// 브러시·지우개 반경은 바꾼 값을 브라우저에 기억해, 프레임·에피소드를 옮기거나 새로고침·다시 접속해도 그 반경으로 이어서 작업합니다.
+$('hcRadius').oninput=()=>{$('hcRadiusLabel').textContent=$('hcRadius').value+'px';try{localStorage.setItem('kaistHcRadius',$('hcRadius').value)}catch(_){}};
+try{const el=$('hcRadius'),v=Math.round(Number(localStorage.getItem('kaistHcRadius')));if(v>=Number(el.min)&&v<=Number(el.max)){el.value=v;$('hcRadiusLabel').textContent=v+'px'}}catch(_){}
 // [ ] 로 브러시 반경을 줄이고 키웁니다(작을 때는 1px, 클수록 크게).
 function hcRadiusStep(dir){const el=$('hcRadius'),v=Number(el.value),step=v<10?1:v<30?2:5;el.value=Math.max(Number(el.min),Math.min(Number(el.max),v+dir*step));el.oninput()}
 $('hcWandUndo').onclick=hcWandUndoPoint;
