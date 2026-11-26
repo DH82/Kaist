@@ -18,7 +18,7 @@ import argparse, datetime, hashlib, json, os, re, sys, time
 from pathlib import Path
 
 SCHEMA = 'kaist-mano-shape-profile/v1'
-ALGORITHM = 'mano-geometric-profile-shape-v3'  # v8 설정(손가락·재검출·삼각측량·깊이)과 함께 쓰는 프로필 피팅 (v1 = v6, v2 = v7)
+ALGORITHM = 'mano-geometric-profile-shape-v2'  # v7 손가락 설정과 함께 쓰는 프로필 피팅 (v1 = v6 설정)
 ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$')
 
 

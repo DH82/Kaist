@@ -40,9 +40,7 @@ def fit_settings(side,side_source,profile=None):
  if side not in ('right','both'):raise ValueError('Unsupported hand side')
  # v7(2026-11-26): 손가락이 영상을 따라가도록 손가락 시간축 가중치 5e5 → 500, 전체 화면에서 못 찾은 MediaPipe 손은
  # 손 마스크 주변을 잘라 다시 검출(mp_crop), MediaPipe 관절을 ±4프레임 평활(mp_smooth). v6 결과는 새 시도로 다시 피팅합니다.
- # v8(2026-11-26): 첫 프레임 손 위치를 MediaPipe 다중 카메라 삼각측량으로 잡고(triangulate_init), 손 표면을 깊이 영상에 맞춤(w_depth).
- #   HaMBA 단일 영상 깊이로 시작하면 손이 물체 위로 5~9cm 떠 있던 문제(ep_20261126_054941) 해결용.
- settings={'algorithm':'mano-geometric-shared-shape-v8','rotation_representation':'6D_to_SO3','side':side,'side_source':side_source,'iterations':1500,'temp_weight':500000,'hamba_weight':.01,'seed':1027,'num_cams':4,'w_mask':1.0,'w_mask_cover':1.0,'cover_max_px':40.0,'wrist_weight':0.1,'staged_fit':True,'w_silhouette':0.0,'silhouette_size':64,'silhouette_every':10,'pose_temp_weight':500,'w_pose_prior':25.0,'shared_shape':True,'shape_frames':'','shape_frame_count':12,'shape_iters':3000,'shape_lr':1e-3,'shape_prior_weight':1.0,'shape_max_delta':1.0,'camera_init_iters':300,'fit_shape':False,'fit_shape_lr':2e-3,'fit_shape_max_delta':0.0,'fit_shape_temporal_weight':1.0,'robust_joint_delta':5.0,'mp_crop':True,'mp_smooth':4,'triangulate_init':True,'w_depth':1.0}
+ settings={'algorithm':'mano-geometric-shared-shape-v7','rotation_representation':'6D_to_SO3','side':side,'side_source':side_source,'iterations':1500,'temp_weight':500000,'hamba_weight':.01,'seed':1027,'num_cams':4,'w_mask':1.0,'w_mask_cover':1.0,'cover_max_px':40.0,'wrist_weight':0.1,'staged_fit':True,'w_silhouette':0.0,'silhouette_size':64,'silhouette_every':10,'pose_temp_weight':500,'w_pose_prior':25.0,'shared_shape':True,'shape_frames':'','shape_frame_count':12,'shape_iters':3000,'shape_lr':1e-3,'shape_prior_weight':1.0,'shape_max_delta':1.0,'camera_init_iters':300,'fit_shape':False,'fit_shape_lr':2e-3,'fit_shape_max_delta':0.0,'fit_shape_temporal_weight':1.0,'robust_joint_delta':5.0,'mp_crop':True,'mp_smooth':4}
  if profile:
   # 형상만 프로필로 고정하고 나머지 피팅 설정은 그대로입니다. 프로필 없는 실행의 설정 값은 바꾸지 않습니다.
   settings.update(algorithm=hand_profile.ALGORITHM,shared_shape=False,shape_profile={'id':profile['id'],'sha256':profile['sha256']})
@@ -111,13 +109,6 @@ def resized_view(case,prepared,mask,infos,wh):
    dst=case/'mask'/str(c)/f.relative_to(mask/str(c));dst.parent.mkdir(parents=True,exist_ok=True)
    with Image.open(f) as im:im.convert('L').resize((W,H),Image.NEAREST).point(lambda v:255 if v>127 else 0).save(dst)
   (case/'mask'/str(c)).mkdir(parents=True,exist_ok=True);link(case/'mask'/f'mask_info_{c}.json',info)
- if (prepared/'depth').is_dir():  # v8 깊이 항: 깊이 값은 그대로, 픽셀만 최근접으로 늘림
-  import numpy as np
-  for cam in sorted(p for p in (prepared/'depth').iterdir() if p.is_dir()):
-   dst=case/'depth'/cam.name;dst.mkdir(parents=True,exist_ok=True)
-   for f in cam.glob('*.npy'):
-    d=np.load(f);ys=np.minimum((np.arange(H)+.5)/sy-.5,d.shape[0]-1).round().astype(int).clip(0);xs=np.minimum((np.arange(W)+.5)/sx-.5,d.shape[1]-1).round().astype(int).clip(0)
-    np.save(dst/f.name,d[ys][:,xs])
  meta=json.loads((prepared/'metadata.json').read_text())
  ks=[]
  for K in meta['intrinsics']:
@@ -144,7 +135,6 @@ def prepare_view(out,prepared,mono,episode):
  else:
   for name in ('color','metadata.json','calibrate.pkl','source_frames.json'):
    link(case/name,prepared/name)
-  if (prepared/'depth').is_dir():link(case/'depth',prepared/'depth')  # v8 깊이 항
   # Keep approved PNGs and semantic IDs together in the disposable runtime view.
   (case/'mask').mkdir(exist_ok=True)
   for c,info in infos.items():
@@ -222,8 +212,6 @@ def run(case,side=None,check=False,new=False,open_view=True,profile_ref=None):
      cmd += ['--'+key,str(settings[key])]
     if settings.get('mp_crop'):cmd += ['--mp_crop']
     if settings.get('mp_smooth'):cmd += ['--mp_smooth',str(settings['mp_smooth'])]
-    if settings.get('triangulate_init'):cmd += ['--triangulate_init']
-    if settings.get('w_depth'):cmd += ['--w_depth',str(settings['w_depth'])]
     if settings['fit_shape']:cmd += ['--fit_shape']
     if settings['staged_fit']:cmd += ['--staged_fit']
     if settings.get('shape_profile'):

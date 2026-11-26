@@ -88,7 +88,6 @@ def build_view(out, prepared, mono, ep, mask, infos):
         fh.resized_view(case, prepared, mask, infos, wh)
     else:
         for name in ('color', 'metadata.json', 'calibrate.pkl', 'source_frames.json'): fh.link(case / name, prepared / name)
-        if (prepared / 'depth').is_dir(): fh.link(case / 'depth', prepared / 'depth')
         (case / 'mask').mkdir(exist_ok=True)
         for c, info in infos.items():
             fh.link(case / 'mask' / str(c), mask / str(c)); fh.link(case / 'mask' / f'mask_info_{c}.json', info)
@@ -155,8 +154,6 @@ def compare(ep, profile_id, dest_root, status):
             if settings['staged_fit']: cmd += ['--staged_fit']
             if settings.get('mp_crop'): cmd += ['--mp_crop']
             if settings.get('mp_smooth'): cmd += ['--mp_smooth', str(settings['mp_smooth'])]
-            if settings.get('triangulate_init'): cmd += ['--triangulate_init']
-            if settings.get('w_depth'): cmd += ['--w_depth', str(settings['w_depth'])]
             if settings.get('shape_profile'):
                 cmd += ['--shape_profile', str(profile_path), '--shape_profile_sha256', settings['shape_profile']['sha256']]
             if settings['shared_shape']:

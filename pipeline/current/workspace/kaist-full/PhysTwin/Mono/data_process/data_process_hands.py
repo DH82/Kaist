@@ -65,9 +65,6 @@ PROFILE_ALGORITHM_VERSION = "mano-geometric-profile-shape-v1"
 #     (18_fit_hands.py가 손가락 시간축 가중치 500과 함께 넘김.) 옵션이 없으면 위의 v6/v1 그대로입니다.
 V7_ALGORITHM_VERSION = "mano-geometric-shared-shape-v7"
 V7_PROFILE_ALGORITHM_VERSION = "mano-geometric-profile-shape-v2"
-# v8: v7 + 첫 프레임 위치를 MediaPipe 다중 카메라 삼각측량으로 잡고(--triangulate_init), 손 표면을 깊이 영상에 맞춤(--w_depth).
-V8_ALGORITHM_VERSION = "mano-geometric-shared-shape-v8"
-V8_PROFILE_ALGORITHM_VERSION = "mano-geometric-profile-shape-v3"
 SHAPE_PROFILE_SCHEMA = "kaist-mano-shape-profile/v1"
 from timer_logger import TimerLogger
 
@@ -140,11 +137,6 @@ parser.add_argument('--silhouette_every', type=int, default=5)
 parser.add_argument('--staged_fit', action='store_true', help='Global, proximal, then full pose fitting')
 parser.add_argument('--pose_temp_weight', type=float, default=None,
                     help='Separate finger-pose temporal weight; default preserves temp_weight')
-parser.add_argument('--triangulate_init', action='store_true',
-                    help='v8: place the first-frame hand at the multi-view triangulation of MediaPipe wrist/MCP joints (before and after camera init)')
-parser.add_argument('--w_depth', type=float, default=0.0,
-                    help='v8: weight of the depth-image term (Huber mm between camera-facing hand vertices and the depth map inside the hand mask)')
-parser.add_argument('--depth_huber_mm', type=float, default=10.0)
 parser.add_argument('--mp_crop', action='store_true',
                     help='v7: frames where full-image MediaPipe found no right hand are re-detected on a 2x upscaled crop '
                          '(2.2x the hand-mask box); kept only as Left (=right hand) with score>=0.9 and >=80%% joints on the mask')
@@ -185,9 +177,6 @@ if args.shape_profile_sha256 and not args.shape_profile: parser.error('--shape_p
 if args.mp_smooth < 0: parser.error('--mp_smooth must be nonnegative')
 if args.mp_crop or args.mp_smooth:
     ALGORITHM_VERSION, PROFILE_ALGORITHM_VERSION = V7_ALGORITHM_VERSION, V7_PROFILE_ALGORITHM_VERSION
-if args.w_depth < 0: parser.error('--w_depth must be nonnegative')
-if args.triangulate_init or args.w_depth > 0:
-    ALGORITHM_VERSION, PROFILE_ALGORITHM_VERSION = V8_ALGORITHM_VERSION, V8_PROFILE_ALGORITHM_VERSION
 if args.shape_profile: ALGORITHM_VERSION = PROFILE_ALGORITHM_VERSION
 if args.shape_frame_count < 1 or args.shape_iters < 1 or args.shape_lr <= 0 or args.shape_max_delta <= 0 or args.shape_prior_weight < 0: parser.error('invalid shape calibration settings')
 
@@ -1559,83 +1548,6 @@ def align_initial_camera(params, targets, valid, c2w, w2c, ref, is_right, fidx):
     return params
 
 
-TRI_JOINTS = [0, 5, 9, 13, 17]  # 손목 + 손가락 뿌리(MediaPipe·MANO 관절 순서 같음)
-
-
-def triangulate_shift(params, gt_2d, gt_valid, c2w, w2c, ref, is_right, fidx, tag):
-    """v8: 손목·손가락 뿌리를 카메라 2대 이상에서 DLT 삼각측량해, 현재 손 관절과의 평균 차이만큼 이동(회전·형상·손가락 그대로)."""
-    if REAL_KS is None: return params
-    k2 = gt_2d.detach().cpu().numpy(); cf = gt_valid.detach().cpu().numpy().reshape(NUM_CAMS, -1)
-    W2C = w2c.detach().cpu().numpy(); tri = {}
-    for j in TRI_JOINTS:
-        cams = [c for c in range(NUM_CAMS) if cf[c, j] >= 0.5]
-        if len(cams) < 2: continue
-        A = []
-        for c in cams:
-            P = np.asarray(REAL_KS[c], float) @ W2C[c][:3, :4]; u, v = k2[c, j, 0], k2[c, j, 1]
-            A += [u * P[2] - P[0], v * P[2] - P[1]]
-        X = np.linalg.svd(np.asarray(A))[2][-1]; X = X[:3] / X[3]
-        err = []
-        for c in cams:
-            P = np.asarray(REAL_KS[c], float) @ W2C[c][:3, :4]; q = P @ np.append(X, 1.0)
-            err.append(np.hypot(q[0] / q[2] - k2[c, j, 0], q[1] / q[2] - k2[c, j, 1]))
-        if np.mean(err) <= 20.0: tri[j] = X
-    if len(tri) < 2:
-        print(f'[triangulate init] f{fidx} {tag}: too few triangulated joints ({len(tri)}); unchanged', flush=True); return params
-    with torch.no_grad():
-        pred = mano(global_orient=params['global_orient'], hand_pose=params['hand_pose'], betas=params['betas'], pose2rot=False)
-        jt = pred.joints[0].clone()
-        if not is_right: jt[:, 0] *= -1.
-        jt = jt + params['transl']
-        jw = (jt @ c2w[ref, :3, :3].T + c2w[ref, :3, 3]).cpu().numpy()
-    delta = np.mean([tri[j] - jw[j] for j in tri], axis=0)
-    d_ref = torch.as_tensor(np.asarray(W2C[ref][:3, :3] @ delta, dtype=np.float32), device=params['transl'].device)
-    params['transl'] = (params['transl'].detach() + d_ref.reshape(params['transl'].shape)).requires_grad_(True)
-    print(f'[triangulate init] f{fidx} {tag}: joints {sorted(tri)} shift {np.round(delta * 1000, 1).tolist()} mm', flush=True)
-    return params
-
-
-DEPTH_ERODE_PX = 3
-
-
-def depth_targets(fidx, ids):
-    """v8: 카메라별 깊이 영상(m)과 손 마스크(3px 깎음). 없으면 None. (C,1,H,W) 텐서 둘."""
-    Ds, Ms = [], []
-    for c in range(NUM_CAMS):
-        dp = f'{phystwin_base_path}/{case_name}/depth/{c}/{fidx}.npy'
-        mp_ = f'{phystwin_base_path}/{case_name}/mask/{c}/{ids[c]}/{fidx}.png'
-        m = cv2.imread(mp_, 0) if os.path.exists(mp_) else None
-        if not os.path.exists(dp) or m is None: return None
-        d = np.load(dp).astype(np.float32); d = d / 1000.0 if d.max() > 50 else d
-        m = cv2.erode((m > 127).astype(np.uint8), np.ones((2 * DEPTH_ERODE_PX + 1,) * 2, np.uint8))
-        if d.shape != m.shape: return None
-        Ds.append(d); Ms.append(m.astype(np.float32))
-    return (torch.as_tensor(np.stack(Ds)[:, None], device=device), torch.as_tensor(np.stack(Ms)[:, None], device=device))
-
-
-def depth_loss(verts_wld, faces_t, w2c, data, huber_mm):
-    """v8 (그래프 호환): 카메라를 향한 손 정점의 깊이 - 깊이 영상(마스크 안, 유효 깊이)의 Huber 평균(mm)."""
-    D, M = data; C, _, H, W = D.shape
-    v0, v1, v2 = verts_wld[faces_t[:, 0]], verts_wld[faces_t[:, 1]], verts_wld[faces_t[:, 2]]
-    fn = torch.cross(v1 - v0, v2 - v0, dim=1)
-    vn = torch.zeros_like(verts_wld).index_add_(0, faces_t[:, 0], fn).index_add_(0, faces_t[:, 1], fn).index_add_(0, faces_t[:, 2], fn)
-    R = w2c[:C, :3, :3]; t = w2c[:C, :3, 3]
-    pc = torch.einsum('cij,vj->cvi', R, verts_wld) + t[:, None, :]
-    nc = torch.einsum('cij,vj->cvi', R, vn)
-    front = ((nc * pc).sum(-1) < 0).float()
-    fx_, fy_, cx_, cy_ = _intrinsics_t()
-    z = pc[..., 2].clamp(min=1e-3)
-    u = fx_ * pc[..., 0] / z + cx_; v = fy_ * pc[..., 1] / z + cy_
-    grid = torch.stack([2 * u / (W - 1) - 1, 2 * v / (H - 1) - 1], -1)[:, None]
-    ds = torch.nn.functional.grid_sample(D, grid, mode='nearest', align_corners=True)[:, 0, 0]
-    ms = torch.nn.functional.grid_sample(M, grid, mode='nearest', align_corners=True)[:, 0, 0]
-    inb = ((u >= 0) & (u <= W - 1) & (v >= 0) & (v <= H - 1)).float()
-    w = front * ms * (ds > 0.1).float() * inb
-    e = (pc[..., 2] - ds).abs() * 1000.0
-    hub = torch.where(e < huber_mm, 0.5 * e * e / huber_mm, e - 0.5 * huber_mm)
-    return (hub * w).sum() / w.sum().clamp(min=1.0)
-
-
 def register(frame_data, c2ws, is_right, prev_params, ref_cidx, fidx, mp_out, obj_pts=None):
 
     T_c2w = c2ws
@@ -1649,7 +1561,6 @@ def register(frame_data, c2ws, is_right, prev_params, ref_cidx, fidx, mp_out, ob
         _mask_ids = _two_hand_mask_ids(is_right, mp_out)
     silhouette_data = silhouette_targets(fidx,_mask_ids,mp_out,is_right) if (_mask_ids is not None and (args.w_silhouette > 0 or args.wrist_weight < 1)) else None
     dt_maps = mask_dt_maps(fidx, _mask_ids) if (w_mask > 0 and _mask_ids is not None) else None
-    depth_data = depth_targets(fidx, _mask_ids) if (args.w_depth > 0 and _mask_ids is not None) else None
     cover_pts = mask_cover_pts(fidx, ids=_mask_ids) if (w_mask_cover > 0 and _mask_ids is not None) else None
     _ball_shift = ball_temp_shift(fidx, is_right)
     if _ball_shift is not None:
@@ -1696,12 +1607,8 @@ def register(frame_data, c2ws, is_right, prev_params, ref_cidx, fidx, mp_out, ob
     if is_right in SHARED_BETAS and (prev_params is None or not args.fit_shape):
         pred_mano_params['betas'] = SHARED_BETAS[is_right].detach().clone()
 
-    if prev_params is None and args.triangulate_init:
-        pred_mano_params = triangulate_shift(pred_mano_params, gt_2d, gt_valid, T_c2w, T_w2c, ref_cidx, is_right, fidx, 'before camera init')
     if prev_params is None and args.camera_init_iters > 0:
         pred_mano_params = align_initial_camera(pred_mano_params, gt_2d_hamba, gt_valid_hamba, T_c2w, T_w2c, ref_cidx, is_right, fidx)
-    if prev_params is None and args.triangulate_init:
-        pred_mano_params = triangulate_shift(pred_mano_params, gt_2d, gt_valid, T_c2w, T_w2c, ref_cidx, is_right, fidx, 'after camera init')
 
     # --- Set up optimizer ---
     initial_pose = pred_mano_params['hand_pose'].detach().clone()
@@ -1760,8 +1667,6 @@ def register(frame_data, c2ws, is_right, prev_params, ref_cidx, fidx, mp_out, ob
             loss_dict['shape_temporal'] = args.fit_shape_temporal_weight * (pred_mano_params['betas'] - prev_params['betas'].detach()).square().mean()
         if args.w_pose_prior > 0:
             loss_dict['pose_prior'] = args.w_pose_prior * (pred_mano_params['hand_pose']-initial_pose).square().mean()
-        if depth_data is not None:
-            loss_dict['depth'] = args.w_depth * depth_loss(vertices_world, hand_faces, T_w2c, depth_data, args.depth_huber_mm)
         return loss_dict, val
 
     # The fit is ~1500 tiny MANO forward/backward passes per frame; launching their ~600
