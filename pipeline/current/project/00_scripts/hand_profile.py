@@ -5,7 +5,7 @@
   {"schema": "kaist-mano-shape-profile/v1", "profile_id": "W07", "betas": {"right": [10개], "left": [10개]?},
    "mano_model": {"MANO_RIGHT.pkl": sha256, ...}, "created": ..., "method": ..., "sources": {...}}
 - 18_fit_hands.py --hand-profile <ID 또는 경로> (또는 episodes.all.json의 "hand_profile")로 쓰면
-  공유 형상 보정 대신 이 베타를 고정합니다(알고리즘 mano-geometric-profile-shape-v1).
+  공유 형상 보정 대신 이 베타를 고정합니다(알고리즘 mano-geometric-profile-shape-v2, v7 손가락 설정).
 - 프로필 파일의 sha256이 실행 설정·계약에 고정되므로, 같은 ID라도 내용을 바꾸면 기존 결과는 새 시도로 다시 돌려야 합니다.
   내용을 고칠 때는 새 ID(예: W07_v2)로 만드는 것을 권합니다.
 - ID로 찾는 위치: 환경변수 KAIST_HAND_PROFILES, 없으면 <pipeline_root>/hand_profiles/<ID>.json
@@ -18,7 +18,7 @@ import argparse, datetime, hashlib, json, os, re, sys, time
 from pathlib import Path
 
 SCHEMA = 'kaist-mano-shape-profile/v1'
-ALGORITHM = 'mano-geometric-profile-shape-v1'
+ALGORITHM = 'mano-geometric-profile-shape-v2'  # v7 손가락 설정과 함께 쓰는 프로필 피팅 (v1 = v6 설정)
 ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$')
 
 

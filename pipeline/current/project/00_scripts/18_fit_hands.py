@@ -38,7 +38,9 @@ def resolve_profile(root,episode,requested,previous=None):
 
 def fit_settings(side,side_source,profile=None):
  if side not in ('right','both'):raise ValueError('Unsupported hand side')
- settings={'algorithm':'mano-geometric-shared-shape-v6','rotation_representation':'6D_to_SO3','side':side,'side_source':side_source,'iterations':1500,'temp_weight':500000,'hamba_weight':.01,'seed':1027,'num_cams':4,'w_mask':1.0,'w_mask_cover':1.0,'cover_max_px':40.0,'wrist_weight':0.1,'staged_fit':True,'w_silhouette':0.0,'silhouette_size':64,'silhouette_every':10,'pose_temp_weight':500000,'w_pose_prior':25.0,'shared_shape':True,'shape_frames':'','shape_frame_count':12,'shape_iters':3000,'shape_lr':1e-3,'shape_prior_weight':1.0,'shape_max_delta':1.0,'camera_init_iters':300,'fit_shape':False,'fit_shape_lr':2e-3,'fit_shape_max_delta':0.0,'fit_shape_temporal_weight':1.0,'robust_joint_delta':5.0}
+ # v7(2026-11-26): 손가락이 영상을 따라가도록 손가락 시간축 가중치 5e5 → 500, 전체 화면에서 못 찾은 MediaPipe 손은
+ # 손 마스크 주변을 잘라 다시 검출(mp_crop), MediaPipe 관절을 ±4프레임 평활(mp_smooth). v6 결과는 새 시도로 다시 피팅합니다.
+ settings={'algorithm':'mano-geometric-shared-shape-v7','rotation_representation':'6D_to_SO3','side':side,'side_source':side_source,'iterations':1500,'temp_weight':500000,'hamba_weight':.01,'seed':1027,'num_cams':4,'w_mask':1.0,'w_mask_cover':1.0,'cover_max_px':40.0,'wrist_weight':0.1,'staged_fit':True,'w_silhouette':0.0,'silhouette_size':64,'silhouette_every':10,'pose_temp_weight':500,'w_pose_prior':25.0,'shared_shape':True,'shape_frames':'','shape_frame_count':12,'shape_iters':3000,'shape_lr':1e-3,'shape_prior_weight':1.0,'shape_max_delta':1.0,'camera_init_iters':300,'fit_shape':False,'fit_shape_lr':2e-3,'fit_shape_max_delta':0.0,'fit_shape_temporal_weight':1.0,'robust_joint_delta':5.0,'mp_crop':True,'mp_smooth':4}
  if profile:
   # 형상만 프로필로 고정하고 나머지 피팅 설정은 그대로입니다. 프로필 없는 실행의 설정 값은 바꾸지 않습니다.
   settings.update(algorithm=hand_profile.ALGORITHM,shared_shape=False,shape_profile={'id':profile['id'],'sha256':profile['sha256']})
@@ -208,6 +210,8 @@ def run(case,side=None,check=False,new=False,open_view=True,profile_ref=None):
     cmd=[python,'-u',str(runmono/'data_process/data_process_hands.py'),'--hamba_base_path',str(out/'hamba'),'--phystwin_base_path',str(work.parent),'--case_name',case.name,'--temp_weight','500000','--hamba_weight','0.01','--log','hand_v1','--seed','1027','--num_iters','1500','--num_hands','1' if side=='right' else '2','--num_cams','4','--resume','--observations-cache',str(out/'observations.pkl')]
     for key in ('w_mask','w_mask_cover','cover_max_px','wrist_weight','w_silhouette','silhouette_size','silhouette_every','pose_temp_weight','w_pose_prior','camera_init_iters','fit_shape_lr','fit_shape_max_delta','fit_shape_temporal_weight','robust_joint_delta'):
      cmd += ['--'+key,str(settings[key])]
+    if settings.get('mp_crop'):cmd += ['--mp_crop']
+    if settings.get('mp_smooth'):cmd += ['--mp_smooth',str(settings['mp_smooth'])]
     if settings['fit_shape']:cmd += ['--fit_shape']
     if settings['staged_fit']:cmd += ['--staged_fit']
     if settings.get('shape_profile'):
@@ -221,6 +225,7 @@ def run(case,side=None,check=False,new=False,open_view=True,profile_ref=None):
    fit_outputs=['hand_v1/hand_reg.pkl','hand_v1/hand_reg_params.pkl','hand_v1/hand_reg_cidx.pkl','hand_v1/integrity.json','observations.pkl']
    if settings['shared_shape']:fit_outputs += ['hand_v1/shared_shape.pkl','hand_v1/shared_shape.json']
    if settings.get('shape_profile'):fit_outputs += ['hand_v1/shape_profile_used.json']
+   if settings.get('mp_crop') or settings.get('mp_smooth'):fit_outputs += ['hand_v1/mediapipe_v7.json']
    step(out,'19',fit,fit_outputs)
    if 'fit' not in validated:validate('fit')  # 재개로 19를 건너뛴 경우에만 다시 검사
    step(out,'preview',lambda:validate('preview'),['review/mano_review.mp4','review/frames','review/validation.json'])

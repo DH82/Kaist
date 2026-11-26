@@ -152,6 +152,8 @@ def compare(ep, profile_id, dest_root, status):
                 cmd += ['--' + key, str(settings[key])]
             if settings['fit_shape']: cmd += ['--fit_shape']
             if settings['staged_fit']: cmd += ['--staged_fit']
+            if settings.get('mp_crop'): cmd += ['--mp_crop']
+            if settings.get('mp_smooth'): cmd += ['--mp_smooth', str(settings['mp_smooth'])]
             if settings.get('shape_profile'):
                 cmd += ['--shape_profile', str(profile_path), '--shape_profile_sha256', settings['shape_profile']['sha256']]
             if settings['shared_shape']:

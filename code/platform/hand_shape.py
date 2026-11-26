@@ -57,11 +57,11 @@ WAND_IDLE = 180
 WAND_MIN_FREE_MB = 8192
 EP = re.compile(r'ep_[A-Za-z0-9_]+$')
 PID = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$')
-# 운영 18_fit_hands.py(mano-geometric-shared-shape-v6)의 피팅 설정 + --shape_only (공유 형상 보정까지만)
+# 운영 18_fit_hands.py(mano-geometric-shared-shape-v7)의 피팅 설정 + --shape_only (공유 형상 보정까지만)
 SHAPE_ARGS = ['--temp_weight', '500000', '--hamba_weight', '0.01', '--log', 'hand_v1', '--seed', '1027', '--num_iters', '1500',
               '--num_hands', '1', '--num_cams', '4', '--resume', '--w_mask', '1.0', '--w_mask_cover', '1.0', '--cover_max_px', '40.0',
               '--wrist_weight', '0.1', '--w_silhouette', '0.0', '--silhouette_size', '64', '--silhouette_every', '10',
-              '--pose_temp_weight', '500000', '--w_pose_prior', '25.0', '--camera_init_iters', '300', '--fit_shape_lr', '0.002',
+              '--pose_temp_weight', '500', '--w_pose_prior', '25.0', '--mp_crop', '--mp_smooth', '4', '--camera_init_iters', '300', '--fit_shape_lr', '0.002',
               '--fit_shape_max_delta', '0.0', '--fit_shape_temporal_weight', '1.0', '--robust_joint_delta', '5.0', '--staged_fit',
               '--shared_shape', '--shape_frames', '', '--shape_frame_count', '12', '--shape_iters', '3000', '--shape_lr', '0.001',
               '--shape_prior_weight', '1.0', '--shape_max_delta', '1.0', '--shape_only']

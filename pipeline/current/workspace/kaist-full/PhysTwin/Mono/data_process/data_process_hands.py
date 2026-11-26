@@ -3,6 +3,7 @@ import os.path as osp
 import numpy as np
 import open3d as o3d
 import json
+import time
 import copy
 import pickle
 import cv2
@@ -60,6 +61,10 @@ from pytorch3d.transforms import matrix_to_rotation_6d, rotation_6d_to_matrix
 ALGORITHM_VERSION = "mano-geometric-shared-shape-v6"
 # Same fit, but betas come from a per-person profile instead of the per-episode shared-shape calibration.
 PROFILE_ALGORITHM_VERSION = "mano-geometric-profile-shape-v1"
+# v7: 손가락이 영상을 따라가도록 MediaPipe 재검출(--mp_crop)·관절 평활(--mp_smooth)을 쓰는 피팅.
+#     (18_fit_hands.py가 손가락 시간축 가중치 500과 함께 넘김.) 옵션이 없으면 위의 v6/v1 그대로입니다.
+V7_ALGORITHM_VERSION = "mano-geometric-shared-shape-v7"
+V7_PROFILE_ALGORITHM_VERSION = "mano-geometric-profile-shape-v2"
 SHAPE_PROFILE_SCHEMA = "kaist-mano-shape-profile/v1"
 from timer_logger import TimerLogger
 
@@ -132,6 +137,11 @@ parser.add_argument('--silhouette_every', type=int, default=5)
 parser.add_argument('--staged_fit', action='store_true', help='Global, proximal, then full pose fitting')
 parser.add_argument('--pose_temp_weight', type=float, default=None,
                     help='Separate finger-pose temporal weight; default preserves temp_weight')
+parser.add_argument('--mp_crop', action='store_true',
+                    help='v7: frames where full-image MediaPipe found no right hand are re-detected on a 2x upscaled crop '
+                         '(2.2x the hand-mask box); kept only as Left (=right hand) with score>=0.9 and >=80%% joints on the mask')
+parser.add_argument('--mp_smooth', type=int, default=0,
+                    help='v7: temporal smoothing radius (frames) of the MediaPipe joints, triangular weights over detected frames only')
 parser.add_argument('--w_pose_prior', type=float, default=0.0,
                     help='Rotation prior to initial HaMBA finger pose')
 parser.add_argument('--shared_shape', action='store_true', help='Calibrate one shared beta per hand before tracking')
@@ -164,6 +174,9 @@ if args.shape_only and not (args.shared_shape or args.shared_shape_file): parser
 if args.shape_profile and (args.shared_shape or args.shared_shape_file or args.fit_shape or args.shape_only):
     parser.error('--shape_profile replaces shared-shape calibration; do not combine it with --shared_shape/--shared_shape_file/--fit_shape/--shape_only')
 if args.shape_profile_sha256 and not args.shape_profile: parser.error('--shape_profile_sha256 requires --shape_profile')
+if args.mp_smooth < 0: parser.error('--mp_smooth must be nonnegative')
+if args.mp_crop or args.mp_smooth:
+    ALGORITHM_VERSION, PROFILE_ALGORITHM_VERSION = V7_ALGORITHM_VERSION, V7_PROFILE_ALGORITHM_VERSION
 if args.shape_profile: ALGORITHM_VERSION = PROFILE_ALGORITHM_VERSION
 if args.shape_frame_count < 1 or args.shape_iters < 1 or args.shape_lr <= 0 or args.shape_max_delta <= 0 or args.shape_prior_weight < 0: parser.error('invalid shape calibration settings')
 
@@ -1136,6 +1149,59 @@ def shape_rescue_path():
     return Path(f'{phystwin_base_path}/{case_name}/{log}/shape_rescue.pkl')
 
 
+MP_CROP_SCALE, MP_CROP_UPSCALE = 2.2, 2.0  # v7 재검출: 손 마스크 상자 2.2배 범위를 2배 확대
+
+
+def mp_crop_redetect(frame_num, mp_out):
+    """v7: full-image MediaPipe misses small hands (palm detector). For frames without an accepted
+    right-hand detection, run the same detector on a 2x upscaled square crop around the approved hand
+    mask. Acceptance matches the first pass (label Left = right hand, score>=0.9) plus >=80% of the
+    joints on the (11px dilated) hand mask. Returns {camera: {frame: (21x2 pixel joints, score)}}."""
+    import mediapipe as mp
+    found = {}
+    for cidx in range(NUM_CAMS):
+        found[cidx] = {}
+        missing = [f for f in range(frame_num) if float(np.asarray(mp_out[cidx]['conf']['Left'][f]).mean()) < .5]
+        if not missing: continue
+        det = mp.solutions.hands.Hands(static_image_mode=False, max_num_hands=1, min_detection_confidence=0.5, min_tracking_confidence=0.5)
+        for f in missing:
+            mask = cv2.imread(f'{phystwin_base_path}/{case_name}/mask/{cidx}/{HAND_MASK_IDS[cidx]}/{f}.png', 0)
+            image = cv2.imread(os.path.join(phystwin_base_path, case_name, 'color', f'{cidx}', f'{f}.png'))
+            if image is None or mask is None or (mask > 127).sum() < 50: continue
+            ys, xs = np.nonzero(mask > 127); half = max(xs.max() - xs.min(), ys.max() - ys.min()) * MP_CROP_SCALE / 2
+            cx_, cy_ = (xs.min() + xs.max()) / 2, (ys.min() + ys.max()) / 2
+            x0, y0 = int(max(0, cx_ - half)), int(max(0, cy_ - half)); x1, y1 = int(min(image.shape[1], cx_ + half)), int(min(image.shape[0], cy_ + half))
+            if x1 - x0 < 16 or y1 - y0 < 16: continue
+            crop = cv2.resize(np.ascontiguousarray(image[y0:y1, x0:x1]), None, fx=MP_CROP_UPSCALE, fy=MP_CROP_UPSCALE, interpolation=cv2.INTER_LINEAR)
+            r = det.process(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
+            if not r.multi_hand_landmarks or not r.multi_handedness: continue
+            lab = r.multi_handedness[0].classification[0]
+            if lab.label != 'Left' or lab.score < 0.9: continue
+            xy = np.asarray([[lm.x * (x1 - x0) + x0, lm.y * (y1 - y0) + y0] for lm in r.multi_hand_landmarks[0].landmark], dtype=float)
+            padded = cv2.dilate((mask > 127).astype(np.uint8), np.ones((11, 11), np.uint8))
+            ij = np.rint(xy).astype(int); inside = (ij[:, 0] >= 0) & (ij[:, 0] < mask.shape[1]) & (ij[:, 1] >= 0) & (ij[:, 1] < mask.shape[0])
+            ok = np.zeros(21, dtype=bool); ok[inside] = padded[ij[inside, 1], ij[inside, 0]] > 0
+            if ok.mean() >= .8: found[cidx][f] = (xy, float(lab.score))
+        det.close()
+    return found
+
+
+def mp_smooth_joints(mp_out, radius):
+    """v7: triangular-weight temporal average of each detected frame's 21 joints over detected neighbours (±radius)."""
+    for cidx in range(NUM_CAMS):
+        K = [np.asarray(x, float) for x in mp_out[cidx]['kpts']['Left']]; C = [float(np.asarray(x).mean()) for x in mp_out[cidx]['conf']['Left']]
+        out = []
+        for f in range(len(K)):
+            if C[f] < .5: out.append(mp_out[cidx]['kpts']['Left'][f]); continue
+            acc = np.zeros_like(K[f]); ws = 0.0
+            for d in range(-radius, radius + 1):
+                g = f + d
+                if 0 <= g < len(K) and C[g] >= .5 and K[g].shape == K[f].shape:
+                    w = radius + 1 - abs(d); acc += w * K[g]; ws += w
+            out.append(acc / ws)
+        mp_out[cidx]['kpts']['Left'] = out
+
+
 def mask_crop_mediapipe(frame_num,mp_out):
     """Second MediaPipe pass for frames without an accepted detection (single hand).
     The full-frame palm detector misses small or partly hidden hands; the same detector is
@@ -1847,6 +1913,21 @@ def process_hands(case_name):
     timer.start("process_hands-compute_mediapipe_2d_gt")
 
     mp_out = frozen_observations(frame_num)
+    if num_hands == 1 and (args.mp_crop or args.mp_smooth):
+        record = {'algorithm': ALGORITHM_VERSION, 'mp_crop': bool(args.mp_crop), 'mp_smooth': args.mp_smooth}
+        if args.mp_crop:
+            state = rng_state(); t0 = time.time(); found = mp_crop_redetect(frame_num, mp_out); restore_rng(state)
+            for c, frames in found.items():
+                for f, (xy, score) in frames.items():
+                    k0 = np.asarray(mp_out[c]['kpts']['Left'][f]); c0 = np.asarray(mp_out[c]['conf']['Left'][f])
+                    mp_out[c]['kpts']['Left'][f] = xy.reshape(k0.shape) if k0.size == xy.size else xy
+                    mp_out[c]['conf']['Left'][f] = np.full(c0.shape, score)
+            record.update(redetected={str(c): len(v) for c, v in found.items()}, redetect_seconds=round(time.time() - t0, 1))
+            print('MediaPipe crop re-detection:', record['redetected'], f"{record['redetect_seconds']}s", flush=True)
+        if args.mp_smooth: mp_smooth_joints(mp_out, args.mp_smooth)
+        record['detected_frames'] = {str(c): int(sum(float(np.asarray(x).mean()) >= .5 for x in mp_out[c]['conf']['Left'])) for c in range(NUM_CAMS)}
+        rec_path = Path(f'{phystwin_base_path}/{case_name}/{log}/mediapipe_v7.json'); rec_path.parent.mkdir(parents=True, exist_ok=True)
+        rec_path.write_text(json.dumps(record, indent=1))
     if num_hands == 1: load_shape_rescue(mp_out, ref_cidx)
     shared_shape_path = prepare_shared_shape(frame_num,hand_data,mp_out,c2ws,ref_cidx)
     if shape_rescue_path().exists():
