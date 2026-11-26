@@ -674,8 +674,9 @@ def execute(stage, episode, run_id, config_path, sam_prompt='', sam_scene='2d', 
         # 마스크 재승인 → 재추적, 또는 코드 변경으로 기준이 바뀌면 기존 결과를 보관하고 새로 실행합니다(track과 동일).
         cli('10_reconstruct.py', paths.episode_root(project, episode), '--no-view', '--auto-new-attempt')
     elif stage == 'hands':
-        # 사람별 손 형상: RAW 목록에서 프로필을 지정한 에피소드만 --hand-profile을 넘깁니다(없으면 기존과 같은 명령).
-        profile = assigned_hand_profile(cfg, raw_episode or episode)  # raw_episode는 실행 이름과 다를 때만 옵니다
+        # 사람별 손 형상(선택 기능): 켜져 있고 RAW에 프로필을 지정한 에피소드만 --hand-profile을 넘깁니다.
+        # 사람별 손 형상 프로필은 Worker 설정에 "hand_profiles": true 가 있을 때만 씁니다(기본: 에피소드마다 β 보정).
+        profile = assigned_hand_profile(cfg, raw_episode or episode) if cfg.get('hand_profiles') else None  # raw_episode는 실행 이름과 다를 때만 옵니다
         if profile:
             print('손 형상 프로필 지정:', profile, flush=True)
         cli('18_fit_hands.py', recon, '--hand-side', 'right', *(['--hand-profile', str(profile)] if profile else []), '--no-view')

@@ -81,6 +81,17 @@ def workspace():
         return None
 
 
+def ui_enabled():
+    """사람별 손 형상 화면(MANO beta 칸·RAW '손 형상' 칸·비교 화면) 표시 여부. 기본 꺼짐, KAIST_HAND_PROFILE_UI=1 일 때만 켬."""
+    return os.environ.get('KAIST_HAND_PROFILE_UI', '').strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+def strip_ui(page):
+    """index.html에서 MANO beta 칸과 RAW '손 형상' 열 머리를 뺍니다(outputs.js는 #manoBeta가 없으면 열을 그리지 않음)."""
+    page = re.sub(r'<details class="card" id="manoBeta">.*?</details>', '', page, count=1, flags=re.S)
+    return re.sub(r'<th title="MANO 피팅에 쓸 사람별 손 형상[^"]*">손 형상</th>', '', page, count=1)
+
+
 def tool_available():
     return workspace() is not None and (WORKER / 'gpu_slots.py').exists() and SCRIPTS.is_dir()
 
@@ -660,6 +671,7 @@ class AssignBody(BaseModel):
 
 def setup(app, guard, access, csrf):
     """platform_app에 경로를 붙입니다. guard: 주소·CSRF·로그인 검사, access: 사용자·권한·감사 기록."""
+    if not ui_enabled(): return  # 화면을 끈 PC는 경로도 만들지 않습니다(404).
     def need_tool():
         if not tool_available(): raise HTTPException(409, '이 PC에서는 MANO beta 측정 도구를 쓸 수 없습니다(Worker 파이프라인 사본이 있는 Native PC 전용).')
         start_worker()

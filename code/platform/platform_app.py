@@ -12,7 +12,7 @@ from starlette.background import BackgroundTask
 from pydantic import BaseModel,Field
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(Path(__file__).parent))
-import intake,access,re,fleet
+import intake,access,re,fleet,hand_shape
 sys.path.insert(0,str(ROOT/'dags'))
 from direct_worker import call,token,request_for,MANO_STAGES,mano_cutoff,MANO_CUTOFF_HOUR,REDO_STAGES,REDO_LABELS,REDO_START,BATCH_STAGES,BATCH_LABELS
 from workers import workers,worker,dag_entries,dag_worker,DEFAULT_WORKER,DAY_DAG,BATCH_DAG,MAX_PARALLEL_RUNS,POOL_SLOTS
@@ -334,6 +334,7 @@ def home(req:Request):
  guard(req)
  page=(Path(__file__).parent/'index.html').read_text().replace('__CSRF__',CSRF)
  if access.EXTRA_NAMES:page=page.replace('<option>PC6</option>','<option>PC6</option>'+''.join(f'<option>{n}</option>' for n in access.EXTRA_NAMES),1)  # 추가 로그인 이름(KAIST_EXTRA_LOGIN_NAMES)
+ if not hand_shape.ui_enabled():page=hand_shape.strip_ui(page)  # 사람별 손 형상 화면을 쓰지 않는 PC(기본)
  return HTMLResponse(page,headers={'Cache-Control':'no-store','Content-Security-Policy':"default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; frame-src 'self'; img-src 'self' data: blob:; frame-ancestors 'none'"})
 
 class Login(BaseModel):
@@ -3275,6 +3276,5 @@ def continuous_script(req:Request):
 import viz
 viz.install(app,guard,access)
 
-# ---- MANO beta: 사람별 손 형상(MANO 베타) 측정 도구(작업 현황) · RAW별 프로필 지정(RAW 목록) ----
-import hand_shape
+# ---- MANO beta: 사람별 손 형상(MANO 베타) 측정 도구 · RAW별 프로필 지정. 기본 꺼짐(KAIST_HAND_PROFILE_UI=1로 켬) ----
 hand_shape.setup(app,guard,access,CSRF)
