@@ -116,6 +116,35 @@ def patched_code():
 
 
 ''' + a3, 1)
+    # (시험) 관통 방지 항을 CUDA Graph로: 고정 크기 연산(가변 인덱싱·Meshes 없음) + 프레임마다 손 근처 물체 점만 미리 고름.
+    # 관통 항을 켰을 때(--w_pen > 0)만 달라지고, 꺼져 있으면 운영과 같습니다.
+    p0 = s.index('def penetration_loss(verts_wld, faces_t, obj_pts, band_m):'); p1 = s.index('def validate_hand_masks(frame_num):')
+    s = s[:p0] + '''def penetration_loss(verts_wld, faces_t, obj_pts, band_m):
+    """(시험 · 그래프 호환) 손 안쪽으로 들어온 물체 점의 깊이(mm) 평균. 손 정점 법선 기준 부호 거리(음수 = 안쪽)."""
+    v0, v1, v2 = verts_wld[faces_t[:, 0]], verts_wld[faces_t[:, 1]], verts_wld[faces_t[:, 2]]
+    fn = torch.cross(v1 - v0, v2 - v0, dim=1)
+    vn = torch.zeros_like(verts_wld).index_add_(0, faces_t[:, 0], fn).index_add_(0, faces_t[:, 1], fn).index_add_(0, faces_t[:, 2], fn)
+    vn = vn / vn.norm(dim=1, keepdim=True).clamp(min=1e-12)
+    d = torch.cdist(obj_pts, verts_wld)
+    dmin, idx = d.min(dim=1)
+    w = (dmin < band_m).float()
+    signed = ((obj_pts - verts_wld[idx]) * vn[idx]).sum(-1)
+    pen_mm = torch.relu(-signed) * 1000.0 * w
+    return pen_mm.sum() / w.sum().clamp(min=1.0)
+
+
+''' + s[p1:]
+    a6 = "    obj_pts_t = torch.tensor(obj_pts, dtype=torch.float32, device=device) if obj_pts is not None else None\n"
+    assert s.count(a6) == 1, 'patch anchor obj'
+    s = s.replace(a6, a6 + '''    if obj_pts_t is not None and prev_params is not None and 'verts' in prev_params:
+        _pv = prev_params['verts']
+        _c = (_pv.detach().float().to(device) if torch.is_tensor(_pv) else torch.as_tensor(np.asarray(_pv, dtype=np.float32), device=device)).reshape(-1, 3).mean(0)
+        _near = obj_pts_t[(obj_pts_t - _c).norm(dim=1) < 0.15]
+        obj_pts_t = _near if len(_near) else None
+''')
+    a7 = "                and not (w_pen > 0 and obj_pts_t is not None) and not args.w_silhouette > 0\n"
+    assert s.count(a7) == 1, 'patch anchor graph'
+    s = s.replace(a7, "                and not args.w_silhouette > 0\n")
     out = mc.WORK / 'patched' / 'data_process_hands.py'; out.parent.mkdir(parents=True, exist_ok=True); out.write_text(s)
     return out
 
