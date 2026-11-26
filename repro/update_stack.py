@@ -637,6 +637,45 @@ class Updater:
                 + (' · ' + ' / '.join(errors)[:300] if errors else '') + " · 종료된 실행은 '실패 단계 다시 실행'으로 이어서 하세요")
 
 
+def run_tick_hooks(env_file):
+    """NAS control/update/tick_hooks.json 에 적힌 일회성 정비 작업을 타이머 실행마다 돌립니다.
+
+    [{"name": "...", "cmd": ["python3", "{nas}/...", "--work", "{work}"], "until": "2026-11-28T00:00:00+09:00"}]
+    {nas}=NAS 마운트, {work}=이 PC 작업 폴더(GPU_PROJECT_DIR), {pc}=PC 이름. until 이 지나면 건너뜁니다.
+    작업은 스스로 멱등이어야 합니다(같은 일을 반복해도 결과가 같음). 실패해도 업데이트는 계속합니다.
+    끄려면 NAS 파일에서 항목을 지우면 됩니다(다시 push할 필요 없음).
+    """
+    try:
+        env = read_env(env_file)
+        pc = (env.get('PC_ID') or 'pc1').lower()
+        nas = Path(env.get('NAS_MOUNT') or '/mnt/kaist-data')
+        hooks = read_json(nas / 'control' / 'update' / 'tick_hooks.json') or []
+    except Exception as e:  # NAS가 안 보이면 다음 실행에서 다시 봅니다.
+        log(f'정기 작업 목록을 읽지 못함: {e}')
+        return
+    work = env.get('GPU_PROJECT_DIR') or str(Path.home() / 'kaist_work' / pc)
+    now = time.time()
+    for h in hooks if isinstance(hooks, list) else []:
+        name = str(h.get('name') or 'hook')
+        try:
+            until = h.get('until')
+            if until and now > __import__('datetime').datetime.fromisoformat(until).timestamp():
+                continue
+            if pc in [str(x).lower() for x in h.get('skip_pcs') or []]:
+                continue
+            cmd = [str(a).replace('{nas}', str(nas)).replace('{work}', work).replace('{pc}', pc) for a in h['cmd']]
+            if cmd and cmd[0] == 'python3':
+                cmd[0] = sys.executable
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=int(h.get('timeout') or 300), stdin=subprocess.DEVNULL)
+            out = (r.stdout + r.stderr).strip()
+            if out or r.returncode:
+                log(f'[정기 작업 {name}] 종료코드 {r.returncode}\n{out[-4000:]}')
+                write_json(nas / 'control' / 'update' / pc / f'hook_{name}.json',
+                           {'name': name, 'time': time.strftime('%Y-%m-%dT%H:%M:%S%z'), 'returncode': r.returncode, 'output': out[-20000:]})
+        except Exception as e:
+            log(f'[정기 작업 {name}] 실패: {e}')
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--env-file', type=Path, default=ROOT / '.env')
@@ -658,11 +697,14 @@ def main():
             u.report((read_json(u.dir / 'status.json') or {}).get('state', 'idle'), '상태 조회')
             print(json.dumps(u.status, ensure_ascii=False, indent=2))
             return
+        run_tick_hooks(args.env_file.resolve())
         try:
             u.tick(now=args.now, auto=args.auto)
         except Exception as e:  # 상태 파일에 남겨 대시보드에서 보이게 합니다.
             u.report('failed', f'업데이트 오류: {e}')
             raise
+        finally:
+            run_tick_hooks(args.env_file.resolve())
 
 
 if __name__ == '__main__':
