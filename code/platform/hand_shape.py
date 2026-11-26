@@ -35,7 +35,7 @@ ASSIGN = PROFILES / 'assign'
 COMPARE_OUT = Path(os.environ.get('KAIST_MANO_COMPARE_OUT', str(NAS / 'TEST/Set2')))
 COMPARE_WORK = Path(os.environ.get('KAIST_MANO_COMPARE_WORK', str(Path.home() / 'kaist_work/mano_compare')))
 VARIANT = re.compile(r'(default|[A-Za-z0-9][A-Za-z0-9_.+-]{0,80})$')
-SWEEP = re.compile(r'pt[0-9.e+]+_hw[0-9.e+-]+_pr[0-9.e+]+_(prev|hamba)(_crop)?$')
+SWEEP = re.compile(r'pt[0-9.e+]+_hw[0-9.e+-]+_pr[0-9.e+]+_(prev|hamba)(_crop)?(_s[0-9]+)?(_def)?$')
 
 
 def variant_dir(ep, v):
@@ -47,11 +47,11 @@ def variant_dir(ep, v):
 
 
 def variant_label(v, settings=None):
-    if v == 'default': return '원래 방식 (에피소드 β 보정) · 현재 설정'
+    if v == 'default': return '현재 운영 (기본 β 보정 · 손가락 500,000)'
     m = SWEEP.fullmatch(v)
     if not m: return f'{v} β · 현재 설정 (기준)'
     pt, hw, pr = re.match(r'pt([^_]+)_hw([^_]+)_pr([^_]+)_', v).groups()
-    return f"손가락 시간축 {float(pt):g} · HaMBA {float(hw):g} · 자세 사전 {float(pr):g} · {'프레임별 HaMBA 시작' if m.group(1) == 'hamba' else '이전 프레임 시작'}" + (' · MediaPipe 잘라서 재검출' if m.group(2) else '')
+    return f"손가락 시간축 {float(pt):g} · HaMBA {float(hw):g} · 자세 사전 {float(pr):g} · {'프레임별 HaMBA 시작' if m.group(1) == 'hamba' else '이전 프레임 시작'}" + (' · MediaPipe 잘라서 재검출' if m.group(2) else '') + (f' · 관절 평활 ±{m.group(3)[2:]}' if m.group(3) else '') + (' · 기본 β 보정' if m.group(4) else ' · User2 β')
 SUBTRACT = ['human forearm', 'shadow']
 WAND_IDLE = 180
 WAND_MIN_FREE_MB = 8192

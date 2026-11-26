@@ -27,7 +27,7 @@ STAGE1 = [dict(BASE, pose_temp_weight=v) for v in (5e4, 5e3, 5e2, 50.0)] + \
 
 
 def name(v):
-    return f"pt{v['pose_temp_weight']:g}_hw{v['hamba_weight']:g}_pr{v['w_pose_prior']:g}_{v['pose_init']}" + ('_crop' if v.get('mp_crop') else '')
+    return f"pt{v['pose_temp_weight']:g}_hw{v['hamba_weight']:g}_pr{v['w_pose_prior']:g}_{v['pose_init']}" + ('_crop' if v.get('mp_crop') else '') + (f"_s{v['mp_smooth']}" if v.get('mp_smooth') else '') + ('_def' if v.get('beta') == 'default' else '')
 
 
 def patched_code():
@@ -54,6 +54,8 @@ def patched_code():
     a4 = "parser.add_argument('--w_pose_prior'"
     s = s.replace(a4, "parser.add_argument('--mp_crop', action='store_true', help='(시험) 전체 화면에서 못 찾은 프레임만 손 마스크 주변을 잘라 2배 확대해 MediaPipe 재검출')\n"
                   "parser.add_argument('--mp_crop_out', default=None)\n" + a4, 1)
+    s = s.replace("parser.add_argument('--mp_crop_out', default=None)\n", "parser.add_argument('--mp_crop_out', default=None)\n"
+                  "parser.add_argument('--mp_smooth', type=int, default=0, help='(시험) MediaPipe 관절 시간축 평활 반경(프레임, 삼각 가중치, 검출된 프레임끼리만)')\n", 1)
     a5 = "    mp_out = frozen_observations(frame_num)\n"
     assert s.count(a5) == 1, 'patch anchor mp'
     s = s.replace(a5, a5 + '''    if args.mp_crop and num_hands == 1:
@@ -67,6 +69,21 @@ def patched_code():
         print('[mp crop] added', {c: len(v) for c, v in _found.items()}, f'{_time.time() - _t:.1f}s', flush=True)
         if args.mp_crop_out:
             with open(args.mp_crop_out, 'wb') as _fh: pickle.dump({'observations': mp_out, 'added': {c: len(v) for c, v in _found.items()}, 'seconds': _time.time() - _t}, _fh)
+    if args.mp_smooth > 0 and num_hands == 1:
+        _r = args.mp_smooth
+        for _c in range(NUM_CAMS):
+            _K = [np.asarray(x, float) for x in mp_out[_c]['kpts']['Left']]; _C = [float(np.asarray(x).mean()) for x in mp_out[_c]['conf']['Left']]
+            _new = []
+            for _f in range(len(_K)):
+                if _C[_f] < .5: _new.append(mp_out[_c]['kpts']['Left'][_f]); continue
+                _acc = np.zeros_like(_K[_f]); _ws = 0.0
+                for _d in range(-_r, _r + 1):
+                    _g = _f + _d
+                    if 0 <= _g < len(_K) and _C[_g] >= .5 and _K[_g].shape == _K[_f].shape:
+                        _w = _r + 1 - abs(_d); _acc += _w * _K[_g]; _ws += _w
+                _new.append(_acc / _ws)
+            mp_out[_c]['kpts']['Left'] = _new
+        print(f'[mp smooth] radius {_r}', flush=True)
 ''')
     s = s.replace(a3, '''def _mp_crop_pass(frame_num, mp_out, scale=2.2, up=2.0):
     import mediapipe as mp
@@ -119,10 +136,11 @@ def run_variant(ep, v, status, key):
     code = runmono / 'data_process/data_process_hands.py'
     if code.is_symlink(): code.unlink()
     shutil.copy2(status['patched'], code)
-    settings = mc.fh.fit_settings(side, side_source, {'id': prof['profile_id'], 'sha256': psha})
+    default_beta = v.get('beta') == 'default'
+    settings = mc.fh.fit_settings(side, side_source, None if default_beta else {'id': prof['profile_id'], 'sha256': psha})
     settings.update(pose_temp_weight=v['pose_temp_weight'], hamba_weight=v['hamba_weight'], w_pose_prior=v['w_pose_prior'], pose_init=v['pose_init'], experiment='finger-sweep')
     (out / 'settings.json').write_text(json.dumps(settings, indent=2))
-    obs = base / 'User2' / 'observations.pkl'
+    obs = base / ('default' if default_beta else 'User2') / 'observations.pkl'
     if obs.exists() and not (out / 'observations.pkl').exists(): shutil.copy2(obs, out / 'observations.pkl')  # MediaPipe 검출 재사용(같은 입력)
     cmd = [python, '-u', str(code), '--hamba_base_path', str(out / 'hamba'), '--phystwin_base_path', str(work.parent), '--case_name', ep,
            '--temp_weight', '500000', '--hamba_weight', str(v['hamba_weight']), '--log', 'hand_v1', '--seed', '1027', '--num_iters', '1500',
@@ -130,8 +148,12 @@ def run_variant(ep, v, status, key):
     for k in ('w_mask', 'w_mask_cover', 'cover_max_px', 'wrist_weight', 'w_silhouette', 'silhouette_size', 'silhouette_every', 'camera_init_iters',
               'fit_shape_lr', 'fit_shape_max_delta', 'fit_shape_temporal_weight', 'robust_joint_delta'):
         cmd += ['--' + k, str(settings[k])]
-    cmd += ['--pose_temp_weight', str(v['pose_temp_weight']), '--w_pose_prior', str(v['w_pose_prior']), '--staged_fit',
-            '--shape_profile', str(profile_path), '--shape_profile_sha256', psha]
+    cmd += ['--pose_temp_weight', str(v['pose_temp_weight']), '--w_pose_prior', str(v['w_pose_prior']), '--staged_fit']
+    if default_beta:
+        cmd += ['--shared_shape'] + [x for k in ('shape_frames', 'shape_frame_count', 'shape_iters', 'shape_lr', 'shape_prior_weight', 'shape_max_delta') for x in ('--' + k, str(settings[k]))]
+    else:
+        cmd += ['--shape_profile', str(profile_path), '--shape_profile_sha256', psha]
+    if v.get('mp_smooth'): cmd += ['--mp_smooth', str(v['mp_smooth'])]
     if v.get('mp_crop'): cmd += ['--mp_crop', '--mp_crop_out', str(out / 'mp_crop.pkl')]
     status['current'] = {'episode': ep, 'variant': name(v), 'stage': key, 'started': time.strftime('%H:%M:%S')}; save(status)
     t0 = time.time()
@@ -203,6 +225,8 @@ def main():
             v = {'pose_temp_weight': float(kv.get('pt', BASE['pose_temp_weight'])), 'hamba_weight': float(kv.get('hw', BASE['hamba_weight'])),
                  'w_pose_prior': float(kv.get('pr', BASE['w_pose_prior'])), 'pose_init': kv.get('init', BASE['pose_init'])}
             if kv.get('crop') in ('1', 'true', 'yes'): v['mp_crop'] = True
+            if int(kv.get('smooth', 0)): v['mp_smooth'] = int(kv['smooth'])
+            if kv.get('beta') == 'default': v['beta'] = 'default'
             status['variants'][name(v)] = v
             if name(v) not in status['extra']: status['extra'].append(name(v))
             for ep in a.episodes:
