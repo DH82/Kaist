@@ -3272,3 +3272,7 @@ def continuous_script(req:Request):
 # ---- 완료된 에피소드 3D 시각화(/viz): MANO 손 메시 · 물체 3D 추적점 · RGB ----
 import viz
 viz.install(app,guard,access)
+
+# ---- MANO beta: 사람별 손 형상(MANO 베타) 측정 도구(작업 현황) · RAW별 프로필 지정(RAW 목록) ----
+import hand_shape
+hand_shape.setup(app,guard,access,CSRF)

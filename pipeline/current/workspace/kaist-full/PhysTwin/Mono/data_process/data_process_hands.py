@@ -58,6 +58,9 @@ import hashlib
 from pathlib import Path
 from pytorch3d.transforms import matrix_to_rotation_6d, rotation_6d_to_matrix
 ALGORITHM_VERSION = "mano-geometric-shared-shape-v6"
+# Same fit, but betas come from a per-person profile instead of the per-episode shared-shape calibration.
+PROFILE_ALGORITHM_VERSION = "mano-geometric-profile-shape-v1"
+SHAPE_PROFILE_SCHEMA = "kaist-mano-shape-profile/v1"
 from timer_logger import TimerLogger
 
 def set_all_seeds(seed):
@@ -134,6 +137,10 @@ parser.add_argument('--w_pose_prior', type=float, default=0.0,
 parser.add_argument('--shared_shape', action='store_true', help='Calibrate one shared beta per hand before tracking')
 parser.add_argument('--shared_shape_file', default=None, help='Reuse a validated shared-shape calibration')
 parser.add_argument('--shape_only', action='store_true', help='Calibrate shared shape and skip temporal tracking')
+parser.add_argument('--shape_profile', default=None,
+                    help='Per-person MANO shape profile JSON (kaist-mano-shape-profile/v1); betas are fixed from it and '
+                         'shared-shape calibration is skipped')
+parser.add_argument('--shape_profile_sha256', default=None, help='Expected sha256 of --shape_profile (refuses a changed file)')
 parser.add_argument('--shape_frames', default='', help='Comma-separated representative frame IDs; empty selects by confidence')
 parser.add_argument('--shape_frame_count', type=int, default=6)
 parser.add_argument('--shape_iters', type=int, default=3000)
@@ -154,6 +161,10 @@ if args.camera_init_iters < 0: parser.error('camera_init_iters must be nonnegati
 if not 0 <= args.wrist_weight <= 1: parser.error('wrist_weight must be in [0,1]')
 if args.silhouette_size < 32 or args.silhouette_every < 1: parser.error('invalid silhouette sampling')
 if args.shape_only and not (args.shared_shape or args.shared_shape_file): parser.error('shape_only requires shared shape')
+if args.shape_profile and (args.shared_shape or args.shared_shape_file or args.fit_shape or args.shape_only):
+    parser.error('--shape_profile replaces shared-shape calibration; do not combine it with --shared_shape/--shared_shape_file/--fit_shape/--shape_only')
+if args.shape_profile_sha256 and not args.shape_profile: parser.error('--shape_profile_sha256 requires --shape_profile')
+if args.shape_profile: ALGORITHM_VERSION = PROFILE_ALGORITHM_VERSION
 if args.shape_frame_count < 1 or args.shape_iters < 1 or args.shape_lr <= 0 or args.shape_max_delta <= 0 or args.shape_prior_weight < 0: parser.error('invalid shape calibration settings')
 
 set_all_seeds(args.seed)
@@ -1309,10 +1320,44 @@ def calibrate_shared_beta(frames,hand_data,mp_out,c2ws,is_right,ref):
     return beta.detach().cpu().numpy(),dict(frames=frames,initial_betas=initial.cpu().numpy().tolist(),betas=beta.detach().cpu().numpy().tolist(),history=history,bone_length_ratio_min=float(ratios.min()),bone_length_ratio_max=float(ratios.max()))
 
 
+def mano_model_digests():
+    return {p.name:file_digest(p) for p in sorted((Path.cwd()/'data_process/Hamba/_DATA/data/mano').glob('*.pkl'))}
+
+
+def load_shape_profile():
+    """Fix betas from a per-person profile. Refuses a changed file, another MANO model, or a missing side."""
+    path=Path(args.shape_profile)
+    raw=path.read_bytes();sha=hashlib.sha256(raw).hexdigest()
+    if args.shape_profile_sha256 and sha!=args.shape_profile_sha256:
+        raise RuntimeError(f'Shape profile changed: {path} sha256 {sha} != expected {args.shape_profile_sha256}')
+    profile=json.loads(raw)
+    if profile.get('schema')!=SHAPE_PROFILE_SCHEMA:raise RuntimeError(f'Unsupported shape profile schema: {profile.get("schema")!r}')
+    models=mano_model_digests()
+    for name,digest in (profile.get('mano_model') or {}).items():
+        if models.get(name)!=digest:raise RuntimeError(f'Shape profile was made with a different MANO model file: {name}')
+    if not profile.get('mano_model'):raise RuntimeError('Shape profile does not record the MANO model it was made with')
+    sides=['right'] if num_hands==1 else ['left','right']
+    betas={}
+    for side in sides:
+        b=np.asarray((profile.get('betas') or {}).get(side,[]),dtype=np.float32).reshape(-1)
+        if b.shape!=(10,) or not np.isfinite(b).all():raise RuntimeError(f'Shape profile has no valid 10-value betas for the {side} hand')
+        betas[side]=b
+    for side,b in betas.items():SHARED_BETAS[side=='right']=torch.as_tensor(b[None],dtype=torch.float32,device=device)
+    used=Path(f'{phystwin_base_path}/{case_name}/{log}/shape_profile_used.json');used.parent.mkdir(parents=True,exist_ok=True)
+    record=dict(algorithm=ALGORITHM_VERSION,profile_id=profile.get('profile_id'),profile_path=str(path),profile_sha256=sha,
+                betas={k:v.tolist() for k,v in betas.items()},mano_model=models,profile=profile)
+    text=json.dumps(record,indent=2,ensure_ascii=False)
+    if not used.exists() or used.read_text()!=text:
+        tmp=used.with_suffix('.tmp');tmp.write_text(text);os.replace(tmp,used)
+    print(f'Shape profile {profile.get("profile_id")!r} ({sha[:12]}) fixed betas for {sides}; shared-shape calibration skipped',flush=True)
+    return used
+
+
 def prepare_shared_shape(frame_num,hand_data,mp_out,c2ws,ref_cidx):
     global SHARED_BETAS, SHAPE_SELECTION_C2WS
     SHAPE_SELECTION_C2WS=np.asarray(c2ws)
     SHARED_BETAS={}
+    if args.shape_profile:return load_shape_profile()
     if not (args.shared_shape or args.shared_shape_file):return None
     identity=shape_input_identity()
     path=Path(args.shared_shape_file or f'{phystwin_base_path}/{case_name}/{log}/shared_shape.pkl')

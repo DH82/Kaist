@@ -10,6 +10,7 @@ from stage_refs import source,link
 from resume_steps import digest,snapshot,step,preserve
 from sam_settings import save
 from live_log import Display
+import hand_profile
 recon=importlib.import_module('10_reconstruct');HERE=Path(__file__).resolve().parent
 
 def resolve_side(root,episode,requested,previous=None):
@@ -21,9 +22,26 @@ def resolve_side(root,episode,requested,previous=None):
   return 'right',record['hand_identity_source']
  raise ValueError('손 설정이 필요합니다: --hand-side right 또는 --hand-side both. 기존 코드의 단일 왼손 피팅은 아직 지원하지 않습니다.')
 
-def fit_settings(side,side_source):
+def resolve_profile(root,episode,requested,previous=None):
+ """사람별 형상 프로필 (경로, {'id','sha256'}) 또는 (None, None). 우선순위: 명령 인자 → 이전 실행 설정 → episodes.all.json의 hand_profile."""
+ ref=requested
+ if ref is None and previous is not None:
+  ref=(previous.get('shape_profile') or {}).get('id')
+  if ref is None:return None,None  # 프로필 없이 시작한 실행은 재개해도 그대로 둡니다.
+ if ref is None:
+  config=root/'episodes.all.json'
+  ref=(json.loads(config.read_text()).get(episode,{}) if config.exists() else {}).get('hand_profile')
+ if not ref:return None,None
+ path=hand_profile.resolve(ref,root)
+ profile,sha=hand_profile.load(path)
+ return path,{'id':profile['profile_id'],'sha256':sha}
+
+def fit_settings(side,side_source,profile=None):
  if side not in ('right','both'):raise ValueError('Unsupported hand side')
  settings={'algorithm':'mano-geometric-shared-shape-v6','rotation_representation':'6D_to_SO3','side':side,'side_source':side_source,'iterations':1500,'temp_weight':500000,'hamba_weight':.01,'seed':1027,'num_cams':4,'w_mask':1.0,'w_mask_cover':1.0,'cover_max_px':40.0,'wrist_weight':0.1,'staged_fit':True,'w_silhouette':0.0,'silhouette_size':64,'silhouette_every':10,'pose_temp_weight':500000,'w_pose_prior':25.0,'shared_shape':True,'shape_frames':'','shape_frame_count':12,'shape_iters':3000,'shape_lr':1e-3,'shape_prior_weight':1.0,'shape_max_delta':1.0,'camera_init_iters':300,'fit_shape':False,'fit_shape_lr':2e-3,'fit_shape_max_delta':0.0,'fit_shape_temporal_weight':1.0,'robust_joint_delta':5.0}
+ if profile:
+  # 형상만 프로필로 고정하고 나머지 피팅 설정은 그대로입니다. 프로필 없는 실행의 설정 값은 바꾸지 않습니다.
+  settings.update(algorithm=hand_profile.ALGORITHM,shared_shape=False,shape_profile={'id':profile['id'],'sha256':profile['sha256']})
  return settings
 
 def hand_mask_inputs(case):
@@ -52,7 +70,7 @@ def make_hand_contract(case,prepared,mono,settings):
 
 def verify_hand_contract(out,prepared,mono):
  settings=json.loads((out/'settings.json').read_text())
- expected=fit_settings(settings['side'],settings['side_source'])
+ expected=fit_settings(settings['side'],settings['side_source'],settings.get('shape_profile'))
  if settings!=expected:raise ValueError('손 복원 설정/알고리즘 변경: 새 시도로 재실행하세요.')
  current=make_hand_contract(out.parent,prepared,mono,settings)
  saved=json.loads((out/'_resume/contract.json').read_text())
@@ -123,7 +141,7 @@ def prepare_view(out,prepared,mono,episode):
  (out/'hand_v1').mkdir(exist_ok=True);link(case/'hand_v1',out/'hand_v1')
  return case,runmono
 
-def run(case,side=None,check=False,new=False,open_view=True):
+def run(case,side=None,check=False,new=False,open_view=True,profile_ref=None):
  case=case.resolve()
  if case.parent.name!='06_reconstruction':raise ValueError('06_reconstruction/<episode> 폴더를 입력하세요.')
  project=case.parent.parent
@@ -134,13 +152,16 @@ def run(case,side=None,check=False,new=False,open_view=True):
   env['PYTHONPATH']=str(mono/'data_process')+os.pathsep+str(mono/'data_process/Hamba')+os.pathsep+env.get('PYTHONPATH','');env.pop('DISPLAY',None);env.pop('XAUTHORITY',None);env['PYOPENGL_PLATFORM']='egl';env['HF_HUB_OFFLINE']='1'
   subprocess.run([python,str(HERE/'hand_stage_worker.py'),'check','--mono',str(mono)],cwd=mono,env=env,check=True)
   print('선택한 손:',side,'· 근거:',side_source,flush=True)
+  profile_path,profile=resolve_profile(root,case.name,profile_ref,None if new else previous)
+  if profile and side!='right':raise ValueError('손 형상 프로필은 아직 오른손 단일 피팅에서만 지원합니다.')
+  print('손 형상:',f"프로필 {profile['id']} ({profile['sha256'][:12]}) · {profile_path}" if profile else '에피소드별 공유 형상 보정',flush=True)
   hand_mask_inputs(case)
   if check:print('HaMBA/MANO 실행 전 검사 완료 (추론은 실행하지 않음)');return
   if new and out.exists():
    # Archive entire self-contained run. Historic runtime links are reference-only.
    target=project/'99_history/hands'/case.name/pipeline.stamp();target.parent.mkdir(parents=True,exist_ok=True);__import__('stage_refs').move(out,target)
   out.mkdir(exist_ok=True);T=int(json.loads((prepared/'metadata.json').read_text())['frame_num'])
-  settings=fit_settings(side,side_source)
+  settings=fit_settings(side,side_source,profile)
   contract=make_hand_contract(case,prepared,mono,settings)
   cp=out/'_resume/contract.json';cp.parent.mkdir(exist_ok=True)
   if cp.exists() and json.loads(cp.read_text())!=contract:raise ValueError('손 복원 입력/코드/설정 변경: --new-attempt로 기존 결과를 보관하고 재실행하세요.')
@@ -189,6 +210,9 @@ def run(case,side=None,check=False,new=False,open_view=True):
      cmd += ['--'+key,str(settings[key])]
     if settings['fit_shape']:cmd += ['--fit_shape']
     if settings['staged_fit']:cmd += ['--staged_fit']
+    if settings.get('shape_profile'):
+     if hand_profile.sha256(profile_path)!=settings['shape_profile']['sha256']:raise ValueError('손 형상 프로필 파일이 바뀌었습니다. 새 ID로 만들거나 --new-attempt로 다시 실행하세요.')
+     cmd += ['--shape_profile',str(profile_path),'--shape_profile_sha256',settings['shape_profile']['sha256']]
     if settings['shared_shape']:
      cmd += ['--shared_shape']
      for key in ('shape_frames','shape_frame_count','shape_iters','shape_lr','shape_prior_weight','shape_max_delta'):
@@ -196,6 +220,7 @@ def run(case,side=None,check=False,new=False,open_view=True):
     recon.logged(cmd,runmono,env,out/'logs/19_mano.log','19 · MANO 시간축 피팅 (프레임 체크포인트 재개)',display);validate('fit');validated.add('fit')
    fit_outputs=['hand_v1/hand_reg.pkl','hand_v1/hand_reg_params.pkl','hand_v1/hand_reg_cidx.pkl','hand_v1/integrity.json','observations.pkl']
    if settings['shared_shape']:fit_outputs += ['hand_v1/shared_shape.pkl','hand_v1/shared_shape.json']
+   if settings.get('shape_profile'):fit_outputs += ['hand_v1/shape_profile_used.json']
    step(out,'19',fit,fit_outputs)
    if 'fit' not in validated:validate('fit')  # 재개로 19를 건너뛴 경우에만 다시 검사
    step(out,'preview',lambda:validate('preview'),['review/mano_review.mp4','review/frames','review/validation.json'])
@@ -217,9 +242,9 @@ def verify(out):
  return json.loads((out/'review/validation.json').read_text())
 
 def main():
- p=argparse.ArgumentParser(description=__doc__);p.add_argument('input',type=Path);p.add_argument('--hand-side',choices=['right','both']);p.add_argument('--check',action='store_true');p.add_argument('--new-attempt',action='store_true');p.add_argument('--no-view',action='store_true');a=p.parse_args()
+ p=argparse.ArgumentParser(description=__doc__);p.add_argument('input',type=Path);p.add_argument('--hand-side',choices=['right','both']);p.add_argument('--hand-profile',help='사람별 손 형상 프로필 ID 또는 JSON 경로 (hand_profile.py)');p.add_argument('--check',action='store_true');p.add_argument('--new-attempt',action='store_true');p.add_argument('--no-view',action='store_true');a=p.parse_args()
  if a.check and a.new_attempt:p.error('--check와 --new-attempt 동시 사용 불가')
- try:run(a.input,a.hand_side,a.check,a.new_attempt,not a.no_view)
+ try:run(a.input,a.hand_side,a.check,a.new_attempt,not a.no_view,a.hand_profile)
  except KeyboardInterrupt:p.exit(130,'중단됨. 같은 명령으로 재개하세요.\n')
  except Exception as ex:p.exit(1,'중단: '+str(ex)+'\n')
 if __name__=='__main__':main()

@@ -141,6 +141,51 @@ def adopt_transfer(cfg, project, episode, source_pc, source_key, identity, recei
     print(f'MANO 이관 받기 완료: {episode} ← {source_pc} (코드 {len(mine)}개 파일 일치)', flush=True)
 
 
+HAND_PROFILE_ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,63}')
+
+
+def hand_profile_dir(cfg):
+    """사람별 손 형상(MANO 베타) 프로필과 RAW별 지정: NAS control/hand_profiles/ (UI 작업 현황 'MANO beta'가 만듦)."""
+    return Path(cfg['nas_mount']) / 'control' / 'hand_profiles'
+
+
+def assigned_hand_profile(cfg, raw_episode):
+    """RAW 에피소드에 지정한 손 형상 프로필 파일 경로, 지정이 없으면 None.
+    지정 파일(assign/<RAW>.json)에 적힌 sha256과 프로필 파일이 다르면(지정 뒤 프로필이 바뀜) 멈춥니다."""
+    base = hand_profile_dir(cfg)
+    if not Path(cfg['nas_mount']).resolve().is_mount():
+        raise RuntimeError('NAS가 연결되지 않아 손 형상 프로필 지정을 확인할 수 없습니다: ' + cfg['nas_mount'])
+    path = base / 'assign' / (raw_episode + '.json')
+    if not path.exists():
+        return None
+    record = read(path)
+    pid = str(record.get('profile') or '')
+    if not pid:
+        return None
+    if not HAND_PROFILE_ID.fullmatch(pid):
+        raise ValueError('잘못된 손 형상 프로필 지정: ' + str(path))
+    profile = base / (pid + '.json')
+    if not profile.is_file():
+        raise FileNotFoundError('지정한 손 형상 프로필이 없습니다: ' + str(profile))
+    if record.get('sha256') and digest(profile) != record['sha256']:
+        raise ValueError(f'손 형상 프로필 {pid}이(가) 지정한 뒤 바뀌었습니다. RAW 목록에서 다시 지정하세요.')
+    return profile
+
+
+def result_artifacts(source, cfg):
+    """최종 저장 파일 목록. 손 형상 프로필로 피팅한 실행은 공유 형상 보정(shared_shape.pkl)을 하지 않으므로
+    대신 사용한 프로필 기록(shape_profile_used.json)을 저장합니다. 프로필 없는 실행은 설정 그대로입니다."""
+    artifacts = list(cfg['artifacts'])
+    try:
+        settings = read(Path(source) / 'hands' / 'settings.json')
+    except (OSError, ValueError):
+        return artifacts
+    if settings.get('shape_profile'):
+        artifacts = [a for a in artifacts if a != 'hands/hand_v1/shared_shape.pkl']
+        artifacts.append('hands/hand_v1/shape_profile_used.json')
+    return artifacts
+
+
 def publish_result(source, cfg, episode, key, identity, receipt, result_pc=None, target=''):
     nas = Path(cfg['nas_mount'])
     nas_ready = check_project_mount(cfg)
@@ -148,7 +193,7 @@ def publish_result(source, cfg, episode, key, identity, receipt, result_pc=None,
     sub = 'results/' + result_pc if result_pc else cfg['nas_results_subdir']
     root = (nas / sub if nas_ready else Path(cfg['project_dir']) / '07_deliverables' / 'local_results') / target_folder(target)
     destination = root / episode / key
-    result = publish(source, destination, cfg['artifacts'], identity)
+    result = publish(source, destination, result_artifacts(source, cfg), identity)
     record = {'destination': result, 'storage': 'nas' if nas_ready else 'local',
               'nas_pending': not nas_ready, 'configured_nas': str(nas)}
     (Path(receipt) / 'published.json').write_text(json.dumps(record, indent=2))
@@ -629,7 +674,11 @@ def execute(stage, episode, run_id, config_path, sam_prompt='', sam_scene='2d', 
         # 마스크 재승인 → 재추적, 또는 코드 변경으로 기준이 바뀌면 기존 결과를 보관하고 새로 실행합니다(track과 동일).
         cli('10_reconstruct.py', paths.episode_root(project, episode), '--no-view', '--auto-new-attempt')
     elif stage == 'hands':
-        cli('18_fit_hands.py', recon, '--hand-side', 'right', '--no-view')
+        # 사람별 손 형상: RAW 목록에서 프로필을 지정한 에피소드만 --hand-profile을 넘깁니다(없으면 기존과 같은 명령).
+        profile = assigned_hand_profile(cfg, raw_episode or episode)  # raw_episode는 실행 이름과 다를 때만 옵니다
+        if profile:
+            print('손 형상 프로필 지정:', profile, flush=True)
+        cli('18_fit_hands.py', recon, '--hand-side', 'right', *(['--hand-profile', str(profile)] if profile else []), '--no-view')
     elif stage == 'validate':
         module(scripts / '18_fit_hands.py').verify(recon / 'hands')
     elif stage == 'publish':
