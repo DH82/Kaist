@@ -734,7 +734,9 @@ def setup(app, guard, access, csrf):
                                     'per_frame': b.get('per_frame_mean_mm')})
                 except (OSError, ValueError, KeyError): pass
         except OSError as e: return {'status': status, 'results': [], 'error': str(e), 'out': str(COMPARE_OUT)}
-        return {'status': status, 'results': results, 'out': str(COMPARE_OUT)}
+        try: analysis = json.loads((COMPARE_OUT / 'shape_analysis.json').read_text())
+        except (OSError, ValueError): analysis = None
+        return {'status': status, 'results': results, 'out': str(COMPARE_OUT), 'analysis': analysis}
 
     @app.get('/api/hand-shape/compare/video')
     def compare_video(req: Request, ep: str, v: str = 'compare'):
