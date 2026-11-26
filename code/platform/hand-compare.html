@@ -19,18 +19,19 @@ input[type=range]{width:100%}.beta{font:11px ui-monospace,monospace;color:var(--
 </style></head><body>
 <header><h1>두 방식 MANO 비교</h1><select id="ep" aria-label="에피소드"></select><span class="small muted" id="info"></span><span style="flex:1"></span><a href="/#jobs" class="small">← 작업 현황</a></header>
 <main><p id="err"></p>
-<div class="card"><div class="row" style="margin-bottom:6px"><b>카메라 4대 투영</b><span class="small muted">왼쪽 <span class="sw" style="background:var(--a)"></span>원래 방식(에피소드마다 β 보정) · 오른쪽 <span class="sw" style="background:var(--b)"></span><span class="pname">프로필</span>(β 고정)</span></div>
- <video id="vid" muted playsinline preload="auto"></video>
+<div class="card"><div class="row" style="margin-bottom:6px"><b>카메라 4대 투영</b><label class="small">왼쪽 <span class="sw" style="background:var(--a)"></span><select id="va" aria-label="왼쪽 조건"></select></label><label class="small">오른쪽 <span class="sw" style="background:var(--b)"></span><select id="vb" aria-label="오른쪽 조건"></select></label></div>
+ <div class="grid2" style="display:grid;grid-template-columns:1fr 1fr;gap:6px"><div><div class="small muted" id="la"></div><video id="vid" muted playsinline preload="auto"></video></div><div><div class="small muted" id="lb"></div><video id="vid2" muted playsinline preload="auto"></video></div></div>
  <div class="row" style="margin-top:8px"><button id="play">▶ 재생</button><button onclick="go(F-1)">◀</button><button onclick="go(F+1)">▶</button><input type="range" id="fr" min="0" value="0" style="flex:1" aria-label="프레임"><span id="frl" style="min-width:110px" class="muted"></span>
  <label class="small">속도 <select id="speed"><option value="0.25">0.25×</option><option value="0.5" selected>0.5×</option><option value="1">1×</option></select></label></div>
 </div>
 <div class="grid">
- <div class="card"><div class="row" style="margin-bottom:8px"><b>3D 손 메시</b><button data-m="both" class="on">겹쳐 보기</button><button data-m="a">원래 방식만</button><button data-m="b"><span class="pname">프로필</span>만</button><button data-m="heat">차이 색</button>
+ <div class="card"><div class="row" style="margin-bottom:8px"><b>3D 손 메시</b><button data-m="both" class="on">겹쳐 보기</button><button data-m="a">왼쪽만</button><button data-m="b">오른쪽만</button><button data-m="heat">차이 색</button>
   <label class="small row" style="gap:4px">투명도 <input type="range" id="op" min="0.15" max="1" step="0.05" value="0.55" style="width:90px"></label><button id="reset">시점 초기화</button></div>
-  <div id="scene"><div id="legend"></div></div><p class="small muted" style="margin:6px 0 0">드래그 회전 · 휠 확대 · 오른쪽 드래그 이동. 두 결과는 같은 카메라 좌표계라 그대로 겹칩니다. 차이 색은 <span class="pname">프로필</span> 메시를 원래 방식 메시와의 점별 거리로 칠합니다.</p></div>
+  <div id="scene"><div id="legend"></div></div><p class="small muted" style="margin:6px 0 0">드래그 회전 · 휠 확대 · 오른쪽 드래그 이동. 두 결과는 같은 카메라 좌표계라 그대로 겹칩니다. 차이 색은 오른쪽 메시를 왼쪽 메시와의 점별 거리로 칠합니다.</p></div>
  <div>
   <div class="card"><b>프레임별 두 메시 거리</b> <span class="small muted">평균(진한 선) · 최대(옅은 선) · 클릭하면 그 프레임으로</span><div id="chart"></div><p class="small" id="fstat"></p></div>
-  <div class="card"><b>형상(β) 비교</b><table id="stats"></table></div>
+  <div class="card"><b>손가락 추종 지표</b> <span class="small muted">(003904 시험 기준 지표)</span><table id="fstats"></table></div>
+  <div class="card" id="betaCard"><b>형상(β) 비교</b><table id="stats"></table></div>
  </div>
 </div></main>
 <script type="module">
@@ -61,18 +62,18 @@ function setMode(m){mode=m;document.querySelectorAll('[data-m]').forEach(b=>b.cl
  A.visible=m==='both'||m==='a';B.visible=m!=='a';const op=+$('op').value;
  B.material.vertexColors=m==='heat';B.material.color.set(m==='heat'?0xffffff:0x2f7de1);B.material.opacity=m==='heat'?1:op;B.material.transparent=m!=='heat';B.material.depthWrite=m==='heat';B.material.needsUpdate=true;A.material.opacity=op;
  $('legend').innerHTML=m==='heat'?'차이 0mm <span class="sw" style="background:#0000ff"></span><span class="sw" style="background:#00ff00"></span><span class="sw" style="background:#ff0000"></span> 3mm 이상':
-  '<span class="sw" style="background:#d9468f"></span>원래 방식 · <span class="sw" style="background:#2f7de1"></span>'+esc(META?META.names[1]:'프로필');setFrame(F)}
+  '<span class="sw" style="background:#d9468f"></span>왼쪽 · <span class="sw" style="background:#2f7de1"></span>오른쪽';setFrame(F)}
 document.querySelectorAll('[data-m]').forEach(b=>b.onclick=()=>setMode(b.dataset.m));$('op').oninput=()=>setMode(mode);
 function fitView(){const box=new THREE.Box3().setFromObject(A),c=box.getCenter(new THREE.Vector3()),r=box.getSize(new THREE.Vector3()).length();
  ctl.target.copy(c);cam.position.copy(c).add(new THREE.Vector3(0,-r*0.6,-r*1.6));cam.up.set(0,-1,0);cam.lookAt(c);ctl.update();grid.position.copy(c)}
 $('reset').onclick=fitView;
 // ---- 영상·프레임 동기화 ----
 const vid=$('vid');
-function go(f){f=Math.max(0,Math.min(T-1,f));vid.currentTime=(f+0.5)/FPS;setFrame(f)}window.go=go;
+const vid2=$('vid2');function go(f){f=Math.max(0,Math.min(T-1,f));vid.currentTime=vid2.currentTime=(f+0.5)/FPS;setFrame(f)}window.go=go;
 $('fr').oninput=e=>{if(playing)togglePlay();go(+e.target.value)};
-function togglePlay(){playing=!playing;$('play').textContent=playing?'❚❚ 멈춤':'▶ 재생';if(playing){vid.playbackRate=+$('speed').value;vid.play()}else vid.pause()}
-$('play').onclick=togglePlay;$('speed').onchange=()=>vid.playbackRate=+$('speed').value;
-function tick(){if(playing){const f=Math.min(T-1,Math.floor(vid.currentTime*FPS));if(f!==F)setFrame(f)}requestAnimationFrame(tick)}tick();
+function togglePlay(){playing=!playing;$('play').textContent=playing?'❚❚ 멈춤':'▶ 재생';if(playing){vid.playbackRate=vid2.playbackRate=+$('speed').value;vid2.currentTime=vid.currentTime;vid.play();vid2.play()}else{vid.pause();vid2.pause()}}
+$('play').onclick=togglePlay;$('speed').onchange=()=>vid.playbackRate=vid2.playbackRate=+$('speed').value;
+function tick(){if(playing){const f=Math.min(T-1,Math.floor(vid.currentTime*FPS));if(Math.abs(vid2.currentTime-vid.currentTime)>0.1)vid2.currentTime=vid.currentTime;if(f!==F)setFrame(f)}requestAnimationFrame(tick)}tick();
 vid.onended=()=>{playing=false;$('play').textContent='▶ 재생'};
 // ---- 그래프 ----
 let chartW=0;
@@ -84,7 +85,13 @@ function drawChart(){const a=META.dist_mean_mm,b=META.dist_max_mm,w=$('chart').c
 function drawMarker(){const mk=document.getElementById('mk');if(!mk)return;const x=F*(chartW-30)/Math.max(1,T-1)+28;mk.setAttribute('x1',x);mk.setAttribute('x2',x)}
 new ResizeObserver(()=>META&&drawChart()).observe($('chart'));
 // ---- 수치 ----
-function stats(){const s=META.summary,n=META.names,an=META.analysis,v=s.variants,bv=s.between_variants||{};
+function fstats(){const L=VARS[META.names[0]],R=VARS[META.names[1]],ma=L&&L.metrics,mb=R&&R.metrics;
+ const row=(t,f,u,better)=>{const x=ma?f(ma):null,y=mb?f(mb):null;return '<tr><td>'+t+'</td><td>'+(x==null?'—':x+u)+'</td><td>'+(y==null?'—':y+u)+'</td><td class="small muted">'+better+'</td></tr>'};
+ $('fstats').innerHTML='<tr><th></th><th><span class="sw" style="background:var(--a)"></span>왼쪽</th><th><span class="sw" style="background:var(--b)"></span>오른쪽</th><th></th></tr>'+
+  row('MediaPipe 손가락 끝 오차 평균',m=>m.mp2d.tips_mean,' px','작을수록 좋음')+row('손가락 끝 오차 상위 10%',m=>m.mp2d.tips_p90,' px','작을수록 좋음')+
+  row('손가락 메시 마스크 안 비율',m=>(m.mask_inside_finger*100).toFixed(1),' %','클수록 좋음')+row('HaMBA 손가락 흐름 상관',m=>m.hamba.corr_mean,'','1에 가까울수록 같이 움직임')+
+  row('손가락 관절 움직임',m=>m.motion_deg,'°','HaMBA '+((ma||mb)?(ma||mb).hamba_motion_deg:'')+'° 와 비슷하면 자연스러움')+row('떨림 (손가락 끝 가속도)',m=>m.jitter_tip_mm,' mm','작을수록 부드러움')}
+function stats(){fstats();$('betaCard').hidden=!META.summary;if(!META.summary)return;const s=META.summary,n=META.names,an=META.analysis,v=s.variants,bv=s.between_variants||{};
  const sz=x=>x&&x.hand_size_mm?x.hand_size_mm.length.toFixed(1)+' / '+x.hand_size_mm.width.toFixed(1)+' mm':'—';
  let rows='<tr><th></th><th><span class="sw" style="background:var(--a)"></span>원래 방식</th><th><span class="sw" style="background:var(--b)"></span>'+esc(n[1])+'</th></tr>'+
  '<tr><td>β 출처</td><td>이 에피소드에서 보정'+(an?' (프레임 '+an.default.calibration_frames+'장, 한계 닿은 β '+an.default.clamp_hits+'개)':'')+'</td><td>프로필 고정 (손만 찍은 영상 평균)</td></tr>'+
@@ -97,18 +104,23 @@ function stats(){const s=META.summary,n=META.names,an=META.analysis,v=s.variants
  '<tr><td>두 메시 거리</td><td colspan=2>평균 '+(bv.vertex_mean_mm??'—')+' mm · 95% '+(bv.vertex_p95_mm??'—')+' mm · 최대 '+(bv.vertex_max_mm??'—')+' mm · 중심 차이 평균 '+(bv.center_mean_mm??'—')+' mm</td></tr>';
  $('stats').innerHTML=rows}
 // ---- 불러오기 ----
-async function load(ep){$('err').textContent='';$('info').textContent='불러오는 중… (처음 열 때 메시 변환 약 10초)';
- try{const r=await fetch('/api/hand-shape/compare/mesh?ep='+encodeURIComponent(ep));if(!r.ok)throw Error((await r.json().catch(()=>({}))).detail||('불러오기 실패 '+r.status));META=await r.json();
-  const buf=await (await fetch('/api/hand-shape/compare/mesh?part=bin&ep='+encodeURIComponent(ep))).arrayBuffer();V=new Float32Array(buf);T=META.frames.length;NV=META.vertices;
+let VARS={},CUR_EP='';
+async function load(ep){$('err').textContent='';$('info').textContent='불러오는 중… (처음 여는 조합은 메시 변환 약 10초)';
+ try{if(ep!==CUR_EP){const vr=await (await fetch('/api/hand-shape/compare/variants?ep='+encodeURIComponent(ep))).json();VARS={};vr.variants.forEach(x=>VARS[x.id]=x);CUR_EP=ep;
+   const opts=vr.variants.map(x=>'<option value="'+esc(x.id)+'">'+esc(x.label)+'</option>').join('');$('va').innerHTML=opts;$('vb').innerHTML=opts;
+   const q=new URLSearchParams(location.search),ids=vr.variants.map(x=>x.id);$('va').value=ids.includes(q.get('a'))?q.get('a'):(ids.includes('User2')?'User2':ids[0]);$('vb').value=ids.includes(q.get('b'))?q.get('b'):(ids.includes('default')?'default':ids[1]||ids[0])}
+  const A_=$('va').value,B_=$('vb').value,qs='ep='+encodeURIComponent(ep)+'&a='+encodeURIComponent(A_)+'&b='+encodeURIComponent(B_);
+  const r=await fetch('/api/hand-shape/compare/mesh?'+qs);if(!r.ok)throw Error((await r.json().catch(()=>({}))).detail||('불러오기 실패 '+r.status));META=await r.json();
+  const buf=await (await fetch('/api/hand-shape/compare/mesh?part=bin&'+qs)).arrayBuffer();V=new Float32Array(buf);T=META.frames.length;NV=META.vertices;
   for(const o of [A,B]){o.geometry.dispose();const g=new THREE.BufferGeometry();g.setAttribute('position',new THREE.BufferAttribute(new Float32Array(NV*3),3));g.setIndex(META.faces);o.geometry=g}
   B.geometry.setAttribute('color',new THREE.BufferAttribute(new Float32Array(NV*3),3));
   document.querySelectorAll('.pname').forEach(e=>e.textContent=META.names[1]);$('fr').max=T-1;
-  vid.src='/api/hand-shape/compare/video?v=compare&ep='+encodeURIComponent(ep);history.replaceState(null,'','?ep='+ep);
-  $('info').textContent=T+'프레임 · '+FPS+'fps · 결과 '+String(META.summary.created||'').slice(0,16).replace('T',' ');
+  vid.src='/api/hand-shape/compare/video?ep='+encodeURIComponent(ep)+'&v='+encodeURIComponent(A_);vid2.src='/api/hand-shape/compare/video?ep='+encodeURIComponent(ep)+'&v='+encodeURIComponent(B_);$('la').textContent=META.labels[0];$('lb').textContent=META.labels[1];history.replaceState(null,'','?'+qs);
+  $('info').textContent=T+'프레임 · '+FPS+'fps · 결과 '+String((META.summary||{}).created||'').slice(0,16).replace('T',' ');
   setMode(mode);setFrame(0);fitView();drawChart();stats();resize()}catch(e){$('err').textContent=e.message;$('info').textContent=''}}
 async function init(){const r=await fetch('/api/hand-shape/compare');const d=await r.json();const eps=(d.results||[]).map(x=>x.episode);
  if(!eps.length){$('err').textContent='아직 완료된 비교 결과가 없습니다.';return}
  $('ep').innerHTML=eps.map(e=>'<option>'+esc(e)+'</option>').join('');const want=new URLSearchParams(location.search).get('ep');$('ep').value=eps.includes(want)?want:eps[0];
- $('ep').onchange=()=>{if(playing)togglePlay();load($('ep').value)};load($('ep').value)}
+ $('ep').onchange=()=>{if(playing)togglePlay();load($('ep').value)};$('va').onchange=$('vb').onchange=()=>{if(playing)togglePlay();load($('ep').value)};load($('ep').value)}
 init();
 </script></body></html>

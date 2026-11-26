@@ -91,7 +91,7 @@ def main():
     allv = np.concatenate([errs[j] for j in range(1, 21)]); tips = np.concatenate([errs[j] for j in TIPS])
     mp2d = {'all_median': round(float(np.median(allv)), 2), 'all_mean': round(float(allv.mean()), 2), 'tips_median': round(float(np.median(tips)), 2),
             'tips_mean': round(float(tips.mean()), 2), 'tips_p90': round(float(np.percentile(tips, 90)), 2), 'n': int(len(tips)),
-            'fingers_median': {n: round(float(np.median(np.concatenate([errs[j] for j in js]))), 2) for n, js in FINGERS.items()}}
+            'fingers_median': {n: (round(float(np.median(np.concatenate([errs[j] for j in js]))), 2) if sum(len(errs[j]) for j in js) else None) for n, js in FINGERS.items()}}
     # 마스크 안 비율(손가락 점)
     inside = []
     for c in range(4):

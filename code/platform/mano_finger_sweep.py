@@ -143,7 +143,23 @@ def neighbors(v):
 def main():
     p = argparse.ArgumentParser(); p.add_argument('--profile', default='User2'); p.add_argument('--out', type=Path, default=Path('/mnt/kaist-data/TEST/Set2'))
     p.add_argument('--episodes', nargs='+', required=True); p.add_argument('--search', type=int, default=2, help='탐색에 쓸 에피소드 수(손가락 움직임 큰 순)')
+    p.add_argument('--extra', action='append', default=[], help='탐색 없이 이 조건만 실행: pt=500000,hw=0.1,pr=25,init=prev (여러 번 가능)')
     a = p.parse_args()
+    if a.extra:
+        status = json.loads(STATUS.read_text()) if STATUS.exists() else {'results': {}, 'variants': {}, 'baseline': {}, 'log': []}
+        status.update(profile=a.profile, patched=str(patched_code())); status.setdefault('extra', [])
+        for spec in a.extra:
+            kv = dict(x.split('=') for x in spec.split(','))
+            v = {'pose_temp_weight': float(kv.get('pt', BASE['pose_temp_weight'])), 'hamba_weight': float(kv.get('hw', BASE['hamba_weight'])),
+                 'w_pose_prior': float(kv.get('pr', BASE['w_pose_prior'])), 'pose_init': kv.get('init', BASE['pose_init'])}
+            status['variants'][name(v)] = v
+            if name(v) not in status['extra']: status['extra'].append(name(v))
+            for ep in a.episodes:
+                status['baseline'].setdefault(ep, baseline(ep, status)); status['results'].setdefault(ep, {})
+                try: status['results'][ep][name(v)] = run_variant(ep, v, status, '추가')
+                except Exception as e: traceback.print_exc(); status['results'][ep][name(v)] = None; status['log'].append(time.strftime('%H:%M ') + f'실패 {ep} {name(v)}: {e}')
+                status.pop('current', None); save(status)
+        return
     status = json.loads(STATUS.read_text()) if STATUS.exists() else {}
     status.update(profile=a.profile, running=True, started=status.get('started') or time.strftime('%Y-%m-%d %H:%M:%S'), episodes=a.episodes,
                   baseline=status.get('baseline', {}), results=status.get('results', {}), variants=status.get('variants', {}), log=status.get('log', []))

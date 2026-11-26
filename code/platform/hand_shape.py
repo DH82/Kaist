@@ -34,7 +34,24 @@ ASSIGN = PROFILES / 'assign'
 # 두 방식 MANO 비교(mano_compare.py): 결과는 NAS, 진행 상태는 로컬 작업 폴더
 COMPARE_OUT = Path(os.environ.get('KAIST_MANO_COMPARE_OUT', str(NAS / 'TEST/Set2')))
 COMPARE_WORK = Path(os.environ.get('KAIST_MANO_COMPARE_WORK', str(Path.home() / 'kaist_work/mano_compare')))
-VARIANT = re.compile(r'(default|[A-Za-z0-9][A-Za-z0-9_.-]{0,63})$')
+VARIANT = re.compile(r'(default|[A-Za-z0-9][A-Za-z0-9_.+-]{0,80})$')
+SWEEP = re.compile(r'pt[0-9.e+]+_hw[0-9.e+-]+_pr[0-9.e+]+_(prev|hamba)$')
+
+
+def variant_dir(ep, v):
+    """비교 화면의 조건 폴더: Set2/<ep>/<default|프로필> 또는 손가락 시험 ~/kaist_work/mano_compare/<ep>/sweep/<조건>."""
+    if not EP.fullmatch(ep) or not VARIANT.fullmatch(v) or v in ('.', '..'): raise HTTPException(400, '잘못된 요청입니다.')
+    d = COMPARE_WORK / ep / 'sweep' / v if SWEEP.fullmatch(v) else COMPARE_OUT / ep / v
+    if not (d / 'hand_v1/hand_reg.pkl').is_file(): raise HTTPException(404, f'{v} 결과가 없습니다.')
+    return d
+
+
+def variant_label(v, settings=None):
+    if v == 'default': return '원래 방식 (에피소드 β 보정) · 현재 설정'
+    m = SWEEP.fullmatch(v)
+    if not m: return f'{v} β · 현재 설정 (기준)'
+    pt, hw, pr = re.match(r'pt([^_]+)_hw([^_]+)_pr([^_]+)_', v).groups()
+    return f"손가락 시간축 {float(pt):g} · HaMBA {float(hw):g} · 자세 사전 {float(pr):g} · {'프레임별 HaMBA 시작' if m.group(1) == 'hamba' else '이전 프레임 시작'}"
 SUBTRACT = ['human forearm', 'shadow']
 WAND_IDLE = 180
 WAND_MIN_FREE_MB = 8192
@@ -771,7 +788,7 @@ def setup(app, guard, access, csrf):
     def compare_video(req: Request, ep: str, v: str = 'compare'):
         guard(req)
         if not EP.fullmatch(ep) or not (v == 'compare' or VARIANT.fullmatch(v)): raise HTTPException(400, '잘못된 요청입니다.')
-        p = COMPARE_OUT / ep / ('compare.mp4' if v == 'compare' else f'{v}/review/mano_review.mp4')
+        p = COMPARE_OUT / ep / 'compare.mp4' if v == 'compare' else variant_dir(ep, v) / 'review/mano_review.mp4'
         if not p.is_file(): raise HTTPException(404, '영상이 없습니다.')
         return FileResponse(p, media_type='video/mp4', headers={'Cache-Control': 'no-store'})
 
@@ -788,16 +805,32 @@ def setup(app, guard, access, csrf):
         if name not in ('three.module.js', 'OrbitControls.js'): raise HTTPException(404, '없음')
         return FileResponse(REPO / 'code/viewer/app/vendor' / name, media_type='application/javascript', headers={'Cache-Control': 'max-age=3600'})
 
+    @app.get('/api/hand-shape/compare/variants')
+    def compare_variants(req: Request, ep: str):
+        guard(req)
+        if not EP.fullmatch(ep): raise HTTPException(400, '잘못된 요청입니다.')
+        out = []
+        cands = [p.name for p in sorted((COMPARE_OUT / ep).glob('*')) if (p / 'hand_v1/hand_reg.pkl').is_file()]
+        cands += [p.name for p in sorted((COMPARE_WORK / ep / 'sweep').glob('*')) if SWEEP.fullmatch(p.name) and (p / 'review/mano_review.mp4').is_file()]
+        for v in cands:
+            m = None
+            for d in (COMPARE_WORK / ep / v, COMPARE_WORK / ep / 'sweep' / v):
+                try: m = json.loads((d / 'finger_metrics.json').read_text()); break
+                except (OSError, ValueError): pass
+            out.append({'id': v, 'label': variant_label(v), 'metrics': m, 'sweep': bool(SWEEP.fullmatch(v))})
+        return {'episode': ep, 'variants': out}
+
     @app.get('/api/hand-shape/compare/mesh')
-    def compare_mesh(req: Request, ep: str, part: str = 'json'):
+    def compare_mesh(req: Request, ep: str, part: str = 'json', a: str = '', b: str = ''):
         """두 방식 손 메시(프레임별 778점)를 3D 비교용으로 변환: Set2/<ep>/viewer/mesh.json + mesh.bin(float32 [방식,프레임,778,3])."""
         guard(req)
         if not EP.fullmatch(ep) or part not in ('json', 'bin'): raise HTTPException(400, '잘못된 요청입니다.')
-        d = COMPARE_OUT / ep; v = d / 'viewer'
+        d = COMPARE_OUT / ep
         try: summ = json.loads((d / 'summary.json').read_text())
         except (OSError, ValueError): raise HTTPException(404, '비교 결과가 없습니다.')
-        names = list(summ['variants'])
-        regs = [d / n / 'hand_v1/hand_reg.pkl' for n in names]
+        names = [a or list(summ['variants'])[0], b or list(summ['variants'])[1]]
+        regs = [variant_dir(ep, n) / 'hand_v1/hand_reg.pkl' for n in names]
+        v = COMPARE_WORK / ep / 'viewer' / hashlib.sha256('|'.join(names).encode()).hexdigest()[:16]; v.parent.mkdir(parents=True, exist_ok=True)
         fresh = (v / 'mesh.json').exists() and (v / 'mesh.bin').exists() and all((v / 'mesh.json').stat().st_mtime >= r.stat().st_mtime for r in regs)
         if not fresh:
             with _mesh_lock:
@@ -808,7 +841,8 @@ def setup(app, guard, access, csrf):
                     if r.returncode: raise HTTPException(500, '메시 변환 실패: ' + r.stderr[-400:])
         if part == 'bin': return FileResponse(v / 'mesh.bin', media_type='application/octet-stream', headers={'Cache-Control': 'no-store'})
         meta = json.loads((v / 'mesh.json').read_text())
-        meta['summary'] = summ
+        meta['names'] = names; meta['labels'] = [variant_label(n) for n in names]
+        meta['summary'] = summ if set(names) == set(summ['variants']) else None
         try:
             a = json.loads((COMPARE_OUT / 'shape_analysis.json').read_text())
             meta['analysis'] = next((e for e in a['episodes'] if e['episode'] == ep), None); meta['profile_size'] = a['profile']['size']
