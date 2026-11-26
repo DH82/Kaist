@@ -84,8 +84,10 @@ def details(dag_id: str, episode: str, user: GetUserDep):
 
 
 @app.get('/dags/{dag_id}/episodes/{episode}/image',dependencies=[Depends(requires_access_dag(method='GET'))])
-def frame_image(dag_id: str, episode: str, cam: int, frame: int, mode: str='overlay'):
-    value=backend(dag_id,episode,'image', ['--cam',str(cam),'--frame',str(frame),'--mode',mode])
+def frame_image(dag_id: str, episode: str, cam: int, frame: int, mode: str='overlay', object_color: str='', hand_color: str=''):
+    # object_color·hand_color: 작업자가 고른 마스크 색('rrggbb'). 형식이 맞을 때만 넘깁니다.
+    colors=[x for name,value in (('--object-color',object_color),('--hand-color',hand_color)) if re.fullmatch(r'[0-9a-fA-F]{6}',value) for x in (name,value)]
+    value=backend(dag_id,episode,'image', ['--cam',str(cam),'--frame',str(frame),'--mode',mode,*colors])
     return Response(value,media_type='image/jpeg',headers={'Cache-Control':'no-store'})
 
 

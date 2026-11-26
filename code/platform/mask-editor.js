@@ -50,11 +50,11 @@ function hcEditControls(){
  hcEmptyNavControls();
  $('hcBatchApply').textContent='빈 '+($('hcEditObj').value==='0'?'물체':'손')+' 마스크 프레임만 채우기';
  $('hcBatchApply').disabled=busy||hcBatch.running||!we?.wand.points.some(x=>x[2]===1)||we.wand.busy;$('hcBatchStop').hidden=!hcBatch.running||hcBatch.track;
- // 추적 일괄 교체는 '마스크 수정 → 대상'에서 고른 마스크(손·분홍 / 물체·초록)에만 진행합니다.
+ // 추적 일괄 교체는 '마스크 수정 → 대상'에서 고른 마스크(손 / 물체)에만 진행합니다.
  const trackObj=$('hcEditObj').value==='0';
  // 구간을 비우면 '전체 프레임', 입력하면 그 구간을 버튼에 그대로 보여 줍니다.
  const ranged=$('hcBatchFrom').value.trim()!==''||$('hcBatchTo').value.trim()!=='',span=ranged&&hcMeta?hcBatchRange():null;
- $('hcBatchTarget').textContent=trackObj?'● 물체(초록)':'● 손(분홍)';
+ $('hcBatchTarget').textContent=trackObj?'● 물체':'● 손';
  $('hcBatchTarget').classList.toggle('hcTrackObject',trackObj);$('hcBatchTarget').classList.toggle('hcTrackHand',!trackObj);
  $('hcTrackApply').textContent=(span?'프레임 '+(span[0]+1)+'~'+(span[1]+1):'전체 프레임')+' 교체';
  $('hcTrackApply').classList.toggle('hcTrackObject',trackObj);$('hcTrackApply').classList.toggle('hcTrackHand',!trackObj);
@@ -86,7 +86,7 @@ function hcEditRender(cam){
   region.putImageData(e.original,0,0);region.drawImage(e.mask,0,0);
   ctx.drawImage(e.rgb,0,0);ctx.globalCompositeOperation='destination-in';ctx.drawImage(e.scratch,0,0);ctx.globalCompositeOperation='source-over';
   tint.globalCompositeOperation='source-over';tint.clearRect(0,0,e.width,e.height);
-  tint.fillStyle=e.obj===0?'rgb(40,230,90)':'rgb(245,70,205)';tint.fillRect(0,0,e.width,e.height);
+  tint.fillStyle=e.obj===0?hcMaskColors.object:hcMaskColors.hand;tint.fillRect(0,0,e.width,e.height);
   tint.globalCompositeOperation='destination-in';tint.drawImage(e.mask,0,0);
   ctx.globalAlpha=.48;ctx.drawImage(e.tint,0,0);ctx.globalAlpha=1;
  }
@@ -190,7 +190,7 @@ function hcEditBind(cam){
   if(ev.button!==0&&!(wand&&ev.button===2))return;
   const blocked=hcEditBlocked();if(blocked){hcEditMessage(blocked,true);return}
   ev.preventDefault();hcStop();$('hcEditState').classList.remove('error');
-  // preventDefault로 브라우저가 포커스를 옮기지 않으므로, '대상'(물체 · 초록) 선택칸이나 물체 이름 칸에 포커스가 남아
+  // preventDefault로 브라우저가 포커스를 옮기지 않으므로, '대상'(물체) 선택칸이나 물체 이름 칸에 포커스가 남아
   // Enter(적용·저장)·Esc·Backspace 단축키가 입력칸 몫으로 무시되던 문제를 막습니다. 화면을 누르면 입력칸 포커스를 풉니다.
   const focused=document.activeElement;if(focused&&focused!==document.body&&focused.closest('#hcWorkspace'))focused.blur();
   const p=hcEditPoint(cam,ev);
@@ -667,7 +667,7 @@ async function hcTrackRun(forward){
  const e=hcWandEntry();
  if(!e?.wand?.mask){hcWandMessage('먼저 품질이 나쁜 프레임에서 마법봉으로 대상을 클릭해 노란 결과를 확인하세요. 그 결과를 시드로 추적합니다.',true);return}
  if(e.wand.busy){hcWandMessage('분할이 끝난 뒤 실행할 수 있습니다.',true);return}
- const body=hcWandRequestBody(e),obj=e.obj,path=hcPath,token=hcToken,episode=hcMeta.episode,objName=obj===0?'물체(초록)':'손(분홍)';
+ const body=hcWandRequestBody(e),obj=e.obj,path=hcPath,token=hcToken,episode=hcMeta.episode,objName=obj===0?'물체':'손';
  // 마법봉 결과를 만든 뒤 대상을 바꿨다면 진행하지 않습니다(대상 전환 시 점이 지워지지만 한 번 더 확인).
  if(String(obj)!==$('hcEditObj').value){hcWandMessage('마스크 수정 대상이 바뀌었습니다. 지금 대상으로 마법봉을 다시 클릭하세요.',true);return}
  const range=hcBatchRange(),to=range[1],from=forward?body.frame:range[0],label=forward?'현재 프레임 이후 일괄 교체':'전체 프레임 일괄 교체';
