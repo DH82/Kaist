@@ -33,6 +33,11 @@ def pc_name(name):
 # 실행·담당 기록에는 이 화면의 PC 이름(PC_ID)이 들어가므로 결과 폴더(results/pcN) 규칙은 그대로입니다.
 ADMIN_NAME='관리자'
 
+# 로그인 쿠키 이름. 브라우저 쿠키는 포트를 구분하지 않으므로, 같은 주소에 UI가 둘(정식 18083 · Test 28083) 있으면
+# 서로 다른 이름을 줘야 한쪽 로그인이 다른 쪽을 풀지 않습니다(KAIST_SESSION_COOKIE, 기본 kaist_session).
+SESSION_COOKIE=os.environ.get('KAIST_SESSION_COOKIE','').strip() or 'kaist_session'
+if not re.fullmatch(r'[A-Za-z0-9_]{1,40}',SESSION_COOKIE):raise ValueError('KAIST_SESSION_COOKIE는 영문·숫자·_ 1~40자만 됩니다.')
+
 def here_pc():
  here=os.environ.get('PC_ID','').strip().lower()
  return here.upper() if here.upper() in PC_NAMES else 'PC1'
@@ -43,7 +48,7 @@ def login(name,role):
  return token
 
 def user(req):
- with db() as c:r=c.execute('SELECT name,role FROM ui_sessions WHERE token=? AND expires>?',(req.cookies.get('kaist_session',''),time.time())).fetchone()
+ with db() as c:r=c.execute('SELECT name,role FROM ui_sessions WHERE token=? AND expires>?',(req.cookies.get(SESSION_COOKIE,''),time.time())).fetchone()
  if r and r['role']=='admin' and r['name']==ADMIN_NAME:
   return {'name':here_pc(),'role':'admin','label':ADMIN_NAME,'admin_login':True}
  # PC1~PC6가 아닌 이름으로 만들어진 예전 세션은 다시 로그인해야 합니다.

@@ -315,7 +315,7 @@ async def errors(req,call_next):
   # PC 연동: 다른 PC에서 로그인해 넘어온 1회용 토큰(/sso)과, 그렇게 만든 유효한 로그인 세션은 이 PC의
   # 사이트 비밀번호를 다시 묻지 않습니다(세션은 비밀번호를 통과한 PC의 로그인으로만 생깁니다).
   if not valid and req.url.path=='/sso':valid=True
-  if not valid and req.cookies.get('kaist_session'):
+  if not valid and req.cookies.get(access.SESSION_COOKIE):
    try:access.user(req);valid=True
    except HTTPException:pass
   if not valid:return Response('로그인이 필요합니다.',status_code=401,headers={'WWW-Authenticate':'Basic realm="KAIST"'},media_type='text/plain')
@@ -376,7 +376,7 @@ def login(data:Login,req:Request):
   token=access.login(access.ADMIN_NAME,'admin')
   with access.db() as c:c.execute('INSERT INTO ui_audit VALUES(?,?,?)',(time.time(),access.ADMIN_NAME,'login-admin on '+access.here_pc()))
   response=Response(json.dumps({'name':access.here_pc(),'role':'admin','label':access.ADMIN_NAME,'admin_login':True},ensure_ascii=False),media_type='application/json')
-  response.set_cookie('kaist_session',token,httponly=True,samesite='strict',secure=req.url.scheme=='https',max_age=43200)
+  response.set_cookie(access.SESSION_COOKIE,token,httponly=True,samesite='strict',secure=req.url.scheme=='https',max_age=43200)
   return response
  name=access.pc_name(data.name)
  if not name:raise HTTPException(403,'PC1 ~ PC6 중 하나의 이름으로만 로그인할 수 있습니다.')
@@ -391,7 +391,7 @@ def login(data:Login,req:Request):
   return {'name':name,'role':data.role,'redirect':url.rstrip('/')+'/sso?t='+quote(token_value)}
  token=access.login(name,data.role)
  response=Response(json.dumps({'name':name,'role':data.role}),media_type='application/json')
- response.set_cookie('kaist_session',token,httponly=True,samesite='strict',secure=req.url.scheme=='https',max_age=43200)
+ response.set_cookie(access.SESSION_COOKIE,token,httponly=True,samesite='strict',secure=req.url.scheme=='https',max_age=43200)
  return response
 
 @app.get('/sso')
@@ -403,14 +403,14 @@ def sso(req:Request,t:str=''):
  token_value=access.login(h['name'],h['role'])
  with access.db() as c:c.execute('INSERT INTO ui_audit VALUES(?,?,?)',(time.time(),h['name'],'login-sso from '+str(h.get('from'))))
  response=RedirectResponse('/',status_code=303)
- response.set_cookie('kaist_session',token_value,httponly=True,samesite='lax',secure=req.url.scheme=='https',max_age=43200)
+ response.set_cookie(access.SESSION_COOKIE,token_value,httponly=True,samesite='lax',secure=req.url.scheme=='https',max_age=43200)
  return response
 
 @app.post('/api/logout')
 def logout(req:Request):
  guard(req)
- with access.db() as c:c.execute('DELETE FROM ui_sessions WHERE token=?',(req.cookies.get('kaist_session',''),))
- response=Response('{}',media_type='application/json');response.delete_cookie('kaist_session');return response
+ with access.db() as c:c.execute('DELETE FROM ui_sessions WHERE token=?',(req.cookies.get(access.SESSION_COOKIE,''),))
+ response=Response('{}',media_type='application/json');response.delete_cookie(access.SESSION_COOKIE);return response
 
 @app.get('/api/operators')
 def operators(req:Request):
@@ -2322,7 +2322,7 @@ def task_update(task_id,**fields):
 def internal_request(token_value):
  host=sorted(ALLOWED_HOSTS)[0]
  return _StarletteRequest({'type':'http','method':'POST','path':'/api/run','query_string':b'','scheme':'http','server':('127.0.0.1',0),
-  'headers':[(b'host',host.encode()),(b'origin',('http://'+host).encode()),(b'x-platform-csrf',CSRF.encode()),(b'cookie',('kaist_session='+token_value).encode())]})
+  'headers':[(b'host',host.encode()),(b'origin',('http://'+host).encode()),(b'x-platform-csrf',CSRF.encode()),(b'cookie',(access.SESSION_COOKIE+'='+token_value).encode())]})
 
 def fleet_run_raw(task,p):
  ep=p['episode']
