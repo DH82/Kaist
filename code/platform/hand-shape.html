@@ -74,8 +74,9 @@ function render(){const keep=new Set([...document.querySelectorAll('.pick:checke
  const r=row();if(r&&r.masks){const pv=$('pv'),was=!pv.hidden;pv.hidden=false;frames=r.masks.frames;ed.w=r.masks.wh[0];ed.h=r.masks.wh[1];$('fr').max=frames-1;$('pvt').textContent=cur;
   $('pvm').textContent='마스크 파일(cam1~4): '+r.masks.per_camera.join(' / ')+' / 전체 '+frames+(r.filled?(' · 빈 마스크로 채움 '+r.filled):'');if(!was)setView(view)}
  else $('pv').hidden=true;fit()}
-function fit(){try{parent.postMessage({manoBetaHeight:document.documentElement.scrollHeight},location.origin)}catch(e){}}
-new ResizeObserver(fit).observe(document.body);
+// 내용(main) 높이만 알립니다(문서 높이는 iframe 높이를 따라 커지므로 쓰면 계속 늘어남).
+function fit(){try{parent.postMessage({manoBetaHeight:document.querySelector('main').getBoundingClientRect().bottom+12},location.origin)}catch(e){}}
+new ResizeObserver(fit).observe(document.querySelector('main'));
 function showPreview(bust){$('img').src=A+'img/preview?ep='+cur+'&f='+curF+'&t='+(bust||'')}
 async function setView(v){if(v!==view&&ed.dirty&&!(await save()))return;view=v;['v4','v0','v1','v2','v3'].forEach((id,i)=>$(id).classList.toggle('on',(i==0&&v<0)||(i-1==v)));
  $('img').hidden=v>=0;$('editor').hidden=v<0;if(v<0)showPreview(Date.now());else loadEdit()}

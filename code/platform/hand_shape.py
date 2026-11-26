@@ -216,7 +216,9 @@ def run(ep, cmd, cwd=None, env=None):
     log(ep, '$ ' + ' '.join(map(str, cmd)))
     with (LOGS / f'{ep}.log').open('a') as f:
         r = subprocess.run([str(c) for c in cmd], cwd=cwd, env=env, stdout=f, stderr=subprocess.STDOUT)
-    if r.returncode: raise RuntimeError(f'종료코드 {r.returncode}: {Path(str(cmd[1] if len(cmd) > 1 else cmd[0])).name} (로그 확인)')
+    if r.returncode:
+        name = next((Path(str(c)).name for c in cmd if str(c).endswith('.py')), Path(str(cmd[0])).name)
+        raise RuntimeError(f'종료코드 {r.returncode}: {name} (로그 확인)')
 
 
 def step(ep, text):
@@ -339,6 +341,11 @@ def process_measure(ep):
         run(ep, [W / 'hamba-env/bin/python', '-u', r / 'data_process/data_process_hands.py', '--hamba_base_path', BASE / 'hamba',
                  '--phystwin_base_path', BASE / 'hand', '--case_name', ep, '--observations-cache', case / 'observations.pkl', *SHAPE_ARGS],
             cwd=r, env=hands_env())
+    except RuntimeError:
+        tail = (LOGS / f'{ep}.log').read_text(errors='replace')[-6000:]
+        if 'ref_cidx' in tail and 'KeyError' in tail:
+            raise RuntimeError('첫 프레임에서 어느 카메라도 오른손을 찾지 못했습니다(HaMBA 손 검출 없음). 첫 프레임부터 오른손 전체가 보이게 다시 찍은 영상을 쓰세요.') from None
+        raise
     finally: slot.close()
     m = measurement(ep)
     if not m: raise RuntimeError('형상 보정 결과(hand_v1/shared_shape.json)가 없습니다. 로그를 확인하세요.')

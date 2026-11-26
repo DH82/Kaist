@@ -329,11 +329,12 @@ async function loadHandProfiles(force=false){
 function handProfileCell(e){
  const a=(handProfiles.assignments||{})[e.episode],cur=a&&a.profile||'',ok=(handProfiles.profiles||[]).filter(p=>!p.invalid);
  if(!ok.length&&!cur)return '<span class="help">—</span>';
- const can=e.can_run!==false&&!e.elsewhere&&!handProfileBusy.has(e.episode);
+ // 전체 완료(MANO까지 끝남)한 RAW는 바꿔도 결과가 바뀌지 않으므로 보기만 합니다.
+ const can=e.can_run!==false&&!e.elsewhere&&e.progress!=='전체 완료'&&!handProfileBusy.has(e.episode);
  const tip=a?'지정: '+(a.by||'')+' · '+String(a.at_text||'').replace('T',' ').slice(0,16):'지정하지 않으면 에피소드마다 공유 형상 보정(기존 방식)';
  if(!can)return '<span class="help" title="'+escape(tip)+'">'+escape(cur||'기본')+'</span>';
- return '<select class="handProfileSel" data-hand-profile="'+escape(e.episode)+'" title="'+escape(tip)+'" aria-label="'+escape(e.episode)+' 손 형상 프로필"><option value="">기본 (에피소드별 보정)</option>'+
-  ok.map(p=>'<option value="'+escape(p.id)+'"'+(p.id===cur?' selected':'')+'>'+escape(p.id)+(p.size?' · '+p.size.length.toFixed(0)+'mm':'')+'</option>').join('')+
+ return '<select class="handProfileSel" style="min-width:92px;max-width:130px;padding:5px 4px;margin:0" data-hand-profile="'+escape(e.episode)+'" title="'+escape(tip)+'" aria-label="'+escape(e.episode)+' 손 형상 프로필"><option value="">기본</option>'+
+  ok.map(p=>'<option value="'+escape(p.id)+'"'+(p.id===cur?' selected':'')+'>'+escape(p.id)+'</option>').join('')+
   (cur&&!ok.some(p=>p.id===cur)?'<option value="'+escape(cur)+'" selected>'+escape(cur)+' (없음)</option>':'')+'</select>';
 }
 $('rawRows').addEventListener('change',async ev=>{
@@ -349,7 +350,7 @@ $('rawRows').addEventListener('change',async ev=>{
 setInterval(()=>{if(!document.hidden&&currentUser)loadHandProfiles()},20000);
 // 작업 현황의 MANO beta 칸: 처음 열 때 도구 화면을 불러오고, 도구 화면 높이에 맞춰 늘립니다.
 $('manoBeta').addEventListener('toggle',()=>{const f=$('manoBetaFrame');if($('manoBeta').open&&!f.src)f.src='/mano-beta'});
-window.addEventListener('message',ev=>{if(ev.origin!==location.origin||!ev.data||typeof ev.data.manoBetaHeight!=='number')return;$('manoBetaFrame').style.height=Math.max(500,Math.min(6000,ev.data.manoBetaHeight+20))+'px'});
+window.addEventListener('message',ev=>{if(ev.origin!==location.origin||!ev.data||typeof ev.data.manoBetaHeight!=='number')return;$('manoBetaFrame').style.height=Math.max(500,Math.min(6000,Math.ceil(ev.data.manoBetaHeight)))+'px'});
 function renderRawTable(){
  rawDateCal.refresh();
  const filter=rawDateFilter,groups={},me=rawTeam&&rawTeam.me;
@@ -360,7 +361,7 @@ function renderRawTable(){
  rawEpisodes.forEach((e,i)=>{const d=rawCaptureDate(e.episode);if((e.excluded_from_mine||e.run_hidden)&&!$('rawShowExcluded').checked)return;if(!isMine(e)&&(e.excluded_from_mine||e.run_hidden||!filter||filter===d))(groups[d]=groups[d]||[]).push(i)});
  renderRawTeam();
  const dates=Object.keys(groups).sort((a,b)=>a==='—'?1:b==='—'?-1:b.localeCompare(a));
- const row=i=>{const e=rawEpisodes[i];return '<tr data-raw-index="'+i+'" class="'+($('episode').value===e.episode?'rawSelected':'')+'"><td>'+(e.can_run?'<input type="radio" name="rawSelection" aria-label="'+escape(e.episode)+' 선택" '+($('episode').value===e.episode?'checked':'')+'>'+(rawBatchable(e)?'<input type="checkbox" class="rawPick" data-raw-pick="'+escape(e.episode)+'" title="RAW 전처리 일괄 실행에 포함" aria-label="'+escape(e.episode)+' 일괄 실행에 포함" '+(rawBatchPicked.has(e.episode)?'checked':'')+'>':''):'<span class="help">조회만</span>')+'</td><td>'+rawCaptureDate(e.episode)+'</td><td>'+escape(e.episode)+'</td><td>'+rawWho(e)+'</td><td>'+rawStageCell(e,i)+(e.excluded_from_mine?' <span class="help">· 내 작업에서 제외</span>':'')+(e.run_hidden?' <span class="help" title="내 작업 현황의 숨긴 항목 보기에서 되돌릴 수 있습니다.">· 목록에서 삭제한 실행</span>':'')+'</td>'+handProfileCell(e)+'</td><td><button class="smallbtn" data-raw-preview="'+i+'">미리보기</button>'+((e.can_exclude||e.excluded_from_mine)?' <button type="button" class="smallbtn" data-raw-exclude="'+i+'"'+(rawExcludeBusy.has(e.episode)?' disabled':'')+'>'+(e.excluded_from_mine?'제외 취소':'내 작업에서 제외')+'</button>':'')+'</td></tr>'};
+ const row=i=>{const e=rawEpisodes[i];return '<tr data-raw-index="'+i+'" class="'+($('episode').value===e.episode?'rawSelected':'')+'"><td>'+(e.can_run?'<input type="radio" name="rawSelection" aria-label="'+escape(e.episode)+' 선택" '+($('episode').value===e.episode?'checked':'')+'>'+(rawBatchable(e)?'<input type="checkbox" class="rawPick" data-raw-pick="'+escape(e.episode)+'" title="RAW 전처리 일괄 실행에 포함" aria-label="'+escape(e.episode)+' 일괄 실행에 포함" '+(rawBatchPicked.has(e.episode)?'checked':'')+'>':''):'<span class="help">조회만</span>')+'</td><td>'+rawCaptureDate(e.episode)+'</td><td>'+escape(e.episode)+'</td><td>'+rawWho(e)+'</td><td>'+rawStageCell(e,i)+(e.excluded_from_mine?' <span class="help">· 내 작업에서 제외</span>':'')+(e.run_hidden?' <span class="help" title="내 작업 현황의 숨긴 항목 보기에서 되돌릴 수 있습니다.">· 목록에서 삭제한 실행</span>':'')+'</td><td>'+handProfileCell(e)+'</td><td><button class="smallbtn" data-raw-preview="'+i+'">미리보기</button>'+((e.can_exclude||e.excluded_from_mine)?' <button type="button" class="smallbtn" data-raw-exclude="'+i+'"'+(rawExcludeBusy.has(e.episode)?' disabled':'')+'>'+(e.excluded_from_mine?'제외 취소':'내 작업에서 제외')+'</button>':'')+'</td></tr>'};
  const mineHtml=mine.length?'<tr class="rawDateGroup rawMineGroup"><td colspan="7">👤 내 작업 · '+mine.length+' / '+rawTeam.target+'개 (날짜 필터와 무관)</td></tr>'+mine.map(i=>row(i).replace('<tr ','<tr data-mine="1" ')).join(''):'';
  $('rawRows').innerHTML=mineHtml+(dates.map(d=>'<tr class="rawDateGroup"><td colspan="7">📅 '+(d==='—'?'날짜 미상':escape(d))+' · '+groups[d].length+'개</td></tr>'+groups[d].map(row).join('')).join('')||('<tr><td colspan="7">'+(filter&&rawEpisodes.length?escape(filter)+' 촬영 RAW 에피소드가 없습니다. 📅에서 다른 날짜나 전체 보기를 선택하세요.':'RAW 에피소드가 없습니다.')+'</td></tr>'));
  $('rawRows').querySelectorAll('tr[data-mine]').forEach(r=>r.classList.add('rawMine'));
