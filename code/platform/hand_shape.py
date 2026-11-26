@@ -16,7 +16,7 @@ import base64, datetime, hashlib, json, os, re, shlex, shutil, struct, subproces
 from pathlib import Path
 
 from fastapi import HTTPException, Request
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, Response
 from pydantic import BaseModel, Field
 
 HERE = Path(__file__).resolve().parent
@@ -31,6 +31,10 @@ NAS = Path(os.environ.get('NAS_MOUNT', '/mnt/kaist-data'))
 NAS_ROOTS = [NAS / 'TEST', NAS / 'rgbd_raw']                     # 같은 에피소드가 둘 다 있으면 앞쪽 우선
 PROFILES = Path(os.environ.get('KAIST_HAND_PROFILES', str(NAS / 'control/hand_profiles')))
 ASSIGN = PROFILES / 'assign'
+# 두 방식 MANO 비교(mano_compare.py): 결과는 NAS, 진행 상태는 로컬 작업 폴더
+COMPARE_OUT = Path(os.environ.get('KAIST_MANO_COMPARE_OUT', str(NAS / 'TEST/Set2')))
+COMPARE_WORK = Path(os.environ.get('KAIST_MANO_COMPARE_WORK', str(Path.home() / 'kaist_work/mano_compare')))
+VARIANT = re.compile(r'(default|[A-Za-z0-9][A-Za-z0-9_.-]{0,63})$')
 SUBTRACT = ['human forearm', 'shadow']
 WAND_IDLE = 180
 WAND_MIN_FREE_MB = 8192
@@ -714,6 +718,31 @@ def setup(app, guard, access, csrf):
         except Exception as e: fail(e)
         access.audit(req, f'mano-beta profile {out["id"]} {out["sha256"][:12]}')
         return out
+
+    @app.get('/api/hand-shape/compare')
+    def compare_list(req: Request):
+        guard(req)
+        try: status = json.loads((COMPARE_WORK / 'status.json').read_text())
+        except (OSError, ValueError): status = None
+        results = []
+        try:
+            for p in sorted(COMPARE_OUT.glob('ep_*/summary.json')):
+                try:
+                    d = json.loads(p.read_text()); b = d.get('between_variants') or {}
+                    results.append({'episode': d['episode'], 'frames': d.get('frames'), 'created': d.get('created'), 'variants': d.get('variants'),
+                                    'profile': (d.get('profile') or {}).get('id'), 'between': {k: v for k, v in b.items() if k != 'per_frame_mean_mm'},
+                                    'per_frame': b.get('per_frame_mean_mm')})
+                except (OSError, ValueError, KeyError): pass
+        except OSError as e: return {'status': status, 'results': [], 'error': str(e), 'out': str(COMPARE_OUT)}
+        return {'status': status, 'results': results, 'out': str(COMPARE_OUT)}
+
+    @app.get('/api/hand-shape/compare/video')
+    def compare_video(req: Request, ep: str, v: str = 'compare'):
+        guard(req)
+        if not EP.fullmatch(ep) or not (v == 'compare' or VARIANT.fullmatch(v)): raise HTTPException(400, '잘못된 요청입니다.')
+        p = COMPARE_OUT / ep / ('compare.mp4' if v == 'compare' else f'{v}/review/mano_review.mp4')
+        if not p.is_file(): raise HTTPException(404, '영상이 없습니다.')
+        return FileResponse(p, media_type='video/mp4', headers={'Cache-Control': 'no-store'})
 
     @app.get('/api/hand-profiles')
     def profiles(req: Request, fresh: int = 0):

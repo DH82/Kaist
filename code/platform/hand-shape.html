@@ -48,6 +48,13 @@ input[type=range]{width:100%}#cv{width:100%;border-radius:6px;display:block;touc
  <div style="overflow-x:auto"><table><thead><tr><th>이름</th><th>손 길이·폭</th><th>측정 에피소드</th><th>만든 시각</th><th>RAW 지정</th><th>β (오른손 10개)</th></tr></thead><tbody id="profiles"></tbody></table></div>
  <p class="help">프로필은 만든 뒤 고칠 수 없습니다(같은 이름으로 덮어쓰지 않음). 다시 측정했으면 새 이름(예: User2_v2)으로 만드세요. MANO 평균 손(β=0)은 길이 175.3mm·폭 66.9mm입니다.</p>
 </div></div>
+<div class="card" id="cmpCard"><h3>두 방식 MANO 비교 <span class="muted small" id="cmpOut"></span></h3>
+ <p class="help" style="margin-top:0">같은 에피소드를 <b>default</b>(에피소드마다 β 보정, 운영 기본)와 <b>프로필</b>(β 고정)로 각각 피팅한 결과입니다. 운영 MANO와 같은 명령·설정이며, 운영 결과와는 별도로 저장합니다. 거리는 같은 프레임의 두 손 메시 사이 거리입니다.</p>
+ <p id="cmpStatus" class="small muted"></p>
+ <div style="overflow-x:auto"><table><thead><tr><th>에피소드</th><th>상태</th><th>default 손 길이·폭</th><th>프로필 손 길이·폭</th><th>두 결과 거리 평균 / 최대</th><th>프레임별 거리</th><th></th></tr></thead><tbody id="cmpRows"></tbody></table></div>
+ <div id="cmpPlayer" hidden style="margin-top:10px"><div class="row" style="margin-bottom:6px"><b id="cmpTitle"></b><span class="sep"></span><button id="cmpV0" onclick="cmpShow(null,'compare')">나란히 (왼쪽 default · 오른쪽 프로필)</button><button id="cmpV1" onclick="cmpShow(null,'default')">default만</button><button id="cmpV2" onclick="cmpShow(null,'profile')">프로필만</button></div>
+ <video id="cmpVideo" controls loop muted playsinline style="width:100%;border-radius:6px;background:#000"></video></div>
+</div>
 <div class="card"><b>로그</b> <span class="muted small" id="logt"></span><pre id="log">에피소드를 고르면 로그가 보입니다.</pre></div></div>
 </main><script>
 const CSRF='__CSRF__',$=id=>document.getElementById(id);
@@ -147,5 +154,21 @@ document.addEventListener('keydown',e=>{if($('pv').hidden||e.target.matches('inp
   else if(k==='Enter'&&ed.tool==='wand'){e.preventDefault();applyWand('replace',true)}else if(k==='Escape'){clearWand()}
   else if(k==='Backspace'&&ed.tool==='wand'&&ed.pts.length){e.preventDefault();ed.pts.pop();ed.pts.length?runWand():clearWand()}}});
 window.addEventListener('beforeunload',e=>{if(ed.dirty){e.preventDefault();e.returnValue=''}});
+
+// ---------- 두 방식 비교 ----------
+let cmp=null,cmpCur=null,cmpKind='compare';
+function spark(a){if(!a||!a.length)return '';const w=160,h=28,m=Math.max(...a,1);return '<svg width="'+w+'" height="'+h+'" viewBox="0 0 '+w+' '+h+'" aria-label="프레임별 거리"><polyline fill="none" stroke="#6d5bd0" stroke-width="1.5" points="'+a.map((v,i)=>(i*(w-2)/Math.max(1,a.length-1)+1).toFixed(1)+','+(h-1-v/m*(h-2)).toFixed(1)).join(' ')+'"/></svg><div class="beta">최대 '+m.toFixed(1)+'mm</div>'}
+async function cmpLoad(){try{const r=await fetch(A+'compare');if(!r.ok)return;cmp=await r.json();cmpRender()}catch(e){}}
+function cmpRender(){const st=cmp.status,res={};(cmp.results||[]).forEach(x=>res[x.episode]=x);$('cmpOut').textContent=cmp.out||'';
+ const eps=[...new Set([...Object.keys((st&&st.episodes)||{}),...Object.keys(res)])].sort();
+ $('cmpStatus').textContent=st?((st.running?'실행 중':'마지막 실행')+' · 시작 '+st.started+(st.finished?' · 끝 '+st.finished:'')+' · 프로필 '+st.profile):'아직 실행한 비교가 없습니다.';
+ $('cmpRows').innerHTML=eps.map(ep=>{const s=(st&&st.episodes||{})[ep]||{},r=res[ep],v=r&&r.variants||{},prof=r&&r.profile||(st&&st.profile),b=r&&r.between||{};
+  const sz=x=>x&&x.hand_size_mm?x.hand_size_mm.length.toFixed(1)+' / '+x.hand_size_mm.width.toFixed(1)+' mm':'—';
+  const state=s.state==='running'?'<span class="st-running">진행 중 · '+esc(s.step||'')+'</span>':s.state==='queued'?'<span class="muted">대기</span>':s.state==='failed'?'<span class="st-failed">실패: '+esc(s.error||'')+'</span>':r?'<span class="st-measured">완료</span>':esc(s.state||'');
+  return '<tr class="'+(ep===cmpCur?'sel':'')+'"><td>'+esc(ep)+'</td><td>'+state+'</td><td>'+sz(v.default)+'</td><td>'+sz(v[prof])+(prof?'<div class="beta">'+esc(prof)+'</div>':'')+'</td><td>'+(b.vertex_mean_mm!=null?b.vertex_mean_mm.toFixed(1)+' / '+b.vertex_max_mm.toFixed(1)+' mm':'—')+'</td><td>'+(r?spark(r.per_frame):'')+'</td><td>'+(r?'<button onclick="cmpShow(\''+esc(ep)+'\',\'compare\')">영상 보기</button>':'')+'</td></tr>'}).join('')||'<tr><td colspan=7 class="muted">—</td></tr>';fit()}
+function cmpShow(ep,kind){if(ep)cmpCur=ep;if(!cmpCur)return;cmpKind=kind;const r=(cmp.results||[]).find(x=>x.episode===cmpCur);const v=kind==='profile'?(r&&r.profile):kind;
+ $('cmpPlayer').hidden=false;$('cmpTitle').textContent=cmpCur;['compare','default','profile'].forEach((k,i)=>$('cmpV'+i).classList.toggle('on',k===kind));
+ const vid=$('cmpVideo');vid.src=A+'compare/video?ep='+encodeURIComponent(cmpCur)+'&v='+encodeURIComponent(v)+'&t='+Date.now();vid.play().catch(()=>{});cmpRender()}
+cmpLoad();setInterval(()=>{if(!document.hidden)cmpLoad()},10000);
 tool('brush');reload(false);setInterval(()=>{if(document.hidden)return;reload(false);showLog()},4000);
 </script></body></html>
