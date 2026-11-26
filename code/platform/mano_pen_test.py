@@ -56,6 +56,8 @@ for out in a['outs']:
 def main():
     p = argparse.ArgumentParser(); p.add_argument('--project', type=Path, required=True); p.add_argument('--episode', required=True)
     p.add_argument('--wpen', nargs='+', type=float, default=[0, 10, 50, 200]); p.add_argument('--published', type=Path, default=None)
+    p.add_argument('--pt', type=float, default=500000.0, help='손가락 시간축 가중치(운영 5e5, v7 후보 500)')
+    p.add_argument('--crop', action='store_true', help='MediaPipe 잘라서 재검출'); p.add_argument('--smooth', type=int, default=0, help='관절 평활 반경')
     a = p.parse_args(); ep = a.episode
     case = a.project / '06_reconstruction' / ep; prepared = mc.fh.source(case); final = case / 'final_data.pkl'
     root, pt, env = mc.fh.pipeline.runtime(); mono = pt / 'Mono'; python = str(root / 'hamba-env/bin/python')
@@ -68,7 +70,7 @@ def main():
     save = lambda: (base / 'pen_test.json').write_text(json.dumps(st, ensure_ascii=False, indent=1))
     outs = []
     for wp in a.wpen:
-        name = f'wpen{wp:g}'; out = base / name; outs.append(out)
+        name = (f'v7_wpen{wp:g}' if a.pt != 500000.0 or a.crop or a.smooth else f'wpen{wp:g}'); out = base / name; outs.append(out)
         if not (out / 'review/mano_review.mp4').exists():
             out.mkdir(exist_ok=True)
             if not (out / 'hamba').exists(): (out / 'hamba').symlink_to(case / 'hands/hamba')  # 그 PC의 HaMBA 결과 재사용
@@ -77,12 +79,14 @@ def main():
             code = runmono / 'data_process/data_process_hands.py'
             if code.is_symlink(): code.unlink()
             shutil.copy2(patched, code)
-            settings = mc.fh.fit_settings(side, side_source, None); settings.update(w_pen=wp, experiment='pen-test')
+            settings = mc.fh.fit_settings(side, side_source, None); settings.update(w_pen=wp, pose_temp_weight=a.pt, mp_crop=a.crop, mp_smooth=a.smooth, experiment='pen-test')
             (out / 'settings.json').write_text(json.dumps(settings, indent=2))
             if (case / 'hands/observations.pkl').exists() and not (out / 'observations.pkl').exists(): shutil.copy2(case / 'hands/observations.pkl', out / 'observations.pkl')
             cmd = [python, '-u', str(code), '--hamba_base_path', str(out / 'hamba'), '--phystwin_base_path', str(work.parent), '--case_name', ep,
                    '--temp_weight', '500000', '--hamba_weight', '0.01', '--log', 'hand_v1', '--seed', '1027', '--num_iters', '1500', '--num_hands', '1', '--num_cams', '4',
                    '--resume', '--observations-cache', str(out / 'observations.pkl'), '--w_pen', str(wp)]
+            if a.crop: cmd += ['--mp_crop', '--mp_crop_out', str(out / 'mp_crop.pkl')]
+            if a.smooth: cmd += ['--mp_smooth', str(a.smooth)]
             for k in ('w_mask', 'w_mask_cover', 'cover_max_px', 'wrist_weight', 'w_silhouette', 'silhouette_size', 'silhouette_every', 'pose_temp_weight', 'w_pose_prior',
                       'camera_init_iters', 'fit_shape_lr', 'fit_shape_max_delta', 'fit_shape_temporal_weight', 'robust_joint_delta'):
                 cmd += ['--' + k, str(settings[k])]
@@ -105,7 +109,7 @@ def main():
     work0 = outs[0] / '_runtime/inputs' / ep
     for o in outs:
         subprocess.run([python, str(HERE / 'mano_mask_iou.py'), str(o), '--case', str(work0)], env=env, capture_output=True, text=True, timeout=900)
-        subprocess.run([python, str(HERE / 'mano_finger_eval.py'), str(o), '--case', str(work0), '--hamba', str(case / 'hands/hamba' / ep), '--obs', str(outs[0] / 'observations.pkl')],
+        subprocess.run([python, str(HERE / 'mano_finger_eval.py'), str(o), '--case', str(work0), '--hamba', str(case / 'hands/hamba' / ep), '--obs', str(outs[0] / 'mp_crop.pkl' if (outs[0] / 'mp_crop.pkl').exists() else outs[0] / 'observations.pkl')],
                        env=env, capture_output=True, text=True, timeout=900)
         n = o.name; v = st['variants'].setdefault(n, {})
         for f, k in (('contact_3d.json', 'contact'), ('mask_iou.json', 'mask_iou'), ('finger_metrics.json', 'finger')):
