@@ -1,6 +1,27 @@
 const HC_BASE='/kaist-review/dags/kaist_revising_gpu_4090_a';
 // 마스크를 저장하면 올립니다. 이미지 URL에 붙여 브라우저가 같은 URL의 예전 이미지를 다시 쓰지 않게 합니다.
 let hcImageRev=0;
+// 마스크 색: 작업자가 '표시' 줄의 색 선택칸에서 바꾸면 브라우저에 기억해 다음 접속에도 그대로 씁니다.
+// 서버 이미지(원본 + 마스크)는 이 색으로 그려 받고, 화면에서 수정 중인 마스크와 범례도 같은 색으로 보여 줍니다.
+const HC_COLOR_DEFAULT={object:'#28e65a',hand:'#f546cd'};
+let hcMaskColors={...HC_COLOR_DEFAULT};
+try{const v=JSON.parse(localStorage.getItem('kaistHcMaskColors')||'{}');for(const k of ['object','hand'])if(/^#[0-9a-f]{6}$/i.test(v?.[k]||''))hcMaskColors[k]=v[k].toLowerCase()}catch(_){}
+function hcImageUrl(cam,frame,mode){return hcPath+'/image?'+new URLSearchParams({cam,frame,mode,rev:hcImageRev,object_color:hcMaskColors.object.slice(1),hand_color:hcMaskColors.hand.slice(1)})}
+function hcApplyMaskColors(){
+ const root=document.documentElement.style;root.setProperty('--hc-object',hcMaskColors.object);root.setProperty('--hc-hand',hcMaskColors.hand);
+ if($('hcColorObject'))$('hcColorObject').value=hcMaskColors.object;if($('hcColorHand'))$('hcColorHand').value=hcMaskColors.hand;
+}
+// 색을 바꾸면 지금 프레임 이미지만 새 색으로 다시 받습니다(저장하지 않은 수정은 그대로 둡니다).
+function hcRefreshImages(){
+ if(!hcMeta||hcStage!=='mask'||hcFrameLoading)return;
+ for(let cam=0;cam<4;cam++){const img=$('hcImage'+cam);if(!img)continue;const url=hcImageUrl(cam,hcFrame,hcShownMode);img.src=url;img.onclick=()=>window.open(url,'_blank','noopener')}
+ if(typeof hcEditRender==='function')for(let cam=0;cam<4;cam++)hcEditRender(cam);
+}
+function hcSetMaskColor(kind,value,save){
+ if(!/^#[0-9a-f]{6}$/i.test(value))return;hcMaskColors[kind]=value.toLowerCase();hcApplyMaskColors();
+ if(typeof hcEditRender==='function')for(let cam=0;cam<4;cam++)hcEditRender(cam);
+ if(save){try{localStorage.setItem('kaistHcMaskColors',JSON.stringify(hcMaskColors))}catch(_){}hcRefreshImages()}
+}
 let hcShownMode='overlay',hcFrameLoading=false,hcMeta=null,hcPath='',hcStage='mask',hcEpoch=0,hcFrame=0,hcVisited=[],hcBusy=false,hcTimer=null,hcToken='',activeDetailRun=null,hcLoadGeneration=0;
 const hcVideos=()=>[$('hcObject'),$('hcHand')];
 async function hcRequest(url,options={}){
@@ -108,7 +129,7 @@ async function hcShowFrame(value,skipEditCheck=false,keepEditsUntilLoaded=false)
  if(!keepEditsUntilLoaded)hcEditReset();hcShownMode=$('hcMaskMode').value;hcFrameLoading=true;hcFrame=Math.max(0,Math.min(hcMeta.frames-1,Number(value)));$('hcSlider').value=hcFrame;$('hcFrameLabel').textContent=(hcFrame+1)+' / '+hcMeta.frames+'프레임';['hcPrevFrame','hcNextFrame','hcFirst','hcMiddle','hcLast','hcSlider','hcMaskMode'].forEach(id=>$(id).disabled=true);
  const epoch=++hcEpoch,frame=hcFrame,mode=$('hcMaskMode').value;
  await Promise.all([0,1,2,3].map(cam=>new Promise(resolve=>{
-  const img=$('hcImage'+cam),url=hcPath+'/image?'+new URLSearchParams({cam,frame,mode,rev:hcImageRev});
+  const img=$('hcImage'+cam),url=hcImageUrl(cam,frame,mode);
   img.onload=()=>{if(img.naturalWidth)img.parentElement.style.aspectRatio=img.naturalWidth+'/'+img.naturalHeight;if(epoch===hcEpoch&&mode==='overlay'){hcVisited[cam].add(frame);hcEnable()}resolve()};
   img.onerror=()=>{if(epoch!==hcEpoch){resolve();return}hcStatus('카메라 '+(cam+1)+' 이미지를 불러오지 못했습니다. 새로 불러오기를 눌러주세요.',true);hcStop();resolve()};
   img.src=url;img.onclick=()=>window.open(url,'_blank','noopener');
@@ -163,6 +184,10 @@ $('hcRefreshQueue').onclick=loadHcQueue;document.querySelectorAll('[data-review-
 $('hcApprove').onclick=()=>hcDecide('approve');$('hcHold').onclick=()=>hcDecide('hold');$('hcNote').oninput=hcEnable;
 $('hcFirst').onclick=()=>{hcStop();hcShowFrame(0)};$('hcMiddle').onclick=()=>{hcStop();hcShowFrame(Math.floor(hcMeta.frames/2))};$('hcLast').onclick=()=>{hcStop();hcShowFrame(hcMeta.frames-1)};
 $('hcSlider').oninput=e=>{hcStop();hcShowFrame(e.target.value)};$('hcMaskMode').onchange=()=>hcShowFrame(hcFrame);
+// 색 선택칸: 고르는 동안(input)은 수정 중 표시·범례만 바꾸고, 고른 뒤(change)에 기억하고 이미지를 새 색으로 받습니다.
+for(const [id,kind] of [['hcColorObject','object'],['hcColorHand','hand']]){$(id).oninput=e=>hcSetMaskColor(kind,e.target.value,false);$(id).onchange=e=>hcSetMaskColor(kind,e.target.value,true)}
+$('hcColorReset').onclick=()=>{hcMaskColors={...HC_COLOR_DEFAULT};try{localStorage.removeItem('kaistHcMaskColors')}catch(_){}hcApplyMaskColors();hcRefreshImages()};
+hcApplyMaskColors();
 $('hcPlay').onclick=async()=>{if(!hcMeta)return;if(hcTimer){hcStop();return}if(!await hcEditResolve('재생'))return;let loading=false;$('hcPlay').textContent='❚❚ 일시정지';hcTimer=setInterval(async()=>{if(loading)return;if(hcFrame>=hcMeta.frames-1){hcStop();return}loading=true;await hcShowFrame(hcFrame+1);loading=false},350)};
 $('hcTrackPlay').onclick=()=>Promise.allSettled(hcVideos().map(v=>v.play()));$('hcTrackPause').onclick=hcStop;
 $('hcTrackFirst').onclick=()=>hcSeek(0);$('hcTrackMiddle').onclick=()=>hcSeek(Math.floor(hcMeta.frames/2));$('hcTrackLast').onclick=()=>hcSeek(hcMeta.frames-1);

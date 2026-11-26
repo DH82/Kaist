@@ -16,7 +16,7 @@ What differs from pipeline.sam3():
      Hand masks are computed in their own SAM session reset, so they do not depend on the object.
 
   H. hand_points (손 포인트 방식, object_tracked와 함께만): 텍스트 기준선과 손 ROI 확대를 하지 않습니다.
-     '기준선' 구간은 sam_hand_point_track.py가 첫 프레임 포인트에서 손을 추적해 mask/<cam>/1 을 만들고,
+     '기준선' 구간은 sam_hand_point_track.py가(sam_hand_rotate.py를 거쳐, 카메라 2는 180° 돌린 영상으로) 첫 프레임 포인트에서 손을 추적해 mask/<cam>/1 을 만들고,
      'ROI' 구간은 그 손 마스크를 후보(roi_candidate/mask/<cam>/1)로 그대로 둡니다. 구간 이름·영수증·미리보기·
      완료 검사는 그대로라 재개와 검수 화면이 같은 방식으로 동작합니다.
 
@@ -47,12 +47,25 @@ SOURCE_SAM = ('data_process/segment_object_sam3.py',
               '0a6f63d107a10cafaa67c9156f04a3e42abd7678b52fbe614622b6906a5dec7e')
 CAMERAS = range(4)
 GROUPS_FILE = 'baseline_groups.json'   # _resume/<this>: {cam: 'both'|'controller'|'points:<hash>'}
-HAND_TRACKER = Path(__file__).resolve().with_name('sam_hand_point_track.py')
+# 손 포인트 추적은 sam_hand_rotate.py(카메라별 180° 회전 래퍼)를 거쳐 sam_hand_point_track.py를 그대로 부릅니다.
+HAND_TRACKER = Path(__file__).resolve().with_name('sam_hand_rotate.py')
 
 
-def hand_tag(points):
-    """손 포인트 기준선의 표시. 포인트가 바뀌면 값이 달라져 그 기준선을 다시 계산합니다."""
-    return 'points:' + hashlib.sha256(json.dumps(points, sort_keys=True).encode()).hexdigest()[:16]
+def hand_rotate_cams():
+    """손 추적을 180° 돌린 영상으로 할 카메라(0~3). 기본은 카메라 2(인덱스 1): 팔이 화면 아래에서 들어오는 방향이라
+    그대로 추적하면 손을 자주 놓칩니다. KAIST_HAND_ROTATE_CAMS='1,3'처럼 바꾸고, ''(빈 값)이면 회전하지 않습니다."""
+    value = os.environ.get('KAIST_HAND_ROTATE_CAMS', '1')
+    cams = sorted({int(v) for v in re.split(r'[\s,]+', value.strip()) if v})
+    if any(c not in CAMERAS for c in cams):
+        raise ValueError(f'KAIST_HAND_ROTATE_CAMS는 0~3 카메라 번호만 됩니다: {value!r}')
+    return cams
+
+
+def hand_tag(points, rotate=()):
+    """손 포인트 기준선의 표시. 포인트나 회전 카메라가 바뀌면 값이 달라져 그 기준선을 다시 계산합니다.
+    회전이 없으면 예전과 같은 값이라, 회전을 끈 PC에서는 이미 만든 기준선을 그대로 씁니다."""
+    payload = {'points': points, 'rotate_180': list(rotate)} if rotate else points
+    return 'points:' + hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:16]
 
 
 def is_hand_points(group):
@@ -165,7 +178,7 @@ def _baseline(pipeline, dest, ep, settings, S, source, env, object_tracked, hand
         groups = json.loads(groups_path.read_text())
     except (OSError, ValueError):
         groups = {}
-    group = hand_tag(hand_points) if hand_points else 'controller' if object_tracked else 'both'
+    group = hand_tag(hand_points, hand_rotate_cams()) if hand_points else 'controller' if object_tracked else 'both'
     here = pipeline.HERE
 
     def run(cams):
@@ -214,7 +227,9 @@ def _hand_track(pipeline, dest, S, source, env, cams, hand_points):
     """손 포인트 추적(카메라 여러 대, 모델 1회 로드) → mask/<cam>/1, mask_info, hand_track/<cam>(기록·초기 마스크 그림)."""
     from resume_steps import preserve
     with tempfile.TemporaryDirectory(prefix='.hand-track-', dir=dest) as tmp:
-        jobs = [{'cam': cam, 'points': hand_points[str(cam)], 'out': str(Path(tmp) / f'cam{cam}')} for cam in cams]
+        rotate = hand_rotate_cams()
+        jobs = [{'cam': cam, 'points': hand_points[str(cam)], 'out': str(Path(tmp) / f'cam{cam}'),
+                 **({'rotate': 180} if cam in rotate else {})} for cam in cams]
         pipeline.execute([S, str(HAND_TRACKER), '--case', str(dest), '--jobs', json.dumps(jobs)],
                          dest / '05.log', source, env)
         for cam in cams:
@@ -324,7 +339,7 @@ def _roi(pipeline, dest, S, P, source, env, hand_only, hand_points=None):
                              'grounding_batch_size': 4,
                              'runner_sha256': hashlib.sha256((bundle / 'tools/sam_roi_candidate.py').read_bytes()).hexdigest(),
                              'batched_cameras': True, 'baseline_object': 'skipped' if hand_only else 'computed',
-                             **({'hand_mode': 'point_track'} if hand_points else {})}
+                             **({'hand_mode': 'point_track', 'hand_rotate_180': hand_rotate_cams()} if hand_points else {})}
     (candidate / 'candidate_record.json').write_text(json.dumps(record, ensure_ascii=False, indent=2))
 
 
@@ -348,6 +363,15 @@ def _finish(dest, started, hand_only):
 
 REUSE_NOTE = ('<p><b>테스트 옵션 · 이미지 특징 재사용:</b> 같은 영상의 이미지 특징을 프롬프트 사이에 재사용해 계산했습니다. '
               '마스크가 평소와 다르게 보이면 알려 주세요.</p>')
+def rotate_note():
+    cams = hand_rotate_cams()
+    if not cams:
+        return ''
+    return ('<p><b>손 추적 회전:</b> ' + ', '.join(f'Camera {c + 1}' for c in cams)
+            + '는 영상을 180° 돌려 손을 추적한 뒤 마스크를 원래 방향으로 되돌렸습니다'
+            '(팔이 화면 아래에서 들어오는 방향에서 손을 놓치는 문제 대응).</p>')
+
+
 HAND_ONLY_NOTE = ('<p><b>속도 최적화:</b> 이 실행은 물체를 bbox/포인트 추적으로 계산하므로, '
                   '왼쪽 기준선에는 손만 계산했습니다(물체 초록 표시 없음). 검수 대상은 오른쪽 후보입니다.</p>')
 
@@ -427,10 +451,11 @@ def sam3(pipeline, p, ep, new=False, object_tracked=False, hand_points=None):
                                    'human_approved': False, 'candidate_mask': 'roi_candidate/mask',
                                    'baseline_mask': 'mask', 'input_fingerprint': fp, 'settings': settings,
                                    'version': 'sam3.1', **({'baseline_object': 'skipped_object_tracked'} if hand_only else {}),
-                                   **({'hand_mode': 'point_track', 'hand_points': hand_points} if hand_points else {}),
+                                   **({'hand_mode': 'point_track', 'hand_points': hand_points,
+                                       'hand_rotate_180': hand_rotate_cams()} if hand_points else {}),
                                    **({'feature_reuse_test': True} if reuse else {})})
         (dest / 'index.html').write_text(pipeline.page(ep + ' · 기준선 / ROI 손 마스크 비교',
-                                                       (REUSE_NOTE if reuse else '') + (HAND_POINT_NOTE if hand_points else HAND_ONLY_NOTE if hand_only else '')
+                                                       (REUSE_NOTE if reuse else '') + (HAND_POINT_NOTE + rotate_note() if hand_points else HAND_ONLY_NOTE if hand_only else '')
                                                        + comparison_body()))
         record = _finish(dest, started, hand_only)
         if reuse:

@@ -3,6 +3,7 @@ import argparse
 import hashlib
 import io
 import json
+import re
 from pathlib import Path
 import sys
 from PIL import Image
@@ -145,7 +146,7 @@ def decide(review, project, ep, data):
         raise ValueError('Invalid decision')
 
 
-def image(review, project, ep, cam, frame, mode):
+def image(review, project, ep, cam, frame, mode, colors=None):
     # Read-only requests must not compete for the nonblocking writer lock.
     # Draft creation and all mutations remain locked in inspect()/decide().
     d = review.root(project, ep)
@@ -159,7 +160,9 @@ def image(review, project, ep, cam, frame, mode):
         raise ValueError('Invalid image coordinates')
     rgb = Image.open(prepared/f'color/{cam}/{frame}.png').convert('RGB')
     result = rgb.copy()
-    for obj, color in [(0, (40, 230, 90)), (1, (245, 70, 205))]:
+    # 마스크 색: 작업자가 화면에서 바꾼 색(colors = {0: 물체 (r,g,b), 1: 손 (r,g,b)}), 없으면 기본 초록·분홍
+    colors = {0: (40, 230, 90), 1: (245, 70, 205), **(colors or {})}
+    for obj, color in [(0, colors[0]), (1, colors[1])]:
         if mode == 'rgb' or mode == 'hand' and obj != 1 or mode == 'object' and obj != 0:
             continue
         p = draft/f'mask/{cam}/{obj}/{frame}.png'
@@ -364,10 +367,20 @@ def scan_queue(review, project):
     return {'reviews': items}
 
 
+def hex_colors(object_color, hand_color):
+    # 'rrggbb' 형식만 받습니다. 잘못된 값은 무시하고 기본 색을 씁니다.
+    out = {}
+    for obj, value in ((0, object_color), (1, hand_color)):
+        if re.fullmatch(r'[0-9a-fA-F]{6}', value or ''):
+            out[obj] = tuple(int(value[i:i+2], 16) for i in (0, 2, 4))
+    return out
+
+
 if __name__ == '__main__':
     p = argparse.ArgumentParser();p.add_argument('action', choices=['inspect','image','decision','queue','tracking_inspect','tracking_decision','tracking_video'])
     p.add_argument('--config',required=True);p.add_argument('--episode',required=True)
     p.add_argument('--cam',type=int);p.add_argument('--frame',type=int);p.add_argument('--mode',default='overlay');p.add_argument('--group')
+    p.add_argument('--object-color',default='');p.add_argument('--hand-color',default='')
     a = p.parse_args()
     try:
         review, project, ep = context(a.config,a.episode)
@@ -380,7 +393,7 @@ if __name__ == '__main__':
         elif a.action == 'tracking_video':
             print(json.dumps(tracking_video(project,ep,a.group)))
         elif a.action == 'image':
-            sys.stdout.buffer.write(image(review,project,ep,a.cam,a.frame,a.mode))
+            sys.stdout.buffer.write(image(review,project,ep,a.cam,a.frame,a.mode,hex_colors(a.object_color,a.hand_color)))
         else:
             result = inspect(review,project,ep) if a.action == 'inspect' else decide(review,project,ep,json.load(sys.stdin))
             print(json.dumps(result,ensure_ascii=False))
