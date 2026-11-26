@@ -27,7 +27,7 @@ STAGE1 = [dict(BASE, pose_temp_weight=v) for v in (5e4, 5e3, 5e2, 50.0)] + \
 
 
 def name(v):
-    return f"pt{v['pose_temp_weight']:g}_hw{v['hamba_weight']:g}_pr{v['w_pose_prior']:g}_{v['pose_init']}"
+    return f"pt{v['pose_temp_weight']:g}_hw{v['hamba_weight']:g}_pr{v['w_pose_prior']:g}_{v['pose_init']}" + ('_crop' if v.get('mp_crop') else '')
 
 
 def patched_code():
@@ -48,6 +48,54 @@ def patched_code():
     M = torch.stack(Rs).mean(0); Uu, S, Vh = torch.linalg.svd(M)
     d = torch.sign(torch.det(Uu @ Vh)); Uu[:, :, -1] *= d[:, None]
     return (Uu @ Vh).reshape(hp.shape).to(hp.device).to(hp.dtype)
+
+
+''' + a3, 1)
+    a4 = "parser.add_argument('--w_pose_prior'"
+    s = s.replace(a4, "parser.add_argument('--mp_crop', action='store_true', help='(시험) 전체 화면에서 못 찾은 프레임만 손 마스크 주변을 잘라 2배 확대해 MediaPipe 재검출')\n"
+                  "parser.add_argument('--mp_crop_out', default=None)\n" + a4, 1)
+    a5 = "    mp_out = frozen_observations(frame_num)\n"
+    assert s.count(a5) == 1, 'patch anchor mp'
+    s = s.replace(a5, a5 + '''    if args.mp_crop and num_hands == 1:
+        import time as _time
+        _t = _time.time(); _st = rng_state(); _found = _mp_crop_pass(frame_num, mp_out); restore_rng(_st)
+        for _c, _fr in _found.items():
+            for _f, (_xy, _s) in _fr.items():
+                _k0 = np.asarray(mp_out[_c]['kpts']['Left'][_f]); _c0 = np.asarray(mp_out[_c]['conf']['Left'][_f])
+                mp_out[_c]['kpts']['Left'][_f] = _xy.reshape(_k0.shape) if _k0.size == _xy.size else _xy
+                mp_out[_c]['conf']['Left'][_f] = np.full(_c0.shape, _s)
+        print('[mp crop] added', {c: len(v) for c, v in _found.items()}, f'{_time.time() - _t:.1f}s', flush=True)
+        if args.mp_crop_out:
+            with open(args.mp_crop_out, 'wb') as _fh: pickle.dump({'observations': mp_out, 'added': {c: len(v) for c, v in _found.items()}, 'seconds': _time.time() - _t}, _fh)
+''')
+    s = s.replace(a3, '''def _mp_crop_pass(frame_num, mp_out, scale=2.2, up=2.0):
+    import mediapipe as mp
+    found = {}
+    for cidx in range(NUM_CAMS):
+        found[cidx] = {}
+        missing = [f for f in range(frame_num) if float(np.asarray(mp_out[cidx]['conf']['Left'][f]).mean()) < .5]
+        if not missing: continue
+        det = mp.solutions.hands.Hands(static_image_mode=False, max_num_hands=1, min_detection_confidence=0.5, min_tracking_confidence=0.5)
+        for f in missing:
+            mask = cv2.imread(f'{phystwin_base_path}/{case_name}/mask/{cidx}/{HAND_MASK_IDS[cidx]}/{f}.png', 0)
+            image = cv2.imread(os.path.join(phystwin_base_path, case_name, 'color', f'{cidx}', f'{f}.png'))
+            if image is None or mask is None or (mask > 127).sum() < 50: continue
+            ys, xs = np.nonzero(mask > 127); half = max(xs.max() - xs.min(), ys.max() - ys.min()) * scale / 2
+            cx_, cy_ = (xs.min() + xs.max()) / 2, (ys.min() + ys.max()) / 2
+            x0, y0 = int(max(0, cx_ - half)), int(max(0, cy_ - half)); x1, y1 = int(min(image.shape[1], cx_ + half)), int(min(image.shape[0], cy_ + half))
+            if x1 - x0 < 16 or y1 - y0 < 16: continue
+            crop = cv2.resize(np.ascontiguousarray(image[y0:y1, x0:x1]), None, fx=up, fy=up, interpolation=cv2.INTER_LINEAR)
+            r = det.process(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
+            if not r.multi_hand_landmarks or not r.multi_handedness: continue
+            lab = r.multi_handedness[0].classification[0]
+            if lab.label != 'Left' or lab.score < 0.9: continue
+            xy = np.asarray([[lm.x * (x1 - x0) + x0, lm.y * (y1 - y0) + y0] for lm in r.multi_hand_landmarks[0].landmark], dtype=float)
+            padded = cv2.dilate((mask > 127).astype(np.uint8), np.ones((11, 11), np.uint8))
+            ij = np.rint(xy).astype(int); inside = (ij[:, 0] >= 0) & (ij[:, 0] < mask.shape[1]) & (ij[:, 1] >= 0) & (ij[:, 1] < mask.shape[0])
+            ok = np.zeros(21, dtype=bool); ok[inside] = padded[ij[inside, 1], ij[inside, 0]] > 0
+            if ok.mean() >= .8: found[cidx][f] = (xy, float(lab.score))
+        det.close()
+    return found
 
 
 ''' + a3, 1)
@@ -84,12 +132,14 @@ def run_variant(ep, v, status, key):
         cmd += ['--' + k, str(settings[k])]
     cmd += ['--pose_temp_weight', str(v['pose_temp_weight']), '--w_pose_prior', str(v['w_pose_prior']), '--staged_fit',
             '--shape_profile', str(profile_path), '--shape_profile_sha256', psha]
+    if v.get('mp_crop'): cmd += ['--mp_crop', '--mp_crop_out', str(out / 'mp_crop.pkl')]
     status['current'] = {'episode': ep, 'variant': name(v), 'stage': key, 'started': time.strftime('%H:%M:%S')}; save(status)
     t0 = time.time()
     mc.gpu(lambda: mc.run_logged(cmd, runmono, env, out / 'logs/19_mano.log'), f'손가락 시험 {ep} {name(v)}', logf)
     mc.run_logged([python, str(mc.fh.HERE / 'hand_stage_worker.py'), 'fit', '--out', out, '--case', work, '--frames', T, '--side', side], runmono, env, out / 'logs/validate.log')
     mc.run_logged([python, str(mc.fh.HERE / 'hand_stage_worker.py'), 'preview', '--out', out, '--case', work, '--frames', T, '--side', side], runmono, env, out / 'logs/validate.log')
-    r = subprocess.run([python, str(EVAL), str(out), '--case', str(work), '--hamba', str(base / 'hamba' / ep), '--obs', str(out / 'observations.pkl')],
+    ref = out / 'mp_crop.pkl' if (out / 'mp_crop.pkl').exists() else out / 'observations.pkl'
+    r = subprocess.run([python, str(EVAL), str(out), '--case', str(work), '--hamba', str(base / 'hamba' / ep), '--obs', str(ref)],
                        env=env, capture_output=True, text=True, timeout=900)
     if r.returncode: raise RuntimeError('평가 실패: ' + r.stderr[-400:])
     m = json.loads((out / 'finger_metrics.json').read_text()); m['seconds'] = round(time.time() - t0)
@@ -152,6 +202,7 @@ def main():
             kv = dict(x.split('=') for x in spec.split(','))
             v = {'pose_temp_weight': float(kv.get('pt', BASE['pose_temp_weight'])), 'hamba_weight': float(kv.get('hw', BASE['hamba_weight'])),
                  'w_pose_prior': float(kv.get('pr', BASE['w_pose_prior'])), 'pose_init': kv.get('init', BASE['pose_init'])}
+            if kv.get('crop') in ('1', 'true', 'yes'): v['mp_crop'] = True
             status['variants'][name(v)] = v
             if name(v) not in status['extra']: status['extra'].append(name(v))
             for ep in a.episodes:

@@ -89,8 +89,9 @@ def main():
             for j in range(21):
                 if cf[j] >= 0.5: errs[j].append(e[j])
     allv = np.concatenate([errs[j] for j in range(1, 21)]); tips = np.concatenate([errs[j] for j in TIPS])
+    if not len(tips): allv = tips = np.asarray([np.nan])
     mp2d = {'all_median': round(float(np.median(allv)), 2), 'all_mean': round(float(allv.mean()), 2), 'tips_median': round(float(np.median(tips)), 2),
-            'tips_mean': round(float(tips.mean()), 2), 'tips_p90': round(float(np.percentile(tips, 90)), 2), 'n': int(len(tips)),
+            'tips_mean': round(float(tips.mean()), 2), 'tips_p90': round(float(np.percentile(tips, 90)), 2), 'n': int(np.isfinite(tips).sum()),
             'fingers_median': {n: (round(float(np.median(np.concatenate([errs[j] for j in js]))), 2) if sum(len(errs[j]) for j in js) else None) for n, js in FINGERS.items()}}
     # 마스크 안 비율(손가락 점)
     inside = []
