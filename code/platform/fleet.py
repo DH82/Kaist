@@ -363,7 +363,9 @@ def raw_distributed():
 # ---- 작업자별 RAW 큐 크기: control/queue_targets/<이름>.json {"target": n, "by": ..., "at": ...} ----
 # 작업자(PC1~PC6 로그인 이름)가 직접 정합니다. 배정할 때마다 NAS 파일을 읽으므로 어느 PC 화면에서 바꿔도 바로 반영됩니다.
 QUEUE_MIN, QUEUE_MAX = 0, 30
-QUEUE_NAME = re.compile(r'PC[1-6]')
+# 작업자 이름: PC1~PC6 + 추가 로그인 이름(KAIST_EXTRA_LOGIN_NAMES, 예: Test 스택의 PCT)
+_EXTRA_NAMES = [n for n in os.environ.get('KAIST_EXTRA_LOGIN_NAMES', '').upper().replace(' ', '').split(',') if re.fullmatch(r'PC[A-Z0-9]{1,8}', n)]
+QUEUE_NAME = re.compile('|'.join([r'PC[1-6]'] + [re.escape(n) for n in _EXTRA_NAMES]))
 
 
 def _queue_dir():

@@ -332,7 +332,9 @@ async def errors(req,call_next):
 @app.get('/')
 def home(req:Request):
  guard(req)
- return HTMLResponse((Path(__file__).parent/'index.html').read_text().replace('__CSRF__',CSRF),headers={'Cache-Control':'no-store','Content-Security-Policy':"default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; frame-src 'self'; img-src 'self' data: blob:; frame-ancestors 'none'"})
+ page=(Path(__file__).parent/'index.html').read_text().replace('__CSRF__',CSRF)
+ if access.EXTRA_NAMES:page=page.replace('<option>PC6</option>','<option>PC6</option>'+''.join(f'<option>{n}</option>' for n in access.EXTRA_NAMES),1)  # 추가 로그인 이름(KAIST_EXTRA_LOGIN_NAMES)
+ return HTMLResponse(page,headers={'Cache-Control':'no-store','Content-Security-Policy':"default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; frame-src 'self'; img-src 'self' data: blob:; frame-ancestors 'none'"})
 
 class Login(BaseModel):
  name:str=Field(default='',max_length=80)

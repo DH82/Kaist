@@ -19,6 +19,10 @@ def db():
 
 # 로그인 이름은 PC1~PC6만 허용합니다. 이 이름(소문자)이 NAS 결과 폴더 results/pc1~pc6이 됩니다.
 PC_NAMES=tuple(f'PC{i}' for i in range(1,7))
+# 추가 로그인 이름(예: Test 스택의 PCT). KAIST_EXTRA_LOGIN_NAMES='PCT' 처럼 줍니다. 없으면 PC1~PC6만.
+EXTRA_NAMES=tuple(n for n in (re.sub(r'[\s_-]+','',v).upper() for v in os.environ.get('KAIST_EXTRA_LOGIN_NAMES','').split(','))
+                  if re.fullmatch(r'PC[A-Z0-9]{1,8}',n) and n not in PC_NAMES)
+PC_NAMES=PC_NAMES+EXTRA_NAMES
 
 def pc_name(name):
  """'pc1', 'PC 1', 'pc-1' → 'PC1'. 허용 목록에 없으면 None."""
@@ -31,7 +35,7 @@ ADMIN_NAME='관리자'
 
 def here_pc():
  here=os.environ.get('PC_ID','').strip().lower()
- return here.upper() if re.fullmatch(r'pc[1-6]',here) else 'PC1'
+ return here.upper() if here.upper() in PC_NAMES else 'PC1'
 
 def login(name,role):
  token=secrets.token_urlsafe(32)
@@ -46,7 +50,7 @@ def user(req):
  if not r or not pc_name(r['name']):raise HTTPException(401,'PC1~PC6 중 하나로 로그인하세요.')
  # 이 화면은 PC_ID의 PC만 조작합니다. 다른 PC 이름 세션(예전 로그인)은 다시 로그인 → 그 PC 화면으로 넘어갑니다.
  here=os.environ.get('PC_ID','').strip().lower()
- if re.fullmatch(r'pc[1-6]',here) and r['name'].lower()!=here:raise HTTPException(401,f'이 화면은 {here.upper()}입니다. 다시 로그인하세요.')
+ if here.upper() in PC_NAMES and r['name'].lower()!=here:raise HTTPException(401,f'이 화면은 {here.upper()}입니다. 다시 로그인하세요.')
  return dict(r)
 
 def admin(req):
