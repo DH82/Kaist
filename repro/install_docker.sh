@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Ubuntu에 Docker·Compose v2·NVIDIA Container Toolkit을 설치하고 현재 계정에 docker 권한을 줍니다.
+# Ubuntu에 Docker·Compose v2·NVIDIA Container Toolkit을 설치하고 현재 계정에 docker 권한을 줍니다. ./start.sh --install-docker 로 실행합니다.
 # (sudo 필요, 한 번만. 여러 번 실행해도 안전합니다.)
 set -euo pipefail
 sudo apt-get update

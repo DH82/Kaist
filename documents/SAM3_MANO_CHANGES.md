@@ -232,7 +232,7 @@ elif stage == 'validate':
 | `2604542` → `2198802` | 11-26 | MANO v8(다시점 삼각측량으로 첫 프레임 손 위치, 깊이 이미지 항)을 넣었다가 사용자 요청으로 **되돌림**. 현재 운영은 v7 |
 
 v7은 알고리즘 설정이 바뀐 것이라(가중치·입력 2D 관절), v6 결과와는 결과가 다릅니다. v6로 고정된 실행은 3D 복원 일괄 실행에서 새 시도로 다시 피팅합니다.
-[MANO_FIT_EQUIVALENCE_KO.md](MANO_FIT_EQUIVALENCE_KO.md)의 "알고리즘 동일" 결론은 v6(CUDA graph 전후) 비교에만 해당합니다.
+[MANO_FIT_EQUIVALENCE.md](MANO_FIT_EQUIVALENCE.md)의 "알고리즘 동일" 결론은 v6(CUDA graph 전후) 비교에만 해당합니다.
 
 알려진 약점(11-26 결과 774개 분석): MANO 손이 카메라 쪽으로 평균 약 4.5 cm 떠 있는 경우가 많고(v8은 이를 고치려던 시도), 결과 QC가 이를 걸러내지 못합니다.
 

@@ -8,7 +8,7 @@ UI는 기본 `http://<PC-IP>:18083/`입니다. 현재 UI 코드의 RAW 목록·�
 사람의 검수 승인이 필요한 단계는 UI에서 승인해야 계속 진행됩니다.
 
 작업자용 사용 설명은 [작업자 가이드](code/platform/worker-guide/README.md)에 있습니다. UI 사이드바 **📖 작업 가이드**에서도 같은 문서가 열립니다.
-SAM3·MANO 쪽 변경 이력은 [SAM3_MANO_CHANGES.md](SAM3_MANO_CHANGES.md)에 정리했습니다.
+그 밖의 문서는 [documents/](documents/)에 있습니다: [SAM3·MANO 변경 이력](documents/SAM3_MANO_CHANGES.md), [MANO 피팅 버전 비교](documents/MANO_FIT_EQUIVALENCE.md), [weight 설정 안내](documents/MODELS.md).
 
 작업 흐름(2026-11-27 기준): 작업자가 낮에 RAW마다 물체(와 손) 포인트를 찍으면 `RAW 전처리 → SAM3 → 마스크 검수 → 추적 → 추적 검수`까지 진행하고 `3D 복원 대기`로 멈춥니다.
 퇴근 전 **3D 복원 일괄 실행**이 `3D 복원 → HaMBA·MANO → NAS 저장`을 에피소드마다 이어서 돌리고, 평일 오전 9시가 되면 새 에피소드를 시작하지 않습니다.
@@ -44,7 +44,7 @@ weight 폴더만 지정하면 GPU 세대, 사용자 UID, PC 주소, 작업 폴�
   --weight hamba=/data/models/hamba/checkpoints
 ```
 
-모델별 경로의 이름과 형식은 [weight 설정 안내](repro/MODELS.md)에 있습니다.
+모델별 경로의 이름과 형식은 [weight 설정 안내](documents/MODELS.md)에 있습니다.
 공통 폴더가 없어도 모든 모델 경로를 개별 지정할 수 있습니다.
 NAS PC 번호·그룹을 직접 지정해야 하면 `--pc-id pc2 --nas-gid 65537`을 추가합니다.
 
@@ -64,8 +64,8 @@ UI·Airflow의 Worker 주소와 토큰 경로는 함께 설정합니다. 일부 
 - `.env`, 인증 파일, 모델, 실행 데이터는 Git에 넣지 않습니다.
 - UI 및 Worker 코드는 이미지에 포함됩니다. 코드 변경 후 `./start.sh`로 다시 빌드합니다.
 
-기존 `./setup.sh`와 `./repro/install.sh PC_ID NAS_GID LOCAL_PROJECT [WEIGHTS_ROOT] [NAS_MOUNT]`도
-동일한 실행 흐름을 호출합니다.
+Docker가 없는 Ubuntu PC는 먼저 `./start.sh --install-docker`(sudo, 처음 한 번)로 Docker·Compose·NVIDIA Container Toolkit을 설치한 뒤 다시 로그인합니다.
+(예전 `./setup.sh`, `repro/install.sh`, `./install_docker.sh`는 `./start.sh` 하나로 합쳤습니다.)
 
 ## 기존 서비스를 운영 중인 PC
 
@@ -151,7 +151,9 @@ PC마다 기본 SAM3 분할 방식(`물체 포인트 + 손 텍스트`(기본) / 
 ./start.sh --configure-only              # 설정 파일만 준비
 python3 repro/verify_source.py           # 포함된 소스 체크섬 검사
 python3 repro/check_ui.py                # 로그인·Airflow·Worker·화면 API 연결 검사
-python3 -m unittest discover -s deploy   # GPU 없는 빌드 패치 회귀 검사
+# 회귀 검사(GPU 불필요). UI·DAG 테스트는 fastapi·httpx가 든 UI 이미지 안에서, 나머지는 호스트에서 돌립니다.
+docker run --rm --network none -u $(id -u):0 -e HOME=/tmp -v $PWD:/src:ro -w /src --entrypoint python kaist-airflow:3.3.2 -m unittest discover -s deploy
+python3 -m unittest deploy.test_publish_background deploy.test_sam3_single deploy.test_track_replace deploy.test_updater
 
 docker compose ps
 docker compose logs -f ui airflow gpu-worker
@@ -166,7 +168,8 @@ docker compose run --rm --no-deps gpu-worker check
 |---|---|
 | `Dockerfile` | UI·Airflow 및 GPU 이미지의 단일 빌드 정의 |
 | `compose.yaml` | 네 서비스, 준비 상태 검사, 영속 데이터·weight 마운트 |
-| `start.sh`, `repro/start_stack.py` | 한 번의 명령으로 설정·빌드·검증·실행 |
+| `start.sh`, `repro/start_stack.py` | 한 번의 명령으로 설정·빌드·검증·실행 (`--install-docker`는 `repro/install_docker.sh`) |
+| `documents/` | 변경 이력·검증 기록·weight 안내 |
 | `gpu/env/*.lock`, `build_envs.sh` | 고정된 Python 패키지와 CUDA 확장 빌드 |
 | `gpu/env/patch_selective_scan.py` | 이미지 안에서만 GPU 없는 CUDA 빌드 지원 |
 | `code/`, `worker/app/`, `pipeline/` | UI·작업 제어·검수·파이프라인 소스 |
