@@ -11,7 +11,8 @@ x-airflow-base: &airflow-base
   build:
     context: .
     target: airflow
-  image: kaist-airflow:3.3.2
+  # 한 PC에서 스택을 둘 이상 돌릴 때(정식·시험) 스택마다 다른 태그를 써야 서로의 이미지를 덮어쓰지 않습니다.
+  image: kaist-airflow:${KAIST_AIRFLOW_IMAGE_TAG:-3.3.2}
   restart: unless-stopped
   network_mode: host
   # 호스트 계정 UID로 실행해 state/·intake_state/와 Worker secret 파일을 sudo 없이 읽고 씁니다.
@@ -144,7 +145,7 @@ services:
         HOST_UID: ${HOST_UID:?run ./start.sh first}
         # GPU 세대(compute capability). prepare_pc.py가 nvidia-smi로 채웁니다. 예: 4090=8.9
         TORCH_CUDA_ARCH_LIST: ${TORCH_CUDA_ARCH_LIST:-8.9}
-    image: kaist-gpu:latest
+    image: kaist-gpu:${KAIST_GPU_IMAGE_TAG:-latest}
     restart: unless-stopped
     network_mode: host
     ipc: host

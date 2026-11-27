@@ -19,7 +19,9 @@ class ManoRemoveTests(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
         env = patch.dict(os.environ, KAIST_INTAKE_DB=str(Path(tmp.name) / 'c.sqlite'), KAIST_AIRFLOW_API_URL='')
         env.start(); self.addCleanup(env.stop)
-        self.status = {('day_a', 'hands'): 'running', ('day_b', 'hands'): 'not_started'}
+        # 05cb3fa 이후 일괄 실행은 에피소드마다 3D 복원 준비 → 3D 복원 → MANO 순서(여기서는 3D까지 끝난 실행)
+        self.status = {('day_a', 'prepare_reconstruction'): 'success', ('day_a', 'reconstruct'): 'success', ('day_a', 'hands'): 'running',
+                       ('day_b', 'prepare_reconstruction'): 'success', ('day_b', 'reconstruct'): 'success', ('day_b', 'hands'): 'not_started'}
         self.actions = []
         def call(method, path, json=None, **kw):
             return {'state': self.status.get((json['run_id'], json['stage']), 'not_started')}
@@ -48,7 +50,7 @@ class ManoRemoveTests(unittest.TestCase):
         self.assertEqual(self.remove('day_a').status_code, 200)
         self.assertIn(('stop', 'day_a', None), self.actions)
         ui.batch_history()
-        self.assertEqual(ui.mano_progress({'dag_run_id': 'day_a'}, {'day_a': 'running'}), ('MANO 대기 · 일괄 실행에서 제거됨', True))
+        self.assertEqual(ui.mano_progress({'dag_run_id': 'day_a', 'conf': SRC[0]['conf']}, {'day_a': 'running'}), ('MANO 대기 · 일괄 실행에서 제거됨', True))
 
     def test_waiting_episode_is_skipped(self):
         self.assertEqual(self.remove('day_b').status_code, 200)
@@ -66,7 +68,8 @@ class ManoRedoBatchUiTests(ManoRemoveTests):
         BATCH['conf']['redo_3d'] = True; self.addCleanup(BATCH['conf'].pop, 'redo_3d')
         ui.MANO_DONE.clear()
         super().setUp()
-        self.status = {('day_a', 'reconstruct'): 'running', ('day_b', 'reconstruct'): 'success'}
+        self.status = {('day_a', 'prepare_reconstruction'): 'success', ('day_a', 'reconstruct'): 'running',
+                       ('day_b', 'prepare_reconstruction'): 'success', ('day_b', 'reconstruct'): 'success'}
         self.reset_state = 'success'
         def action(name, payload, wid):
             self.actions.append((name, payload.get('run_id'), payload.get('stage')))
@@ -78,10 +81,11 @@ class ManoRedoBatchUiTests(ManoRemoveTests):
     def test_status_shows_redo_stage(self):
         sel = self.client.get('/api/pc1/mano/status', headers=self.h).json()['selected']
         lines = '\n'.join(sel['summary'])
-        self.assertIn('3D 복원 다시', lines)
-        self.assertIn('ep_20261116_000001  ▶ 3D 복원(다시) · 진행 중', lines)
-        self.assertNotIn('ep_20261116_000002  ▶', lines)         # 원래 3D가 끝난 에피소드는 다시 하는 것으로 보이지 않음
-        self.assertEqual((sel['current']['stage'], sel['current']['label']), ('reconstruct', '3D 복원(다시)'))
+        # 05cb3fa 이후: 따로 '3D 복원(다시)' 표시 없이 일반 3D 복원 단계로 보이고, 머리말에 3D부터 다시 함을 적습니다.
+        self.assertIn('3D 복원부터 다시', lines)
+        self.assertIn('ep_20261116_000001  ▶ 3D 복원 · 진행 중', lines)
+        self.assertNotIn('ep_20261116_000002  ▶', lines)         # 3D가 끝난 에피소드는 진행 중으로 보이지 않음
+        self.assertEqual((sel['current']['stage'], sel['current']['label']), ('reconstruct', '3D 복원'))
         self.assertTrue(sel['queue'][0]['running'])
 
     def test_running_redo_is_stopped_on_remove(self):

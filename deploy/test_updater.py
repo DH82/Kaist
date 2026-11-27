@@ -27,7 +27,9 @@ class UpdaterTests(unittest.TestCase):
         self.commit('README.md', 'v1')
         sh(self.tmp, 'git', 'clone', '-q', str(self.origin), str(self.pc))
         (self.pc / '.env').write_text(f"PC_ID='pc2'\nNAS_MOUNT='{self.nas}'\nGPU_STATE_DIR='{self.pc / 'gpu_state'}'\n")
+        # 바쁠 때 실제로 IDLE_POLL초씩 IDLE_POLL_FOR(165초)까지 기다리지 않게 합니다(대기 판정만 시험).
         for p in (patch.object(us, 'ROOT', self.pc), patch.object(us, 'LOCAL', self.pc / 'state/updater'),
+                  patch.object(us, 'IDLE_POLL', 0), patch.object(us, 'IDLE_POLL_FOR', 0),
                   patch.dict(os.environ, {'KAIST_UPDATE_MODE': 'docker'})):
             p.start(); self.addCleanup(p.stop)
         (self.pc / 'state/updater').mkdir(parents=True)
@@ -76,14 +78,14 @@ class UpdaterTests(unittest.TestCase):
         return sh(self.pc, 'git', 'rev-parse', 'HEAD')
 
     def test_no_request_reports_behind_only(self):
-        self.commit('code/a.py', '1')
+        self.commit('worker/app/a.py', '1')
         st = self.tick()
         self.assertEqual((st['state'], st['behind'], self.calls), ('idle', 1, []))
         self.assertEqual(self.head(), self.deployed)
         self.assertEqual(json.loads((self.nas / 'control/update/pc2/status.json').read_text())['behind'], 1)
 
     def test_request_builds_waits_for_jobs_then_restarts(self):
-        self.commit('code/a.py', '1'); self.request(); self.job('running')
+        self.commit('worker/app/a.py', '1'); self.request(); self.job('running')
         st = self.tick()
         self.assertEqual(st['state'], 'waiting'); self.assertIn('GPU 작업 1개', st['message'])
         self.assertEqual(self.calls, [('--build-only', '--no-gpu-check')])
@@ -140,19 +142,19 @@ class UpdaterTests(unittest.TestCase):
         self.assertEqual(self.tick()['state'], 'waiting')
 
     def test_stale_ui_status_blocks_restart(self):
-        self.commit('code/a.py', '1'); self.request(); self.ui(busy={}, age=600)
+        self.commit('worker/app/a.py', '1'); self.request(); self.ui(busy={}, age=600)
         st = self.tick()
         self.assertEqual(st['state'], 'waiting'); self.assertIn('UI 상태를 확인할 수 없습니다', st['message'])
 
     def test_build_failure_rolls_back(self):
-        self.commit('code/a.py', '1'); self.request(); self.fail_on = {('--build-only', '--no-gpu-check')}
+        self.commit('worker/app/a.py', '1'); self.request(); self.fail_on = {('--build-only', '--no-gpu-check')}
         st = self.tick()
         self.assertEqual(st['state'], 'failed'); self.assertIn('되돌', st['message'])
         self.assertEqual(self.head(), self.deployed)
         self.assertFalse((self.nas / 'control/update/pc2/request.json').exists())
 
     def test_restart_failure_rolls_back_and_restarts_old(self):
-        self.commit('code/a.py', '1'); self.request(); self.fail_on = {('--skip-build',)}
+        self.commit('worker/app/a.py', '1'); self.request(); self.fail_on = {('--skip-build',)}
         st = self.tick()
         self.assertEqual(st['state'], 'failed'); self.assertEqual(self.head(), self.deployed)
         self.assertEqual(self.calls[-1], ())   # 이전 커밋으로 전체 빌드·기동
@@ -164,7 +166,7 @@ class UpdaterTests(unittest.TestCase):
         self.assertEqual(st['state'], 'done'); self.assertIn('직접 고친 파일 1개', st['message'])
         self.assertEqual(self.head(), sh(self.dev, 'git', 'rev-parse', 'HEAD'))
         self.assertEqual((self.pc / 'README.md').read_text(), 'v2'); self.assertFalse(st['dirty'])
-        self.assertEqual(self.calls, [('--build-only', '--no-gpu-check'), ('--gpu-check-only',), ('--skip-build',)])
+        self.assertEqual(self.calls, [])   # 문서(.md)만 바뀌면 빌드·재시작하지 않음(31a201b 업데이트 범위)
         backup = next((us.LOCAL / 'discarded').iterdir())
         self.assertIn('local edit', (backup / 'local.patch').read_text())
         self.assertEqual(json.loads((backup / 'info.json').read_text())['files'], ['README.md'])
@@ -174,7 +176,7 @@ class UpdaterTests(unittest.TestCase):
         (self.pc / 'README.md').write_text('local edit')
         st = self.tick()
         self.assertEqual(st['state'], 'done'); self.assertEqual((self.pc / 'README.md').read_text(), 'v1')
-        self.assertEqual(self.calls, [('--build-only', '--no-gpu-check'), ('--gpu-check-only',), ('--skip-build',)])
+        self.assertEqual(self.calls, [])   # 직접 고친 파일이 문서뿐이면 되돌리기만 하고 다시 빌드하지 않음
 
     def test_diverged_commit_is_backed_up_and_reset(self):
         self.commit('README.md', 'v2'); self.request()
@@ -189,7 +191,7 @@ class UpdaterTests(unittest.TestCase):
         self.assertEqual(branches, local)
 
     def test_cancel_while_waiting_pauses(self):
-        self.commit('code/a.py', '1'); self.request(); self.job('running')
+        self.commit('worker/app/a.py', '1'); self.request(); self.job('running')
         self.assertEqual(self.tick()['state'], 'waiting')
         with patch.object(fleet, 'CONTROL', self.nas / 'control'):
             self.assertTrue(fleet.update_cancel('pc2'))
@@ -203,12 +205,12 @@ class UpdaterTests(unittest.TestCase):
         self.assertEqual((st['state'], self.calls), ('done', []))
 
     def test_auto_mode(self):
-        self.commit('code/a.py', '1')
+        self.commit('worker/app/a.py', '1')
         self.assertEqual(self.tick(auto=True)['state'], 'done')
 
     def test_gpu_check_waits_for_idle(self):
         # 2026-11-17 PC5: 작업 중에 GPU 점검을 돌려 10/12로 실패 → 점검은 쉬는 동안에만
-        self.commit('code/a.py', '1'); self.request(); self.job('running')
+        self.commit('worker/app/a.py', '1'); self.request(); self.job('running')
         self.assertEqual(self.tick()['state'], 'waiting')
         self.assertNotIn(('--gpu-check-only',), self.calls)
         self.job('success')
@@ -216,17 +218,17 @@ class UpdaterTests(unittest.TestCase):
         self.assertEqual(self.calls, [('--build-only', '--no-gpu-check'), ('--gpu-check-only',), ('--skip-build',)])
 
     def test_gpu_check_failure_rolls_back_without_check(self):
-        self.commit('code/a.py', '1'); self.request(); self.fail_on = {('--gpu-check-only',)}
+        self.commit('worker/app/a.py', '1'); self.request(); self.fail_on = {('--gpu-check-only',)}
         st = self.tick()
         self.assertEqual(st['state'], 'failed'); self.assertEqual(self.head(), self.deployed)
         self.assertEqual(self.calls[-1], ('--build-only', '--no-gpu-check'))
 
     def test_failed_auto_commit_is_not_retried(self):
-        self.commit('code/a.py', '1'); self.fail_on = {('--gpu-check-only',)}
+        self.commit('worker/app/a.py', '1'); self.fail_on = {('--gpu-check-only',)}
         self.assertEqual(self.tick(auto=True)['state'], 'failed')
         n = len(self.calls)
         self.assertEqual(self.tick(auto=True)['state'], 'idle'); self.assertEqual(len(self.calls), n)
-        self.commit('code/a.py', '2'); self.fail_on = set()   # 새 커밋이 오면 다시 시도
+        self.commit('worker/app/a.py', '2'); self.fail_on = set()   # 새 커밋이 오면 다시 시도
         self.assertEqual(self.tick(auto=True)['state'], 'done')
 
     def test_native_mode_pulls_without_docker(self):
@@ -274,7 +276,7 @@ class StreamingTests(UpdaterTests):
         u = us.Updater(self.pc / '.env'); u.tick(); return u
 
     def test_progress_recorded_through_phases(self):
-        self.commit('code/a.py', '1'); self.request(); self.job('running'); self.fake_stack()
+        self.commit('worker/app/a.py', '1'); self.request(); self.job('running'); self.fake_stack()
         u = self.real_tick()
         st = json.loads((self.nas / 'control/update/pc2/status.json').read_text())
         self.assertEqual(st['state'], 'waiting')
@@ -292,7 +294,7 @@ class StreamingTests(UpdaterTests):
         self.assertTrue(last['ok']); self.assertIn('check', last['phases']); self.assertIn('restart', last['phases']); self.assertEqual(last['to'], self.head())
 
     def test_failed_build_keeps_failed_phase(self):
-        self.commit('code/a.py', '1'); self.request(); self.fake_stack(fail=True)
+        self.commit('worker/app/a.py', '1'); self.request(); self.fake_stack(fail=True)
         self.real_tick()
         st = json.loads((self.nas / 'control/update/pc2/status.json').read_text())
         self.assertEqual(st['state'], 'failed')
@@ -353,12 +355,12 @@ class ForceUpdateTests(UpdaterTests):
 
     def test_force_does_not_wait_for_runs_ui_reports(self):
         # UI가 강제 종료한 뒤에도 Airflow 상태가 아직 갱신 전(20초 주기)이어도 기다리지 않음
-        self.commit('code/a.py', '1'); self.busy(); self.force()
+        self.commit('worker/app/a.py', '1'); self.busy(); self.force()
         self.tick(); self.ui_stops()
         self.assertEqual(self.tick()['state'], 'done')
 
     def test_waits_for_killed_jobs_to_settle(self):
-        self.commit('code/a.py', '1'); self.busy(); self.force()
+        self.commit('worker/app/a.py', '1'); self.busy(); self.force()
         self.tick(); self.ui_stops(); self.job('running')         # 아직 프로세스가 정리되지 않음
         st = self.tick()
         self.assertEqual(st['state'], 'waiting'); self.assertIn('정리 대기', st['message'])
@@ -366,7 +368,7 @@ class ForceUpdateTests(UpdaterTests):
         self.assertEqual(self.tick()['state'], 'done')
 
     def test_ui_not_answering_restarts_after_timeout(self):
-        self.commit('code/a.py', '1'); self.busy(); self.force()
+        self.commit('worker/app/a.py', '1'); self.busy(); self.force()
         self.tick()
         self.assertEqual(self.tick()['state'], 'waiting')
         order = self.nas / 'control/update/pc2/stop.json'
@@ -375,7 +377,7 @@ class ForceUpdateTests(UpdaterTests):
         self.assertEqual(st['state'], 'done'); self.assertIn('UI 응답 없음', st['message'])
 
     def test_pending_request_converted_to_force_keeps_id(self):
-        self.commit('code/a.py', '1'); self.busy()
+        self.commit('worker/app/a.py', '1'); self.busy()
         req = self.request()
         self.assertEqual(self.tick()['state'], 'waiting')
         self.assertFalse((self.nas / 'control/update/pc2/stop.json').exists())   # 일반 요청은 멈추지 않음
@@ -386,7 +388,7 @@ class ForceUpdateTests(UpdaterTests):
         self.assertEqual(self.calls.count(('--build-only', '--no-gpu-check')), 1)  # 다시 빌드하지 않음
 
     def test_normal_request_never_writes_stop(self):
-        self.commit('code/a.py', '1'); self.busy(); self.request()
+        self.commit('worker/app/a.py', '1'); self.busy(); self.request()
         for _ in range(2):
             self.assertEqual(self.tick()['state'], 'waiting')
         self.assertIsNone(self.ui_stops())

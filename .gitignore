@@ -34,15 +34,6 @@ pipeline/current/workspace/runtime-cache/
 pipeline/current/workspace/logs/
 pipeline/current/workspace/data/
 
-# Local-only tools and historical/native deployment files (not Docker distribution)
-/MIGRATION_KO.md
-/README_KO.md
-/native/
-/intake/
-/pack.sh
-/worker/install_worker.sh
-/gpu/setup_gpu.sh
-/tests/
 /repro/capture_source.py
 /repro/locks/
 /pipeline/**/*.pt
@@ -54,3 +45,7 @@ pipeline/current/workspace/data/
 /pipeline/**/*.npz
 /pipeline/**/*.npy
 review_cache/
+
+# Model weights copied for this PC (KAIST_WEIGHTS_ROOT); never committed
+/weights/
+/compose.override.yaml
