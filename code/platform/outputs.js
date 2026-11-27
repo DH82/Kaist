@@ -287,7 +287,8 @@ async function saveQueueTarget(){
  const input=$('rawQueueInput'),v=Number(input.value),q=rawTeam&&rawTeam.my_queue;
  if(!q||!Number.isInteger(v)||v<q.min||v>q.max){notice('큐 크기는 '+(q?q.min:0)+'~'+(q?q.max:30)+'개 사이 정수로 입력하세요.',true);return}
  if(v===q.target&&q.custom)return;
- if(v<q.target&&!confirm('내 큐를 '+q.target+'개 → '+v+'개로 줄입니다.\n시작하지 않은 배정 중 늦은 촬영부터 풀려 다른 작업자에게 갈 수 있습니다(시작한 RAW는 그대로).\n\n바꿀까요?')){input.value=q.target;return}
+ // 브라우저 confirm()은 크롬에서 '추가 대화상자 차단'이 체크되면 창 없이 곧바로 취소되어 줄이기만 안 되므로 페이지 안 대화상자를 씁니다.
+ if(v<q.target&&!await hcAsk('내 RAW 큐 줄이기','내 큐를 '+q.target+'개 → '+v+'개로 줄입니다.\n시작하지 않은 배정 중 늦은 촬영부터 풀려 다른 작업자에게 갈 수 있습니다(시작한 RAW는 그대로).','줄이기')){input.value=q.target;return}
  queueSaving=true;$('rawQueueSave').disabled=true;
  try{
   const r=await api('/api/queue-target',{method:'POST',body:JSON.stringify({target:v})});
@@ -382,7 +383,7 @@ $('rawRows').addEventListener('click',async event=>{
  const button=event.target.closest('[data-raw-exclude]');if(!button)return;
  event.stopPropagation();const row=rawEpisodes[+button.dataset.rawExclude];if(!row||rawExcludeBusy.has(row.episode))return;
  const excluded=!row.excluded_from_mine,wid=selectedWorker();
- if(excluded&&!confirm(row.episode+'\n\n내 작업에서 제외할까요?\n이 RAW는 나에게 다시 자동 배정되지 않습니다. 다른 작업자에게는 배정될 수 있습니다.\n원본 파일과 실행 기록은 유지되며, 다른 RAW가 있으면 빈자리를 채웁니다.'))return;
+ if(excluded&&!await uiConfirm(row.episode+'\n\n내 작업에서 제외할까요?\n이 RAW는 나에게 다시 자동 배정되지 않습니다. 다른 작업자에게는 배정될 수 있습니다.\n원본 파일과 실행 기록은 유지되며, 다른 RAW가 있으면 빈자리를 채웁니다.'))return;
  rawExcludeBusy.add(row.episode);button.disabled=true;
  try{
   await api('/api/raw-episodes/exclude',{method:'POST',body:JSON.stringify({episode:row.episode,worker_id:wid,excluded})});
@@ -413,7 +414,7 @@ $('rawPickMine').onclick=()=>{const me=rawTeam&&rawTeam.me;rawEpisodes.filter(e=
 $('rawBatchPrep').onclick=async()=>{
  if(rawBatchBusy||!rawBatchPicked.size)return;
  const eps=[...rawBatchPicked].sort();
- if(!confirm('RAW '+eps.length+'개를 전처리 일괄 실행합니다.\n\n'+eps.join('\n')+'\n\n· 각 RAW마다 복사·QC·준비까지 실행하고 \'SAM3 설정 대기\'에서 멈춥니다.\n· 분할 대상은 아래 \'SAM3 설정 대기\'에서 에피소드별로 입력하면 SAM3부터 이어집니다.\n· GPU 작업은 PC의 GPU 슬롯 순서대로 진행됩니다.\n· 처리 fps: '+targetFps()+'fps (실행 설정의 \'처리 fps\'에서 바꿉니다)\n\n진행할까요?'))return;
+ if(!await uiConfirm('RAW '+eps.length+'개를 전처리 일괄 실행합니다.\n\n'+eps.join('\n')+'\n\n· 각 RAW마다 복사·QC·준비까지 실행하고 \'SAM3 설정 대기\'에서 멈춥니다.\n· 분할 대상은 아래 \'SAM3 설정 대기\'에서 에피소드별로 입력하면 SAM3부터 이어집니다.\n· GPU 작업은 PC의 GPU 슬롯 순서대로 진행됩니다.\n· 처리 fps: '+targetFps()+'fps (실행 설정의 \'처리 fps\'에서 바꿉니다)\n\n진행할까요?'))return;
  rawBatchBusy=true;rawBatchControls();$('rawBatchInfo').textContent='시작하는 중…';
  try{
   const r=await api('/api/run/batch-prep',{method:'POST',body:JSON.stringify({worker_id:selectedWorker(),episodes:eps,defer_mano:selectedWorker()==='gpu_4090_a'&&$('deferMano').checked,target_fps:targetFps()})});
@@ -448,7 +449,7 @@ $('samWaitRows').addEventListener('click',async e=>{
  const b=e.target.closest('[data-sam-go]');if(!b)return;
  const input=$('samWaitRows').querySelector('[data-sam-input="'+CSS.escape(b.dataset.samGo)+'"]'),prompt=input.value.trim();
  if(!prompt){notice('SAM3 분할 대상을 입력하세요.',true);input.focus();return}
- if(!confirm(b.dataset.ep+'\nSAM3 분할 대상: '+prompt+'\n\n이 설정으로 SAM3부터 이어서 실행할까요? (같은 실행에서는 나중에 바꿀 수 없습니다)'))return;
+ if(!await uiConfirm(b.dataset.ep+'\nSAM3 분할 대상: '+prompt+'\n\n이 설정으로 SAM3부터 이어서 실행할까요? (같은 실행에서는 나중에 바꿀 수 없습니다)'))return;
  b.disabled=true;
  try{await api('/api/run/sam-settings',{method:'POST',body:JSON.stringify({dag_id:b.dataset.dag,run_id:b.dataset.samGo,sam_prompt:prompt})});
   notice(b.dataset.ep+' · SAM3 분할 대상 "'+prompt+'" 저장 · SAM3를 이어서 시작합니다.');samWaitSnap='';setTimeout(loadSamWaiting,1500);jobsSnapshot='';if(typeof loadJobs==='function')loadJobs()}

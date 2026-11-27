@@ -310,10 +310,10 @@ function hcEventsAllSync(){
  const all=usable.length&&usable.every(c=>c.checked);
  b.textContent=all?'↺ 모두 해제':'✔ 일괄 확인 완료 ('+usable.filter(c=>c.checked).length+'/'+usable.length+')';
 }
-$('hcEventsAll').onclick=()=>{
+$('hcEventsAll').onclick=async()=>{
  const usable=[...document.querySelectorAll('.hcEventCheck')].filter(c=>!c.disabled);if(!usable.length)return;
  const all=usable.every(c=>c.checked);
- if(!all&&!confirm('확인이 필요한 구간 '+usable.length+'개를 모두 확인 완료로 표시합니다.\n각 구간을 실제로 확인했는지 다시 한 번 살펴보세요. 진행할까요?'))return;
+ if(!all&&!await uiConfirm('확인이 필요한 구간 '+usable.length+'개를 모두 확인 완료로 표시합니다.\n각 구간을 실제로 확인했는지 다시 한 번 살펴보세요. 진행할까요?'))return;
  usable.forEach(c=>{c.checked=!all});hcEnable();hcEventsAllSync();
 };
 

@@ -174,7 +174,7 @@ async function loadContDist(){
 async function contDistribute(){
  const pcs=[...$('contDistBody').querySelectorAll('[data-dist-pc]:checked')].map(i=>i.dataset.distPc),date=$('contDistDate').value;
  if(!pcs.length){notice('분배할 PC를 고르세요.',true);return}
- if(!confirm((date||'전체 날짜')+'의 남은 RAW를 '+pcs.map(p=>p.toUpperCase()).join(', ')+'에 균등 분배합니다.\n\n· 분배한 RAW는 각 PC 작업자의 SAM3 연속 모드 목록에 나타납니다.\n· 시작 전이면 PC별로 회수할 수 있습니다.\n\n진행할까요?'))return;
+ if(!await uiConfirm((date||'전체 날짜')+'의 남은 RAW를 '+pcs.map(p=>p.toUpperCase()).join(', ')+'에 균등 분배합니다.\n\n· 분배한 RAW는 각 PC 작업자의 SAM3 연속 모드 목록에 나타납니다.\n· 시작 전이면 PC별로 회수할 수 있습니다.\n\n진행할까요?'))return;
  $('contDistGo').disabled=true;
  try{const r=await api('/api/continuous/distribute',{method:'POST',body:JSON.stringify({pcs,date})});
   notice('균등 분배: 총 '+r.total+'개 · '+Object.entries(r.given).map(([p,n])=>p.toUpperCase()+' +'+n).join(', ')+' (시작 전 합계 '+Object.entries(r.load).map(([p,n])=>p.toUpperCase()+' '+n).join(', ')+')')}
@@ -183,7 +183,7 @@ async function contDistribute(){
 }
 $('contDistBody').addEventListener('click',async e=>{
  const b=e.target.closest('[data-dist-recall]');if(!b)return;const pc=b.dataset.distRecall;
- if(!confirm(pc.toUpperCase()+'에 분배한 RAW 중 아직 시작하지 않은 것을 모두 회수합니다.\n그 PC에서 포인트를 찍어 대기 중인 항목도 시작하지 않습니다.\n\n회수할까요?'))return;
+ if(!await uiConfirm(pc.toUpperCase()+'에 분배한 RAW 중 아직 시작하지 않은 것을 모두 회수합니다.\n그 PC에서 포인트를 찍어 대기 중인 항목도 시작하지 않습니다.\n\n회수할까요?'))return;
  b.disabled=true;
  try{const r=await api('/api/continuous/recall',{method:'POST',body:JSON.stringify({pc})});notice(pc.toUpperCase()+' · '+r.recalled+'개 회수했습니다.')}catch(err){notice(err.message,true)}
  await loadContDist();
@@ -218,7 +218,7 @@ async function loadContMano(force=false){
 async function contManoRun(list,what){
  const runs=list.slice(0,100);if(!runs.length||contManoStarting)return;
  const redo=$('contManoRedo').checked;
- if(!confirm(what+' '+runs.length+'개를 3D 복원 일괄 실행합니다(3D 복원 → MANO → 저장).'+(list.length>runs.length?'\n(한 번에 최대 100개 · 나머지 '+(list.length-runs.length)+'개는 다음에 실행하세요)':'')+(redo?'\n업데이트 전 코드로 만든 3D 결과는 3D 복원부터 다시 합니다(이전 결과 보관).':'')+'\n\n실행할까요?'))return;
+ if(!await uiConfirm(what+' '+runs.length+'개를 3D 복원 일괄 실행합니다(3D 복원 → MANO → 저장).'+(list.length>runs.length?'\n(한 번에 최대 100개 · 나머지 '+(list.length-runs.length)+'개는 다음에 실행하세요)':'')+(redo?'\n업데이트 전 코드로 만든 3D 결과는 3D 복원부터 다시 합니다(이전 결과 보관).':'')+'\n\n실행할까요?'))return;
  contManoStarting=true;$('contManoToday').disabled=$('contManoAll').disabled=true;
  try{
   const r=await api('/api/pc1/mano',{method:'POST',body:JSON.stringify({runs,redo_3d:redo})});

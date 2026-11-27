@@ -52,7 +52,7 @@ async function loadFleet(quiet){
  finally{fleetBusy=false}
 }
 async function fleetSend(body,confirmText){
- if(!confirm(confirmText))return;
+ if(!await uiConfirm(confirmText))return;
  try{const r=await api('/api/fleet/dispatch',{method:'POST',body:JSON.stringify(body)});$('fleetMsg').textContent='명령을 보냈습니다 → '+r.sent_to.toUpperCase()+' (최대 20초 안에 처리 시작)';setTimeout(()=>{if(document.activeElement&&document.activeElement.blur)document.activeElement.blur();loadFleet(true)},3000)}
  catch(e){$('fleetMsg').textContent=e.message}
 }
