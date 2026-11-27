@@ -13,7 +13,7 @@ const hcEdit={cams:[null,null,null,null],history:[],future:[],stroke:null,tap:nu
  legacySave:false,legacyAreas:false};
 const HC_TAP_DELAY=260;
 // 마법봉 일괄 적용 상태(같은 카메라의 빈 마스크 프레임에 현재 점 프롬프트를 차례로 적용·저장)
-const hcBatch={running:false,stop:false,track:false};  // track: 추적 일괄 교체(워커 작업이라 중간에 멈출 수 없음)
+const hcBatch={running:false,stop:false,track:false,leaveOk:false};  // track: 추적 일괄 교체(워커 작업이라 중간에 멈출 수 없음)
 // 빈 마스크 프레임 찾기 상태(조회한 픽셀 수 캐시 포함)
 const hcEmptyNav={running:false,stop:false,cache:new Map()};
 
@@ -22,7 +22,7 @@ function hcEditKey(){return $('hcEditObj').value+':'+hcFrame}
 function hcEditDirtyCams(){return [0,1,2,3].filter(cam=>hcEdit.cams[cam]?.ready&&hcEdit.cams[cam].dirty)}
 function hcEditDirty(){return hcEditDirtyCams().length>0}
 function hcEditMessage(text,error=false){$('hcEditState').textContent=text;$('hcEditState').classList.toggle('error',error)}
-function hcWandMessage(text,error=false){$('hcWandState').textContent=text;$('hcWandState').classList.toggle('error',error)}
+function hcWandMessage(text,error=false){const el=$('hcWandState');el.textContent=text;el.classList.toggle('error',error);if(error&&text&&!el.closest('[hidden]'))el.scrollIntoView({block:'nearest'})}
 function hcEditBlocked(){
  if(!hcMeta||hcStage!=='mask')return '검수 화면을 불러온 뒤 수정할 수 있습니다.';
  if(hcEdit.saving)return '저장하는 중입니다.';
@@ -49,7 +49,8 @@ function hcEditControls(){
  $('hcWandUndo').disabled=busy||!we?.wand.points.length;
  hcEmptyNavControls();
  $('hcBatchApply').textContent='빈 '+($('hcEditObj').value==='0'?'물체':'손')+' 마스크 프레임만 채우기';
- $('hcBatchApply').disabled=busy||hcBatch.running||!we?.wand.points.some(x=>x[2]===1)||we.wand.busy;$('hcBatchStop').hidden=!hcBatch.running||hcBatch.track;
+ $('hcBatchApply').disabled=busy||hcBatch.running;  // 조건이 안 맞으면 누를 때 이유를 보여 줍니다(꺼 두면 '반응 없음'처럼 보임)
+ $('hcBatchStop').hidden=!hcBatch.running||hcBatch.track;
  // 추적 일괄 교체는 '마스크 수정 → 대상'에서 고른 마스크(손 / 물체)에만 진행합니다.
  const trackObj=$('hcEditObj').value==='0';
  // 구간을 비우면 '전체 프레임', 입력하면 그 구간을 버튼에 그대로 보여 줍니다.
@@ -58,7 +59,7 @@ function hcEditControls(){
  $('hcBatchTarget').classList.toggle('hcTrackObject',trackObj);$('hcBatchTarget').classList.toggle('hcTrackHand',!trackObj);
  $('hcTrackApply').textContent=(span?'프레임 '+(span[0]+1)+'~'+(span[1]+1):'전체 프레임')+' 교체';
  $('hcTrackApply').classList.toggle('hcTrackObject',trackObj);$('hcTrackApply').classList.toggle('hcTrackHand',!trackObj);
- $('hcTrackApply').disabled=busy||hcBatch.running||!we?.wand.mask||we.wand.busy;
+ $('hcTrackApply').disabled=busy||hcBatch.running;
  $('hcTrackForward').textContent='현재 프레임 이후만 교체'+(span?' (~'+(span[1]+1)+')':'');
  $('hcTrackForward').classList.toggle('hcTrackObject',trackObj);$('hcTrackForward').classList.toggle('hcTrackHand',!trackObj);
  $('hcTrackForward').disabled=$('hcTrackApply').disabled;
@@ -356,9 +357,9 @@ function hcEditSwap(from,to){
 }
 function hcEditUndo(){if(!hcEdit.saving&&!hcEdit.stroke)hcEditSwap(hcEdit.history,hcEdit.future)}
 function hcEditRedo(){if(!hcEdit.saving&&!hcEdit.stroke)hcEditSwap(hcEdit.future,hcEdit.history)}
-function hcEditDiscard(){
+async function hcEditDiscard(){
  if(!hcEditDirty()||hcEdit.saving)return;
- if(!confirm('저장하지 않은 마스크 수정을 모두 버릴까요?'))return;
+ if(!await uiConfirm('저장하지 않은 마스크 수정을 모두 버릴까요?'))return;
  hcEditReset();
 }
 
@@ -372,7 +373,7 @@ function hcEditPng(e){
 }
 async function hcSaveEdits(){
  const cams=hcEditDirtyCams();if(!cams.length||hcEdit.saving||hcBusy)return true;
- if(hcApproved()&&!confirm('수정한 마스크를 저장하면 기존 승인이 해제되고 다시 검수해야 합니다. 저장할까요?'))return false;
+ if(hcApproved()&&!await uiConfirm('수정한 마스크를 저장하면 기존 승인이 해제되고 다시 검수해야 합니다. 저장할까요?'))return false;
  hcStop();hcEdit.saving=true;hcEditControls();hcEditMessage('');  // 자동 저장은 조용히 진행합니다(실패할 때만 오류 표시)
  const frame=hcFrame,path=hcPath,messages=[];let ok=true,refresh=true;
  try{
@@ -411,7 +412,13 @@ async function hcEditResolve(action='이동'){
 // 검수 화면을 나가기 전에 호출합니다. 수정한 내용이 있으면 묻지 않고 저장을 시작하고 false를 돌려줍니다.
 // 저장이 끝나면 retry(나가려던 동작)를 다시 실행합니다. 수정을 버리지 않습니다.
 function hcEditLeaveOk(retry){
- if(hcBatch.running){if(!confirm(hcBatch.track?'추적 일괄 교체가 진행 중입니다. 나가도 교체는 끝까지 진행됩니다. 나갈까요?':'마법봉 일괄 적용 중입니다. 중지하고 나갈까요? (이미 저장한 프레임은 유지됩니다)'))return false;hcBatch.stop=true}
+ // 일괄 작업 중이면 먼저 묻고(페이지 안 확인창이라 비동기), '나가기'를 고르면 나가려던 동작(retry)을 다시 실행합니다.
+ if(hcBatch.running&&!hcBatch.leaveOk){
+  uiConfirm(hcBatch.track?'추적 일괄 교체가 진행 중입니다. 나가도 교체는 끝까지 진행됩니다. 나갈까요?':'마법봉 일괄 적용 중입니다. 중지하고 나갈까요? (이미 저장한 프레임은 유지됩니다)',{title:'검수 화면 나가기',ok:'나가기'})
+   .then(ok=>{if(!ok||!hcBatch.running)return;hcBatch.leaveOk=true;hcBatch.stop=true;if(typeof retry==='function')retry()});
+  return false;
+ }
+ if(hcBatch.running)hcBatch.stop=true;
  if(!hcEditDirty())return true;
  if(!hcEdit.saving)hcSaveEdits().then(ok=>{if(ok&&typeof retry==='function')retry()});
  return false;
@@ -498,6 +505,16 @@ async function hcBinaryPng(b64,width,height){
  for(let i=0;i<px.data.length;i+=4){const v=px.data[i]>127?255:0;px.data[i]=px.data[i+1]=px.data[i+2]=v;px.data[i+3]=255}
  ctx.putImageData(px,0,0);return canvas.toDataURL('image/png').split(',')[1];
 }
+// 일괄 기능 확인창. 브라우저 confirm()은 크롬에서 '이 페이지가 추가 대화상자를 만들지 못하도록 차단'을 한 번 체크하면
+// 창 없이 곧바로 취소되어 버튼이 반응하지 않는 것처럼 보이므로, 페이지 안의 대화상자를 씁니다.
+function hcAsk(title,text,ok='진행'){return uiConfirm(text,{title,ok})}  // index.html의 uiConfirm(페이지 안 확인창)
+// 분할 중에 일괄 버튼을 누르면 분할이 끝날 때까지 기다렸다가 이어서 진행합니다.
+async function hcWandSettle(e,label){
+ if(!e?.wand?.busy)return true;
+ hcWandMessage('마법봉 분할이 끝나면 바로 이어서 시작합니다 ('+label+')…');
+ try{await e.wand.done}catch(_){}
+ return hcWandEntry()===e&&!e.wand?.busy;
+}
 function hcBatchRange(){
  const n=hcMeta.frames,num=id=>{const v=$(id).value.trim();return v===''?NaN:Math.round(Number(v))};
  let a=num('hcBatchFrom'),b=num('hcBatchTo');
@@ -509,7 +526,7 @@ async function hcBatchRun(){
  const blocked=hcEditBlocked();if(blocked){hcWandMessage(blocked,true);return}
  const e=hcWandEntry();
  if(!e?.wand?.points.some(x=>x[2]===1)){hcWandMessage('먼저 기준이 될 카메라·프레임에서 마법봉 점을 찍어 결과를 확인하세요. 그 점으로 일괄 적용합니다.',true);return}
- if(e.wand.busy){hcWandMessage('분할이 끝난 뒤 일괄 적용할 수 있습니다.',true);return}
+ if(!await hcWandSettle(e,'빈 마스크 채우기')||!e.wand?.points.some(x=>x[2]===1)){hcWandMessage('마법봉 결과가 바뀌었습니다. 노란 결과를 확인한 뒤 다시 눌러 주세요.',true);return}
  // 저장하지 않은 수정을 저장하면 프레임을 다시 불러와 점이 지워지므로, 프롬프트를 먼저 복사해 둡니다.
  const {cam,points,threshold}=hcWandRequestBody(e),obj=e.obj,path=hcPath,token=hcToken,episode=hcMeta.episode;
  const [from,to]=hcBatchRange(),minPx=hcBatchMinPx(),objName=obj===0?'물체':'손',otherName=obj===0?'손':'물체';
@@ -517,10 +534,10 @@ async function hcBatchRun(){
  // 이름은 대상별 이름(손 = hand, 물체 = 이 에피소드의 SAM3 프롬프트)을 씁니다.
  const text=String(hcEdit.names[obj]||(obj===1?'hand':'')).trim();
  if(!text){hcWandMessage(objName+' 이름을 물체 이름 칸에 입력한 뒤 일괄 적용하세요. 일괄 적용은 이름으로 대상을 찾은 결과만 저장합니다.',true);return}
- if(!confirm('카메라 '+(cam+1)+' · '+objName+' 마스크\n프레임 '+(from+1)+'~'+(to+1)+' 중 마스크가 비어 있는(없거나 '+minPx+'px 미만) 프레임에, 현재 마법봉 점 '+points.length+'개'+(text?' + 이름 "'+text+'"':'')+'로 SAM3 분할을 일괄 적용하고 바로 저장합니다.\n\n· "'+text+'"(으)로 찾은 결과만 저장합니다. 이름으로 못 찾아 클릭만으로 분할된 프레임, 결과가 '+otherName+' 마스크와 대부분 겹치는 프레임은 건너뜁니다.\n· '+minPx+'px 미만으로 남은 잡음은 새 결과로 바꿉니다. 그 이상 마스크가 있는 프레임은 바꾸지 않습니다.\n· 점은 모든 프레임에 같은 화면 위치로 들어갑니다. 물체가 크게 움직인 프레임은 결과를 꼭 확인하세요.'+(hcApproved()?'\n· 저장하면 기존 승인이 해제되고 다시 검수해야 합니다.':'')))return;
+ if(!await hcAsk('빈 '+objName+' 마스크 프레임 채우기','카메라 '+(cam+1)+' · '+objName+' 마스크\n프레임 '+(from+1)+'~'+(to+1)+' 중 마스크가 비어 있는(없거나 '+minPx+'px 미만) 프레임에, 현재 마법봉 점 '+points.length+'개'+(text?' + 이름 "'+text+'"':'')+'로 SAM3 분할을 일괄 적용하고 바로 저장합니다.\n\n· "'+text+'"(으)로 찾은 결과만 저장합니다. 이름으로 못 찾아 클릭만으로 분할된 프레임, 결과가 '+otherName+' 마스크와 대부분 겹치는 프레임은 건너뜁니다.\n· '+minPx+'px 미만으로 남은 잡음은 새 결과로 바꿉니다. 그 이상 마스크가 있는 프레임은 바꾸지 않습니다.\n· 점은 모든 프레임에 같은 화면 위치로 들어갑니다. 물체가 크게 움직인 프레임은 결과를 꼭 확인하세요.'+(hcApproved()?'\n· 저장하면 기존 승인이 해제되고 다시 검수해야 합니다.':'')))return;
  if(!await hcEditResolve('일괄 적용'))return;
  if(!hcMeta||hcMeta.episode!==episode||hcBatch.running)return;
- hcBatch.running=true;hcBatch.stop=false;hcStop();hcEditReset();hcEdit.saving=true;hcEditControls();
+ hcBatch.running=true;hcBatch.leaveOk=false;hcBatch.stop=false;hcStop();hcEditReset();hcEdit.saving=true;hcEditControls();
  const headers={'Content-Type':'application/json','X-CSRF-Token':token},targets=[],failed=[];let saved=0,notFound=0,changed=0,clickOnly=0,otherTarget=0;
  try{
   // 1) 범위 안에서 마스크가 비어 있거나 없는 프레임 찾기
@@ -665,17 +682,17 @@ async function hcTrackRun(forward){
  if(hcBatch.running||hcEdit.saving||hcBusy)return;
  const blocked=hcEditBlocked();if(blocked){hcWandMessage(blocked,true);return}
  const e=hcWandEntry();
+ if(e?.wand?.busy&&!await hcWandSettle(e,'일괄 교체')){hcWandMessage('마법봉 결과가 바뀌었습니다. 노란 결과를 확인한 뒤 다시 눌러 주세요.',true);return}
  if(!e?.wand?.mask){hcWandMessage('먼저 품질이 나쁜 프레임에서 마법봉으로 대상을 클릭해 노란 결과를 확인하세요. 그 결과를 시드로 추적합니다.',true);return}
- if(e.wand.busy){hcWandMessage('분할이 끝난 뒤 실행할 수 있습니다.',true);return}
  const body=hcWandRequestBody(e),obj=e.obj,path=hcPath,token=hcToken,episode=hcMeta.episode,objName=obj===0?'물체':'손';
  // 마법봉 결과를 만든 뒤 대상을 바꿨다면 진행하지 않습니다(대상 전환 시 점이 지워지지만 한 번 더 확인).
  if(String(obj)!==$('hcEditObj').value){hcWandMessage('마스크 수정 대상이 바뀌었습니다. 지금 대상으로 마법봉을 다시 클릭하세요.',true);return}
  const range=hcBatchRange(),to=range[1],from=forward?body.frame:range[0],label=forward?'현재 프레임 이후 일괄 교체':'전체 프레임 일괄 교체';
  if(body.frame<range[0]&&!forward||body.frame>to){hcWandMessage('클릭한 프레임('+(body.frame+1)+')이 일괄 프레임 구간('+(range[0]+1)+'~'+(to+1)+') 안에 있어야 합니다.',true);return}
- if(!confirm('카메라 '+(body.cam+1)+' · '+objName+' 마스크 '+label+'\n(마스크 수정 대상: '+objName+' — 다른 대상의 마스크는 바뀌지 않습니다)\n\n프레임 '+(body.frame+1)+'의 마법봉 결과(노란 영역)를 시작점으로 SAM3가 '+(forward?'다음 프레임들을':'앞뒤 프레임을')+' 따라가며, 프레임 '+(from+1)+'~'+(to+1)+'('+(to-from+1)+'개)의 '+objName+' 마스크를 모두 새 결과로 바꿉니다.'+(forward&&from>0?' 프레임 1~'+from+'은 바꾸지 않습니다.':'')+'\n\n· 기존 마스크가 있어도 교체합니다. 추적에서 '+objName+'이 안 보인 프레임은 빈 마스크가 됩니다.\n· 이전 마스크는 수정 이력에 보관됩니다.\n· 프레임 수에 따라 수십 초~몇 분 걸립니다.'+(hcApproved()?'\n· 저장하면 기존 승인이 해제되고 다시 검수해야 합니다.':'')))return;
+ if(!await hcAsk(label,'카메라 '+(body.cam+1)+' · '+objName+' 마스크 '+label+'\n(마스크 수정 대상: '+objName+' — 다른 대상의 마스크는 바뀌지 않습니다)\n\n프레임 '+(body.frame+1)+'의 마법봉 결과(노란 영역)를 시작점으로 SAM3가 '+(forward?'다음 프레임들을':'앞뒤 프레임을')+' 따라가며, 프레임 '+(from+1)+'~'+(to+1)+'('+(to-from+1)+'개)의 '+objName+' 마스크를 모두 새 결과로 바꿉니다.'+(forward&&from>0?' 프레임 1~'+from+'은 바꾸지 않습니다.':'')+'\n\n· 기존 마스크가 있어도 교체합니다. 추적에서 '+objName+'이 안 보인 프레임은 빈 마스크가 됩니다.\n· 이전 마스크는 수정 이력에 보관됩니다.\n· 프레임 수에 따라 수십 초~몇 분 걸립니다.'+(hcApproved()?'\n· 저장하면 기존 승인이 해제되고 다시 검수해야 합니다.':'')))return;
  if(!await hcEditResolve(label))return;
  if(!hcMeta||hcMeta.episode!==episode||hcBatch.running)return;
- hcBatch.running=true;hcBatch.track=true;hcStop();hcEditReset();hcEdit.saving=true;hcEditControls();
+ hcBatch.running=true;hcBatch.leaveOk=false;hcBatch.track=true;hcStop();hcEditReset();hcEdit.saving=true;hcEditControls();
  const headers={'Content-Type':'application/json','X-CSRF-Token':token};let job=null,summary='',error=false;
  try{
   hcWandMessage(label+' · 시작하는 중…'+(hcEdit.wandLoaded?'':' 처음 한 번은 모델을 불러오느라 10~20초 걸립니다.'));

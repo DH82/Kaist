@@ -42,20 +42,20 @@ function bindEpisodeActions(container,onChange){
   const d=b.dataset,ep=d.episode,id=d.ea+'|'+ep+'|'+d.key;if(epActionBusy.has(id))return;
   try{
    if(d.ea==='upload'){
-    if(!confirm(ep+'\n\n지금 GPU PC 작업 폴더에 있는 이 에피소드 파일을 NAS에 올립니다.\n(NAS의 같은 에피소드 사본은 지금 상태로 맞춰집니다.)'))return;
+    if(!await uiConfirm(ep+'\n\n지금 GPU PC 작업 폴더에 있는 이 에피소드 파일을 NAS에 올립니다.\n(NAS의 같은 에피소드 사본은 지금 상태로 맞춰집니다.)'))return;
     epActionBusy.add(id);b.disabled=true;
     const st=await api('/api/episodes/upload',{method:'POST',body:JSON.stringify({episode:ep})});
     if(st.state==='running'){uploadState.set(ep,'running');notice(ep+' NAS 업로드를 시작했습니다. 끝나면 알려 드립니다.');onChange&&onChange();pollUpload(ep,onChange)}
     else notice(ep+' NAS 업로드: '+(st.error||st.state),st.state==='failed');
    }else if(d.ea==='stop'){
-    if(!confirm(ep+'\n\n대기·실행 중인 작업을 강제 종료합니다.\n동시 실행 자리가 비워지고, 진행 중이던 단계는 "실패 단계 다시 실행"으로 나중에 이어갈 수 있습니다.\n\n종료할까요?'))return;
+    if(!await uiConfirm(ep+'\n\n대기·실행 중인 작업을 강제 종료합니다.\n동시 실행 자리가 비워지고, 진행 중이던 단계는 "실패 단계 다시 실행"으로 나중에 이어갈 수 있습니다.\n\n종료할까요?'))return;
     epActionBusy.add(id);b.disabled=true;b.textContent='종료 중…';
     const r=await api('/api/episodes/stop',{method:'POST',body:JSON.stringify({episode:ep,dag_id:d.dag,run_id:d.run})});
     notice(ep+' 강제 종료 완료'+(r.stages.length?' · 종료한 단계: '+r.stages.map(s=>(typeof taskName!=='undefined'&&taskName[s])||s).join(', '):''));
     if(typeof jobsSnapshot!=='undefined')jobsSnapshot='';onChange&&onChange();
    }else if(d.ea==='hide'||d.ea==='unhide'){
     const hide=d.ea==='hide';
-    if(hide&&!confirm(ep+'\n\n목록에서 삭제합니다. 결과 파일과 실행 기록은 그대로 남고, "숨긴 항목 보기"에서 다시 표시할 수 있습니다.'))return;
+    if(hide&&!await uiConfirm(ep+'\n\n목록에서 삭제합니다. 결과 파일과 실행 기록은 그대로 남고, "숨긴 항목 보기"에서 다시 표시할 수 있습니다.'))return;
     epActionBusy.add(id);b.disabled=true;
     await api('/api/hidden',{method:'POST',body:JSON.stringify({scope:d.scope,key:d.key,episode:ep,hidden:hide})});
     hide?hiddenKeys[d.scope].add(d.key):hiddenKeys[d.scope].delete(d.key);

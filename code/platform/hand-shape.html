@@ -59,7 +59,11 @@ input[type=range]{width:100%}#cv{width:100%;border-radius:6px;display:block;touc
  <video id="cmpVideo" controls loop muted playsinline style="width:100%;border-radius:6px;background:#000"></video></div>
 </div>
 <div class="card"><b>로그</b> <span class="muted small" id="logt"></span><pre id="log">에피소드를 고르면 로그가 보입니다.</pre></div></div>
-</main><script>
+</main><dialog id="uiAskDialog" style="width:min(560px,calc(100vw - 32px));border:1px solid #ddd;border-radius:14px;padding:22px 24px"><p id="uiAskText" style="white-space:pre-wrap;line-height:1.55;max-height:60vh;overflow:auto;margin-top:0"></p><div style="display:flex;gap:8px;justify-content:flex-end"><button type="button" id="uiAskCancel">취소</button><button type="button" id="uiAskAccept">확인</button></div></dialog><script>
+// 브라우저 confirm()은 크롬에서 '추가 대화상자 차단'을 체크하면 창 없이 곧바로 취소되므로 페이지 안 확인창을 씁니다.
+function uiConfirm(text){return new Promise(resolve=>{const d=document.getElementById('uiAskDialog'),acc=document.getElementById('uiAskAccept'),can=document.getElementById('uiAskCancel');
+ document.getElementById('uiAskText').textContent=text;const fin=v=>{acc.onclick=can.onclick=d.oncancel=null;if(d.open)d.close();resolve(v)};
+ acc.onclick=()=>fin(true);can.onclick=()=>fin(false);d.oncancel=e=>{e.preventDefault();fin(false)};d.showModal();acc.focus()})}
 const CSRF='__CSRF__',$=id=>document.getElementById(id);
 let cur=null,data=null,frames=0,view=-1,curF=0;const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const ed={w:848,h:480,img:null,mask:null,wandRed:null,wandCyan:null,pts:[],tool:'brush',r:10,dirty:false,undo:[],redo:[],down:false,last:null,hover:null,seq:0,busy:false,key:''};
@@ -101,7 +105,7 @@ function runSel(s){if(ed.dirty){msg('저장하지 않은 수정이 있습니다.
 function toggleAll(b){document.querySelectorAll('.pick').forEach(x=>x.checked=b.checked)}
 async function makeProfile(){const id=$('pid').value.trim(),eps=[...document.querySelectorAll('.pick:checked')].map(x=>x.value);
  if(!id){$('pmsg').textContent='이름을 입력하세요.';return}if(!eps.length){$('pmsg').textContent='위 목록에서 β 측정이 끝난 에피소드를 체크하세요.';return}
- if(!confirm('프로필 '+id+'을(를) 에피소드 '+eps.length+'개의 β 평균으로 만듭니다.\n'+eps.join('\n')+'\n\n만든 뒤에는 고칠 수 없습니다. 진행할까요?'))return;
+ if(!await uiConfirm('프로필 '+id+'을(를) 에피소드 '+eps.length+'개의 β 평균으로 만듭니다.\n'+eps.join('\n')+'\n\n만든 뒤에는 고칠 수 없습니다. 진행할까요?'))return;
  $('pmsg').textContent='만드는 중…';try{const j=await api(A+'profile',{id,episodes:eps,note:$('pnote').value});$('pmsg').textContent='만들었습니다: '+j.id+(j.size?' · '+size(j.size):'')+' · '+j.sha256.slice(0,12);$('pid').value='';reload()}catch(e){$('pmsg').textContent=e.message}}
 // ---------- 편집기 ----------
 function msg(t,err){$('emsg').textContent=t;$('emsg').className=err?'err':'muted'}
@@ -145,7 +149,7 @@ function bits(){const p=ed.mask.getContext('2d').getImageData(0,0,ed.w,ed.h).dat
 async function save(){if(!ed.dirty)return true;if(locked()){msg('실행 중이라 저장할 수 없습니다.',true);return false}const [ep,cam,f]=ed.key.split(':');
  try{msg('저장 중…');const j=await api(A+'mask',{ep,cam:+cam,f:+f,data:bits()});if(ed.key===ep+':'+cam+':'+f){ed.dirty=false;msg('저장했습니다 · cam'+(+cam+1)+' 프레임 '+f+' · 손 픽셀 '+j.area);draw()}reload();return true}
  catch(e){msg('저장 실패: '+e.message,true);return false}}
-async function revert(){if(!confirm('이 카메라·프레임을 처음 SAM3 마스크로 되돌릴까요?'))return;try{await api(A+'mask/revert',{ep:cur,cam:view,f:curF});ed.dirty=false;await loadEdit();msg('원래 SAM3 마스크로 되돌렸습니다.')}catch(e){msg(e.message,true)}}
+async function revert(){if(!await uiConfirm('이 카메라·프레임을 처음 SAM3 마스크로 되돌릴까요?'))return;try{await api(A+'mask/revert',{ep:cur,cam:view,f:curF});ed.dirty=false;await loadEdit();msg('원래 SAM3 마스크로 되돌렸습니다.')}catch(e){msg(e.message,true)}}
 document.addEventListener('keydown',e=>{if($('pv').hidden||e.target.matches('input[type=text]'))return;const k=e.key;
  if((e.ctrlKey||e.metaKey)&&k.toLowerCase()==='s'){e.preventDefault();save();return}
  if((e.ctrlKey||e.metaKey)&&k.toLowerCase()==='z'){e.preventDefault();if(ed.tool==='wand'&&ed.pts.length){ed.pts.pop();ed.pts.length?runWand():clearWand()}else if(e.shiftKey)redo();else undo();return}
