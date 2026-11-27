@@ -127,6 +127,8 @@ Docker 없이 native로 운영하는 PC는 코드를 받은 뒤 UI만 재시작�
 기본값으로 운영하며, 바꿀 때만 아래를 씁니다. 환경 변수는 native 실행은 `.env`, Docker 실행은 compose override로 서비스에 넘겨야 합니다
 (`compose.yaml`은 이 값들을 자동으로 넘기지 않습니다).
 
+한 PC에 정식·시험 스택을 함께 띄울 때는 `--stack-name`을 다르게 주면 상태가 `.runtime/<스택 이름>/`에 따로 생깁니다. 두 스택의 `GPU_LOCK_FILE`은 같은 파일이어야 GPU 작업이 겹치지 않습니다. PC1~PC6 밖의 PC 이름(예: 시험 `pct`)은 `KAIST_EXTRA_LOGIN_NAMES`에 같은 이름이 있을 때만 받습니다.
+
 | 설정 | 위치 | 기본 동작 |
 |---|---|---|
 | `KAIST_SAM3_SLOTS` | Worker 환경 | SAM3 동시 실행 수. RTX 4090은 1개, RTX 5090은 2개(두 번째 자리를 마법봉과 공유). `0`이면 제한 없음 |
@@ -138,6 +140,7 @@ Docker 없이 native로 운영하는 PC는 코드를 받은 뒤 UI만 재시작�
 | `KAIST_HAND_PROFILE_UI=1` | UI 환경 | MANO beta 화면·RAW 손 형상 열·비교 화면 표시(기본 숨김) |
 | `KAIST_EXTRA_LOGIN_NAMES` | UI 환경 | PC1~PC6 외에 허용할 로그인 이름(예: 시험 스택 `PCT`) |
 | `KAIST_SESSION_COOKIE` | UI 환경 | 세션 쿠키 이름(기본 `kaist_session`). 한 PC에 UI를 두 개 띄울 때 서로 다르게 지정 |
+| `KAIST_GPU_IMAGE_TAG`, `KAIST_AIRFLOW_IMAGE_TAG` | 스택 `.env` | 이미지 태그(기본 `latest`, `3.3.2`). 한 PC에 스택을 둘 띄울 때 스택마다 다르게 지정해야 서로의 이미지를 덮어쓰지 않음 |
 
 PC마다 기본 SAM3 분할 방식(`물체 포인트 + 손 텍스트`(기본) / `물체 포인트 + 손 포인트` / `텍스트만`)은 UI DB에 저장됩니다. 작업 실행 화면 **실행 설정 → 물체 분할 방식**에서 고른 뒤 기본값 저장 버튼으로 바꿉니다.
 
