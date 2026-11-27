@@ -17,10 +17,16 @@ class ManoBatchSkipTests(unittest.TestCase):
         self.started = []
         self.broken = set()
         def call(method, path, json=None, **kw):
-            key = (json['run_id'], json['stage'])
             if json['run_id'] in self.broken:
                 raise httpx.HTTPStatusError('400', request=httpx.Request('POST', 'http://x'), response=httpx.Response(400))
-            if json['stage'] == 'reconstruct':
+            # 05cb3fa 이후 일괄 실행은 3D 단계 전에 초기화 상태·코드 변경을 확인합니다(여기서는 모두 새 코드로 고정된 실행).
+            action = path.rsplit('/', 1)[1]
+            if action == 'reset-status':
+                return {'state': 'not_started'}
+            if action == 'drift':
+                return {'pinned': True, 'changed': [], 'code_only': True, 'transfer': False}
+            key = (json['run_id'], json['stage'])
+            if json['stage'] in dw.REDO_STAGES:   # 3D 복원 준비·3D 복원은 이미 끝난 에피소드(05cb3fa 이후 일괄 실행은 3D부터 확인)
                 return {'state': self.state.get(key, 'success')}
             if path.endswith('/start') and self.state.get(key, 'not_started') == 'not_started':
                 self.started.append(key); self.state[key] = 'running'

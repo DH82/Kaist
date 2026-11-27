@@ -88,7 +88,7 @@ def scope_flags(scope):
 
 
 def gpu_image_id():
-    r = subprocess.run(['docker', 'image', 'inspect', '--format', '{{.Id}}', 'kaist-gpu:latest'], capture_output=True, text=True)
+    r = subprocess.run(['docker', 'image', 'inspect', '--format', '{{.Id}}', 'kaist-gpu:' + (os.environ.get('KAIST_GPU_IMAGE_TAG') or 'latest')], capture_output=True, text=True)
     return r.stdout.strip() if r.returncode == 0 else None
 
 
