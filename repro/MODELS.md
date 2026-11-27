@@ -36,3 +36,6 @@ hub 폴더로 지정할 수는 없습니다. `mano`는 MANO_LEFT.pkl과 MANO_RIG
 실행 시 파일은 읽기 전용으로 마운트합니다. `.env`에 경로가 저장되므로 이후에는 `./start.sh`만 실행하면 됩니다.
 모든 모델을 지정한 뒤 GPU·CUDA 확장·캐시·EGL·저장소 검사에 통과해야 UI 준비 완료로 표시합니다.
 전체 에피소드 추론과 검수 승인은 UI에서 수행합니다.
+
+MANO v7(2026-11-26)이 쓰는 MediaPipe 손 검출 모델은 `mediapipe` 패키지(`gpu/env/hamba.lock`의 `mediapipe==0.10.14`) 안에 들어 있어
+따로 지정할 weight가 없습니다.
