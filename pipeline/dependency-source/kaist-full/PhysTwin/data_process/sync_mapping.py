@@ -1,8 +1,12 @@
-"""Versioned host timestamp mapping. Clock/exposure semantics are unknown."""
+"""Versioned timestamp mapping: camera clock (hw_timestamp_ms) when usable, else host arrival time."""
 import csv, math
 from pathlib import Path
-POLICY = 'host_overlap_max_count_reference_nearest_v1'
+POLICY = 'host_overlap_max_count_reference_nearest_v1'          # host_time_s timeline (fallback, unchanged)
+HW_POLICY = 'camera_clock_overlap_max_count_reference_nearest_v2'  # same algorithm on hw_timestamp_ms
 DEFAULT_TOL_S = .025
+# hw_timestamp_ms is used only when it is RealSense global time (camera clock mapped to the PC clock):
+# every row within this distance of host_time_s. Device-internal clocks (counting from 0) fail it -> host_time_s.
+HW_MAX_HOST_OFFSET_S = 2.0
 
 def read_rows(src, cam):
     with (Path(src)/f'{cam}_timestamps.csv').open() as f:
@@ -13,6 +17,36 @@ def read_rows(src, cam):
         raise ValueError('Invalid/duplicate timestamp entries: '+cam)
     if any(b<a for a,b in zip(times,times[1:])):raise ValueError('Non-monotonic host timestamps: '+cam)
     return {int(r['frame_idx']):r for r in rows}
+
+def sync_times(rows):
+    """Per-camera {frame_idx: seconds} used for syncing, and the basis name.
+
+    host_time_s is when a frame reached the PC; USB delivery delay swings from ~60ms to over 1s, so
+    frames exposed at the same moment can differ by hundreds of ms there (and get dropped or mis-paired).
+    hw_timestamp_ms (global time) follows the camera's exposure clock, so all four cameras are compared
+    on it when every camera has valid, non-decreasing values in the PC clock domain."""
+    hw = []
+    for rs in rows:
+        t = {}
+        for i, r in rs.items():
+            try:
+                v = float(r.get('hw_timestamp_ms') or 'nan') / 1000.0
+            except ValueError:
+                v = float('nan')
+            if not math.isfinite(v) or abs(v - float(r['host_time_s'])) > HW_MAX_HOST_OFFSET_S:
+                t = None
+                break
+            t[i] = v
+        if t is None:
+            break
+        ordered = [t[i] for i in sorted(t)]
+        if any(b < a for a, b in zip(ordered, ordered[1:])):
+            break
+        hw.append(t)
+    if rows and len(hw) == len(rows):
+        return hw, 'hw_timestamp_ms'
+    return [{i: float(r['host_time_s']) for i, r in rs.items()} for rs in rows], 'host_time_s'
+
 
 def frame_stride(frame_times, fps):
     """How many synced frames to step over so the capture is exported at `fps`.
@@ -76,7 +110,8 @@ def sync_frames(cam_ts, fps, tol_s):
 
 def source_mapping(src,cams,tol_s=DEFAULT_TOL_S,fps=30):
     rows=[read_rows(src,c) for c in cams]
-    times=[{i:float(r['host_time_s']) for i,r in rs.items()} for rs in rows]
+    times,basis=sync_times(rows)
+    use_hw=basis=='hw_timestamp_ms'
     picks,anchors=sync_frames(times,None,tol_s)
     step=frame_stride(anchors,fps)
     picks,anchors=picks[::step],anchors[::step]
@@ -87,10 +122,12 @@ def source_mapping(src,cams,tol_s=DEFAULT_TOL_S,fps=30):
         views=[]
         for c,i in enumerate(indices):
             r=rows[c][i];host=float(r['host_time_s']);hw=r.get('hw_timestamp_ms')
-            views.append({'camera':c,'raw_camera':cams[c],'raw_idx':i,'host_time_s':host,'hw_timestamp_ms':float(hw) if hw else None,'residual_ms':(host-t)*1000,'duplicate_source':i in seen[c]})
+            views.append({'camera':c,'raw_camera':cams[c],'raw_idx':i,'host_time_s':host,'hw_timestamp_ms':float(hw) if hw else None,'residual_ms':(times[c][i]-t)*1000,'duplicate_source':i in seen[c]})
             seen[c].add(i)
         frames.append({'output_idx':f,'pretrim_idx':f,'pretrim_frame':f,'frame':f,'reference_time_s':t,'reference_host_s':t,'raw_indices':list(indices),'host_ms':[v['host_time_s']*1000 for v in views],'hardware_ms':[v['hw_timestamp_ms'] for v in views],'cameras':views})
     out={'schema_version':1,'raw_indices':[list(ids) for ids in picks],'hardware_common_clock_verified':False,'policy':POLICY,'sync_tol_ms':tol_s*1000,'reference_camera':ref,'timestamp_basis':'host_time_s','clock_domain':'unknown','exposure_semantics':'unknown; host timestamps do not certify simultaneous exposures','overlap_start':lo,'overlap_end':hi,'frames':frames}
+    # Camera-clock mappings say so; host-time mappings stay byte-identical to earlier runs.
+    if use_hw:out.update(policy=HW_POLICY,timestamp_basis='hw_timestamp_ms',clock_domain='realsense_global_time',exposure_semantics='camera frame timestamps (global time); cameras are not hardware-triggered, so exposures can differ by up to half a frame')
     # Recorded only when frames were dropped, so full-rate mappings stay byte-identical to earlier runs.
     if step>1:out.update(target_fps=float(fps),frame_stride=step)
     return out

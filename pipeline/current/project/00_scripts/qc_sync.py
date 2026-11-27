@@ -4,9 +4,9 @@ from pathlib import Path
 
 def timeline(case):
  from sync_mapping import source_mapping
- data=source_mapping(case,[f'cam_{c}' for c in range(1,5)])
- frames=[{'time':r['reference_time_s'],'relative_s':r['reference_time_s']-data['overlap_start'],'cameras':[{'camera':c['camera']+1,'frame':c['raw_idx'],'time':c['host_time_s'],'offset_ms':round(c['residual_ms'],3)} for c in r['cameras']]} for r in data['frames']]
- return {'basis':'host_time_s; preprocessing shared mapping; exposure time unknown','policy':data['policy'],'reference_camera':data['reference_camera']+1,'sync_tol_ms':data['sync_tol_ms'],'start':data['overlap_start'],'end':data['overlap_end'],'duration':data['overlap_end']-data['overlap_start'],'frames':frames}
+ data=source_mapping(case,[f'cam_{c}' for c in range(1,5)]);hw=data.get('timestamp_basis')=='hw_timestamp_ms'
+ frames=[{'time':r['reference_time_s'],'relative_s':r['reference_time_s']-data['overlap_start'],'cameras':[{'camera':c['camera']+1,'frame':c['raw_idx'],'time':c['hw_timestamp_ms']/1000 if hw else c['host_time_s'],'offset_ms':round(c['residual_ms'],3)} for c in r['cameras']]} for r in data['frames']]
+ return {'basis':'hw_timestamp_ms (camera global time); preprocessing shared mapping' if hw else 'host_time_s; preprocessing shared mapping; exposure time unknown','policy':data['policy'],'reference_camera':data['reference_camera']+1,'sync_tol_ms':data['sync_tol_ms'],'start':data['overlap_start'],'end':data['overlap_end'],'duration':data['overlap_end']-data['overlap_start'],'frames':frames}
 
 def build(case,out):
  import cv2,numpy as np

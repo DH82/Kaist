@@ -58,6 +58,43 @@ class SyncTests(unittest.TestCase):
                          (ROOT / 'pipeline/current/workspace/kaist-full/PhysTwin/data_process/sync_mapping.py').read_bytes())
 
 
+class ClockBasisTests(unittest.TestCase):
+    """동기화 시각: 카메라 시각(hw_timestamp_ms, global time)이 PC 시각 기준이면 그것을, 아니면 host_time_s."""
+    cams = [f'cam_{c}' for c in range(1, 5)]
+
+    def write(self, folder, hw, host):
+        for cam in range(1, 5):
+            rows = ['frame_idx,hw_timestamp_ms,host_time_s'] + [f'{i},{hw(cam, i):.3f},{host(cam, i):.6f}' for i in range(60)]
+            (Path(folder) / f'cam_{cam}_timestamps.csv').write_text('\n'.join(rows) + '\n')
+
+    def test_global_hw_clock_ignores_usb_delivery_jitter(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # 4대 같은 순간 촬영(카메라 시각 1~3ms 차이). cam_2 만 frame 20~29 가 USB 에서 밀렸다가 한꺼번에 도착.
+            self.write(tmp, lambda c, i: 1.0e6 + i * 1000 / 30 + c,
+                       lambda c, i: 1000.06 + ((29.5 / 30 + (i - 20) * .001) if c == 2 and 20 <= i < 30 else i / 30))
+            m = sync_mapping.source_mapping(tmp, self.cams, fps=30)
+            self.assertEqual(m['timestamp_basis'], 'hw_timestamp_ms')
+            self.assertEqual(m['policy'], sync_mapping.HW_POLICY)
+            # 같은 번호끼리 짝 (겹침 구간 밖인 0번만 빠짐) · 밀린 cam_2 구간도 남는다
+            self.assertEqual(m['raw_indices'], [[i] * 4 for i in range(1, 60)])
+            # 같은 데이터를 PC 도착 시각으로 맞추면 밀린 구간이 빠진다 (예전 방식)
+            rows = [sync_mapping.read_rows(tmp, c) for c in self.cams]
+            host = [{i: float(r['host_time_s']) for i, r in rs.items()} for rs in rows]
+            self.assertLess(len(sync_mapping.sync_frames(host, None, .025)[0]), 55)
+
+    def test_device_clock_falls_back_to_host_time(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.write(tmp, lambda c, i: i * 1000 / 30, lambda c, i: 100 + i / 30 + c * .004)
+            m = sync_mapping.source_mapping(tmp, self.cams, fps=30)
+            self.assertEqual((m['timestamp_basis'], m['policy']), ('host_time_s', sync_mapping.POLICY))
+
+    def test_one_camera_without_global_clock_uses_host_for_all(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.write(tmp, lambda c, i: (i * 1000 / 30) if c == 3 else 1.0e5 * 1000 + i * 1000 / 30,
+                       lambda c, i: 1.0e5 + i / 30 + c * .004)
+            self.assertEqual(sync_mapping.source_mapping(tmp, self.cams)['timestamp_basis'], 'host_time_s')
+
+
 class ContractTests(unittest.TestCase):
     def contract(self, *fps):
         return preparation_contract.contract('raw', SCRIPTS, ROOT / 'pipeline/current/workspace/kaist-full/PhysTwin', *fps)

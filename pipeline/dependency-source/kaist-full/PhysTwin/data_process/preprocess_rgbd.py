@@ -87,14 +87,10 @@ def w2c_to_c2w(R, T):
     return c2w
 
 
-def load_timestamps(src, cam):
-    # returns dict local_frame_idx -> host_time_s
-    ts = {}
-    with open(os.path.join(src, f"{cam}_timestamps.csv"), "r") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            ts[int(row["frame_idx"])] = float(row["host_time_s"])
-    return ts
+def load_timestamps(src, cams):
+    # returns (per camera dict local_frame_idx -> seconds, basis): camera clock (hw_timestamp_ms, global
+    # time) when every camera has it, else host_time_s. Same choice as the QC/preprocess shared mapping.
+    return sync_times([read_rows(src, cam) for cam in cams])
 
 
 def depth_frames(src, cam):
@@ -107,7 +103,7 @@ def depth_frames(src, cam):
     return out
 
 
-from sync_mapping import sync_frames, source_mapping
+from sync_mapping import sync_frames, source_mapping, sync_times, read_rows
 
 def ransac_plane(pts, thresh=0.01, iters=400, seed=0):
     """Lightweight numpy plane RANSAC -> (unit normal, d, inlier_ratio); plane: n.x+d=0."""
@@ -319,7 +315,7 @@ def main():
     assert all(w == WH for w in WHs), f"camera resolutions differ: {WHs}"
 
     extr = load_extrinsics(src)
-    cam_ts = [load_timestamps(src, cam) for cam in cams]
+    cam_ts, ts_basis = load_timestamps(src, cams)
     cam_depths = [depth_frames(src, cam) for cam in cams]
 
     # Extrinsic convention is FIXED by the producer, not detected. See
@@ -353,7 +349,7 @@ def main():
     synced, grid_times = sync_frames(cam_ts, args.fps, args.sync_tol_ms / 1000.0)
     N = len(synced)
     if not N:raise ValueError("No synchronized frames inside tolerance")
-    print(f"[sync] {N} aligned frames over {grid_times[-1]-grid_times[0]:.2f}s (target {args.fps:g}fps)")
+    print(f"[sync] {N} aligned frames over {grid_times[-1]-grid_times[0]:.2f}s (target {args.fps:g}fps, timestamps: {ts_basis})")
 
     mapping = source_mapping(src, cams, args.sync_tol_ms / 1000.0, args.fps)
     with open(os.path.join(case_dir, 'source_frames.json'), 'w') as f:
