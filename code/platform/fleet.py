@@ -360,6 +360,45 @@ def raw_distributed():
     return out
 
 
+# ---- 다시 검수: control/redo/<RAW>.json = {"raw", "at": epoch 초, "by", "note"} ----
+# 표시 시각(at) 전에 시작한 그 RAW의 실행은 모든 PC에서 '대체됨'이 됩니다: 담당·진행·선점·NAS 시작 기록·3D 대기 목록에서
+# 빠지고 RAW는 공용 대기열(미배정)로 돌아갑니다. 실행 기록(Airflow·작업 현황)은 지우지 않습니다. 각 PC UI가 20초마다 반영합니다.
+# 예: 보정값이 틀린 채 처리한 촬영분을 결과를 지운 뒤 처음부터 다시 검수할 때(2026-11-27 11-25 촬영분).
+def _redo():
+    return CONTROL / 'redo'
+
+
+def raw_redo_marks():
+    """{RAW: {'at': 표시 시각(epoch), 'by', 'note'}}"""
+    out = {}
+    try:
+        names = os.listdir(_redo())
+    except OSError:
+        return out
+    for n in names:
+        ep = n[:-5] if n.endswith('.json') else ''
+        if not RAW_NAME.fullmatch(ep):
+            continue
+        try:
+            d = json.loads((_redo() / n).read_text())
+            out[ep] = dict(d, at=float(d['at']))
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+    return out
+
+
+def raw_redo_mark(ep, by, note='', at=None):
+    """RAW 하나를 '다시 검수'로 표시합니다. 같은 RAW를 다시 표시하면 시각이 새로 바뀌어 그 사이 실행도 대체됩니다."""
+    if not RAW_NAME.fullmatch(ep or ''):
+        raise ValueError('RAW 이름이 잘못되었습니다: ' + str(ep))
+    _redo().mkdir(parents=True, exist_ok=True)
+    rec = {'raw': ep, 'at': time.time() if at is None else float(at), 'by': by, 'note': note}
+    tmp = _redo() / f'.{ep}.json.{secrets.token_hex(4)}.tmp'
+    tmp.write_text(json.dumps(rec, ensure_ascii=False))
+    os.replace(tmp, _redo() / f'{ep}.json')
+    return rec
+
+
 # ---- 작업자별 RAW 큐 크기: control/queue_targets/<이름>.json {"target": n, "by": ..., "at": ...} ----
 # 작업자(PC1~PC6 로그인 이름)가 직접 정합니다. 배정할 때마다 NAS 파일을 읽으므로 어느 PC 화면에서 바꿔도 바로 반영됩니다.
 QUEUE_MIN, QUEUE_MAX = 0, 30

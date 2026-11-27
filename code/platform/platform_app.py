@@ -839,12 +839,75 @@ def mano_dag(run_id):
  return deferred_runs().get(run_id,DAY_DAG)
 
 def mano_ready_runs():
- """3D 복원까지 끝난(성공) 낮 실행 + '3D까지만' 초기화한 뒤 성공한 전체 파이프라인 실행"""
- yield from airflow_runs(DAY_DAG,state='success')
+ """3D 복원까지 끝난(성공) 낮 실행 + '3D까지만' 초기화한 뒤 성공한 전체 파이프라인 실행. 다시 검수로 대체된 실행은 뺍니다."""
+ gone=redo_superseded()
+ for run in airflow_runs(DAY_DAG,state='success'):
+  if run['dag_run_id'] not in gone:yield run
  for run_id,dag in deferred_runs().items():
+  if run_id in gone:continue
   try:run=local_api('GET',f'/api/v2/dags/{dag}/dagRuns/'+quote(run_id,safe=''))
   except Exception:continue
   if run.get('state')=='success':yield run
+
+# ---- 다시 검수(NAS control/redo/<RAW>.json, fleet.raw_redo_mark) ----
+# 표시 시각 전에 시작한 그 RAW의 실행을 '대체됨'(access 테이블 raw_redo_runs)으로 기록하고, 담당(episode_owners·
+# 입고 기록 operator)·시작 전 배정·NAS 선점을 풉니다 → RAW 목록에서 공용 대기열(미배정)로 돌아가 다시 자동 배정됩니다.
+# 대체된 실행은 RAW 진행 판단·NAS 시작 기록(raw_started)·3D 대기 목록에서 빠지고, 작업 현황 기록에는 남습니다.
+_redo_cache=[0.0,frozenset()]
+def redo_superseded(fresh=False):
+ """다시 검수로 대체된 실행(run_id). 목록을 그릴 때 실행마다 묻기 때문에 2초 동안 기억합니다."""
+ if fresh or time.time()-_redo_cache[0]>2:
+  with access.db() as c:rows=c.execute('SELECT run_id FROM raw_redo_runs').fetchall()
+  _redo_cache[:]=[time.time(),frozenset(r[0] for r in rows)]
+ return _redo_cache[1]
+
+def run_started_at(r):
+ """Airflow 실행이 만들어진 시각(epoch). 모르면 0(=아주 예전)."""
+ for key in ('queued_at','start_date','logical_date','run_after'):
+  v=r.get(key)
+  if v:
+   try:return datetime.fromisoformat(str(v).replace('Z','+00:00')).timestamp()
+   except ValueError:pass
+ return 0.0
+
+def fleet_redo_apply():
+ """NAS 다시 검수 표시 중 이 PC에 아직 반영하지 않은 것을 반영합니다(fleet_tick에서 20초마다). → 반영한 RAW 목록"""
+ try:marks=fleet.raw_redo_marks() if fleet.available() else {}
+ except Exception:marks={}
+ if not marks:return []
+ with access.db() as c:seen={r[0]:r[1] for r in c.execute('SELECT episode,at FROM raw_redo')}
+ todo={ep:m for ep,m in marks.items() if seen.get(ep,-1.0)<m['at']}
+ if not todo:return []
+ runs={}
+ for _wid,_mode,dag in active_dags():
+  for r in airflow_runs(dag):
+   conf=r.get('conf') or {};raw=conf.get('raw_episode_id') or conf.get('episode_id')
+   if raw in todo:runs.setdefault(raw,[]).append(r)
+ applied=[]
+ for ep,m in todo.items():
+  old=[r for r in runs.get(ep,[]) if run_started_at(r)<m['at']]
+  newer={r['dag_run_id'] for r in runs.get(ep,[]) if run_started_at(r)>=m['at']}
+  if any(r['state'] in ('queued','running') for r in old):
+   print('다시 검수 반영 보류(진행 중인 실행이 끝나면 반영):',ep,flush=True);continue
+  with access._assign_lock:
+   with access.db() as c:
+    versions=[r[0] for r in c.execute('SELECT run_id FROM execution_versions WHERE raw_episode=?',(ep,))]
+    ids={r['dag_run_id'] for r in old}|{v for v in versions if v not in newer}
+    c.executemany('INSERT OR IGNORE INTO raw_redo_runs VALUES(?,?,?)',[(i,ep,m['at']) for i in sorted(ids)])
+    if not newer:  # 표시 뒤 이 PC에서 새로 시작한 실행이 없으면 담당·배정을 모두 풉니다.
+     c.execute('DELETE FROM episode_owners WHERE episode=?',(ep,))
+     c.execute('UPDATE episodes SET operator=NULL,worker=NULL WHERE episode=?',(ep,))
+     c.execute('DELETE FROM raw_assignments WHERE episode=? AND COALESCE(at,0)<?',(ep,m['at']))
+    c.execute('INSERT OR REPLACE INTO raw_redo VALUES(?,?,?,?)',(ep,m['at'],time.time(),len(ids)))
+    c.execute('INSERT INTO ui_audit VALUES(?,?,?)',(time.time(),str(m.get('by') or 'NAS'),f'raw-redo {ep} 대체 {len(ids)}개'))
+  if not newer:
+   try:fleet.raw_release(ep)
+   except Exception:pass
+  applied.append(ep)
+ if applied:
+  redo_superseded(fresh=True);forget('nas:claims','nas:taken','nas:started')
+  print('다시 검수 반영:',len(applied),'개 RAW',flush=True)
+ return applied
 
 # ---- MANO 일괄 실행 대기열에서 에피소드 하나 제거 ----
 def mano_removed_db():
@@ -1012,6 +1075,7 @@ def launch_mano(data:ManoSelection,req:Request):
  guard(req);update_block()
  if len(set(data.runs))!=len(data.runs):raise HTTPException(400,'중복된 실행입니다.')
  if set(data.runs)&mano_excluded():raise HTTPException(409,'대기 목록에서 제거한 에피소드가 들어 있습니다. 목록을 새로고침하세요.')
+ if set(data.runs)&redo_superseded(fresh=True):raise HTTPException(409,'다시 검수로 대체된 실행입니다. 이 RAW는 공용 대기열에서 새로 시작하세요.')
  with lock:
   check_batch_idle()
   # MANO 일괄 실행은 동시 실행 한도(MAX_PARALLEL_RUNS)와 무관하게 시작합니다. GPU 연산 겹침은 Worker GPU 슬롯이 조절합니다.
@@ -1487,8 +1551,9 @@ def raw_episodes(req:Request):
  episodes=raw_worker_info(selected_worker(req))['episodes'];owners=access.owners();user=access.user(req);latest={};mark('worker')
  for wid,mode,dag in active_dags():
   # 실행 전체를 봅니다(최근 100개만 보면, 밀려난 완료 RAW가 '진행 중'으로 세어져 자동 배정이 멈춤).
-  runs=airflow_runs(dag)
+  runs=airflow_runs(dag);gone=redo_superseded()
   for r in runs:
+   if r['dag_run_id'] in gone:continue  # 다시 검수로 대체된 실행은 이 RAW의 진행으로 치지 않습니다.
    ep=r.get('conf',{}).get('raw_episode_id') or r.get('conf',{}).get('episode_id');stamp=r.get('logical_date') or r.get('queued_at') or ''
    if ep in episodes and (ep not in latest or stamp>latest[ep][0]):latest[ep]=(stamp,dag,r,mode)
  mark('airflow');deferred=deferred_runs()
@@ -1691,6 +1756,7 @@ def retry_job(data:RetryJob,req:Request):
  order=['prepare_raw','sam_settings_ready','sam3','mask_approved','preflight','track','tracking_approved','prepare_reconstruction','reconstruct','hands','validate','publish']
  wid=dag_worker(data.dag_id)
  if data.dag_id not in [d for w,m,d in active_dags()] or data.stage not in order:raise HTTPException(400,'재시도할 단계를 확인하세요.')
+ if data.run_id in redo_superseded(fresh=True):raise HTTPException(409,'다시 검수로 대체된 실행입니다. 이 RAW는 공용 대기열에서 새로 시작하세요.')
  with lock:
   reset_busy(data.run_id)
   base=f'/api/v2/dags/{data.dag_id}/dagRuns/'+quote(data.run_id,safe='')
@@ -1784,6 +1850,7 @@ def start_reset(data,req=None,who=None):
  start=RESET_START.get(data.stage)
  wid=dag_worker(data.dag_id)
  if not start or data.dag_id not in [d for w,m,d in active_dags()]:raise HTTPException(400,'초기화할 단계를 확인하세요.')
+ if data.run_id in redo_superseded(fresh=True):raise HTTPException(409,'다시 검수로 대체된 실행입니다. 이 RAW는 공용 대기열에서 새로 시작하세요.')
  if data.run_id in mano_purged(fresh=True):raise HTTPException(409,'대기 목록에서 제거해 작업 데이터를 삭제한 실행입니다. 다시 하려면 RAW 제외를 풀고 처음부터 실행하세요.')
  with lock:
   reset_busy(data.run_id)
@@ -2566,12 +2633,12 @@ def fleet_snapshot():
   except (httpx.HTTPError,OSError,ValueError):g=local_gpu_status()
   snap['gpu']=[{'idx':x.get('index'),'name':x.get('name'),'uuid':x.get('uuid'),'used_mb':x.get('used_mb'),'total_mb':x.get('total_mb'),'util':x.get('util'),'processes':len(x.get('processes') or [])} for x in g['gpus'] if not g.get('worker_gpu_uuid') or x.get('uuid')==g['worker_gpu_uuid']]
  except Exception as e:snap['meta']['gpu_error']=str(e)[-200:]
- runs=[];started=set(access.owners())
+ runs=[];started=set(access.owners());gone=redo_superseded()
  for wid,mode,dag in active_dags():
   if wid!=DEFAULT_WORKER:continue
   for r in airflow_runs(dag):
    conf=r.get('conf') or {};raw=conf.get('raw_episode_id') or conf.get('episode_id')
-   if raw:started.add(raw)
+   if raw and r['dag_run_id'] not in gone:started.add(raw)  # 다시 검수로 대체된 실행은 '이 PC가 시작한 RAW'가 아님
    stage=None
    if r['state'] in ('queued','running'):
     try:stage=next((t['task_id'] for t in run_tasks(dag,r['dag_run_id']) if t['state'] in ('running','up_for_reschedule','up_for_retry','failed')),None)
@@ -2663,6 +2730,8 @@ def fleet_tick():
  with _fleet_lock:
   force_update_stop()
   fleet_process()
+  try:fleet_redo_apply()
+  except Exception as e:print('다시 검수 반영 실패:',e,flush=True)
   snap=fleet_snapshot()
   try:reconcile_raw_claims(snap)
   except Exception as e:print('RAW 선점 정리 실패:',e,flush=True)

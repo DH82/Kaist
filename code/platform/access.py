@@ -15,6 +15,9 @@ def db():
  c.execute('CREATE TABLE IF NOT EXISTS raw_assignments (episode TEXT PRIMARY KEY,operator TEXT NOT NULL,worker_id TEXT NOT NULL,at REAL)')
  c.execute('CREATE TABLE IF NOT EXISTS raw_exclusions (worker_id TEXT NOT NULL,episode TEXT NOT NULL,operator TEXT NOT NULL,at REAL,PRIMARY KEY(worker_id,episode,operator))')
  c.execute('CREATE TABLE IF NOT EXISTS ui_hidden (scope TEXT NOT NULL,key TEXT NOT NULL,episode TEXT,name TEXT,at REAL,PRIMARY KEY(scope,key))')
+ # 다시 검수(NAS control/redo): 이 PC에 반영한 표시(raw_redo)와 그때 대체된 실행(raw_redo_runs). 대체된 실행은 담당·진행 판단에서 빠집니다.
+ c.execute('CREATE TABLE IF NOT EXISTS raw_redo (episode TEXT PRIMARY KEY,at REAL NOT NULL,applied REAL,runs INTEGER)')
+ c.execute('CREATE TABLE IF NOT EXISTS raw_redo_runs (run_id TEXT PRIMARY KEY,raw_episode TEXT NOT NULL,at REAL)')
  return c
 
 # 로그인 이름은 PC1~PC6만 허용합니다. 이 이름(소문자)이 NAS 결과 폴더 results/pc1~pc6이 됩니다.
@@ -65,7 +68,8 @@ def admin(req):
 
 def owners():
  with db() as c:out={r['episode']:r['operator'] for r in c.execute('SELECT * FROM episode_owners')}
- with db() as c:out.update({r['episode']:r['operator'] for r in c.execute('SELECT episode,operator FROM execution_versions')})
+ # 다시 검수로 대체된 실행은 담당 근거가 아닙니다(그 RAW는 공용 대기열로 돌아감).
+ with db() as c:out.update({r['episode']:r['operator'] for r in c.execute('SELECT episode,operator FROM execution_versions WHERE run_id NOT IN (SELECT run_id FROM raw_redo_runs)')})
  # 입고 명세(metadata, 파일별 해시라 큼)는 읽지 않습니다. 이 함수는 목록의 행마다 불립니다.
  with db() as c:out.update({r['episode']:r['operator'] for r in c.execute("SELECT episode,operator FROM episodes WHERE operator IS NOT NULL AND operator!='' ORDER BY updated")})
  return out

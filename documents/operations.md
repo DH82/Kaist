@@ -45,7 +45,15 @@ NAS `control/update/tick_hooks.json`에 적어 둔 명령을 타이머가 돌 �
 
 현재 등록된 작업은 보정값 교체(calfix)입니다. 보정 회차가 잘못 찍힌 날의 RAW에 대해 `03_prepared/<ep>/calibrate.pkl`·`world_reorient_M.npy`를 교체본으로 바꿉니다. 마스크 승인 후·3D 시작 전 에피소드만 바꿉니다. 3D를 이미 시작한 에피소드는 전처리부터 다시 실행해야 하고, 다시 실행하면 마스크 승인 뒤 다음 타이머에서 자동으로 교체됩니다. 도구와 회차 기록은 [deploy/calfix/](../deploy/calfix/README.md)에 있습니다.
 
-### 1.6 진행 상황 · 로그
+### 1.6 RAW 다시 검수
+
+결과를 지우고 RAW를 처음부터 다시 검수해야 할 때(예: 보정값 오류) NAS `control/redo/<RAW>.json`에 표시를 씁니다. 각 PC UI가 20초마다 읽어, 표시 시각 전에 시작한 그 RAW의 실행을 '대체됨'으로 기록하고 담당·배정·NAS 선점을 풉니다. RAW는 RAW 목록에서 공용 대기열(미배정)로 돌아가 다시 자동 배정되며, 대체된 실행은 3D 대기 목록·RAW 진행 판단에서 빠지고 재시도·단계 초기화·일괄 실행이 막힙니다(작업 현황 기록은 남음). 진행 중인 실행이 있는 RAW는 그 실행이 끝난 뒤 반영합니다. 모든 PC가 이 기능이 든 코드로 업데이트돼야 다른 PC에도 풀립니다.
+
+```bash
+cd code/platform && python3 -I -c "import sys;sys.path.insert(0,'.');import fleet;[fleet.raw_redo_mark(e,'관리자','사유') for e in sys.argv[1:]]" ep_20261125_014211 …
+```
+
+### 1.7 진행 상황 · 로그
 
 - 같은 탭 위쪽 **업데이트 진행** 패널: PC별로 코드 받기 → 이미지 빌드 → GPU 점검 → 작업 종료 대기 → 서비스 재시작 → UI 확인의 소요 시간, 빌드 층 진행도(완료/전체, 캐시 수), 현재 빌드 단계, 최근 로그. 진행 중에는 5초마다 갱신하고 끝난 결과는 6시간 남습니다.
 - 요청과 상태: NAS `control/update/<pc>/{request,status}.json`.
