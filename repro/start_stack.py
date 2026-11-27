@@ -70,11 +70,11 @@ def gpu_check(compose, env, jobs):
 
 
 def same_gpu_image(compose, env):
-    """(빌드된 kaist-gpu:latest 이미지 ID, 실행 중인 gpu-worker 컨테이너의 이미지 ID). 모르면 None."""
+    """(빌드된 GPU 이미지 ID, 실행 중인 gpu-worker 컨테이너의 이미지 ID). 모르면 None. 태그는 KAIST_GPU_IMAGE_TAG(기본 latest)."""
     def out(cmd):
         r = subprocess.run(cmd, env=env, capture_output=True, text=True)
         return r.stdout.strip() if r.returncode == 0 else ''
-    built = out(['docker', 'image', 'inspect', '--format', '{{.Id}}', 'kaist-gpu:latest']) or None
+    built = out(['docker', 'image', 'inspect', '--format', '{{.Id}}', 'kaist-gpu:' + (env.get('KAIST_GPU_IMAGE_TAG') or 'latest')]) or None
     ids = out(compose + ['ps', '-q', 'gpu-worker']).split()
     running = out(['docker', 'inspect', '--format', '{{.Image}}', ids[0]]) or None if ids else None
     return built, running
@@ -134,8 +134,10 @@ def main():
         default_nas = state / 'data'
     nas = (args.nas or Path(setting('NAS_MOUNT', default_nas))).expanduser().resolve()
     pc = args.pc_id or setting('PC_ID', 'pc1')
-    if not re.fullmatch(r'pc[1-9][0-9]*', pc):
-        raise ValueError('PC ID must be pc1, pc2, ...')
+    # 시험 스택처럼 PC1~PC6 밖의 이름(예: pct)은 KAIST_EXTRA_LOGIN_NAMES에 같은 이름이 있을 때만 받습니다.
+    extra = {n.strip().lower() for n in setting('KAIST_EXTRA_LOGIN_NAMES', '').split(',') if n.strip()}
+    if not (re.fullmatch(r'pc[1-9][0-9]*', pc) or (pc in extra and re.fullmatch(r'[a-z][a-z0-9]*', pc))):
+        raise ValueError('PC ID must be pc1, pc2, ... (or a name listed in KAIST_EXTRA_LOGIN_NAMES)')
     default_project = Path.home() / 'kaist_work' / pc if stack_name == 'kaist-pc' else state / 'project'
     project = (args.project or Path(setting('GPU_PROJECT_DIR', default_project))).resolve()
     weight_root = args.weights or values.get('KAIST_WEIGHTS_ROOT')
@@ -172,7 +174,9 @@ def main():
     worker_secret = worker_state / 'worker/secret'
     # All clients must use the worker started by this stack, including existing configurations.
     values.update(COMPOSE_PROJECT_NAME=stack_name, HOST_UID=uid, HOST_IP=ip, PC_ID=pc, PC_LABEL=setting('PC_LABEL', pc),
-                  STACK_STATE_DIR=str(state), NAS_MOUNT=str(nas), NAS_RAW_HOST_PATH=str(nas / 'rgbd_raw'),
+                  STACK_STATE_DIR=str(state), NAS_MOUNT=str(nas),
+                  # 저장한 RAW 폴더(예: 시험 스택의 TEST/Set)는 유지하고, --nas로 저장소를 바꿀 때만 <저장소>/rgbd_raw로 다시 정합니다.
+                  NAS_RAW_HOST_PATH=str(nas / 'rgbd_raw') if args.nas else setting('NAS_RAW_HOST_PATH', nas / 'rgbd_raw'),
                   NAS_GID=str(args.nas_gid if args.nas_gid is not None else setting('NAS_GID', ((nas / 'results').stat().st_gid if (nas / 'results').exists() else os.getgid()))),
                   GPU_PROJECT_DIR=str(project), GPU_STATE_DIR=str(worker_state),
                   GPU_LOCK_FILE=setting('GPU_LOCK_FILE', worker_state / 'worker/gpu_4090_a.lock'),

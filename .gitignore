@@ -54,3 +54,7 @@ pipeline/current/workspace/data/
 /pipeline/**/*.npz
 /pipeline/**/*.npy
 review_cache/
+
+# Model weights copied for this PC (KAIST_WEIGHTS_ROOT); never committed
+/weights/
+/compose.override.yaml
