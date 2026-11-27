@@ -373,7 +373,7 @@ function renderRawTable(){
 }
 async function refreshRawBoard(force=false){
  if((rawBoardBusy&&!force)||!currentUser)return;rawBoardBusy=true;const generation=++rawBoardGeneration;
- const wid=selectedWorker();try{const d=await api('/api/raw-episodes?worker_id='+encodeURIComponent(selectedWorker()));if(generation!==rawBoardGeneration||wid!==selectedWorker())return;rawEpisodes=d.episodes;rawTeam=d.team||null;loadHandProfiles();const selected=$('episode').value;$('episode').innerHTML=rawEpisodes.map(e=>'<option value="'+escape(e.episode)+'">'+escape(e.episode)+'</option>').join('');$('episode').value=rawEpisodes.some(e=>e.episode===selected)?selected:'';renderRawTable();updateLaunch()}
+ const wid=selectedWorker();try{const d=await api('/api/raw-episodes?worker_id='+encodeURIComponent(selectedWorker()));if(generation!==rawBoardGeneration||wid!==selectedWorker())return;rawEpisodes=d.episodes;rawTeam=d.team||null;if(typeof rawAlertCheck==='function')rawAlertCheck(d.episodes,wid);loadHandProfiles();const selected=$('episode').value;$('episode').innerHTML=rawEpisodes.map(e=>'<option value="'+escape(e.episode)+'">'+escape(e.episode)+'</option>').join('');$('episode').value=rawEpisodes.some(e=>e.episode===selected)?selected:'';renderRawTable();updateLaunch()}
  catch(e){if(generation===rawBoardGeneration)notice(e.message,true)}finally{if(generation===rawBoardGeneration)rawBoardBusy=false}
 }
 $('refreshRaw').onclick=()=>refreshRawBoard();

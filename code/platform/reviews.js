@@ -319,11 +319,13 @@ $('hcEventsAll').onclick=async()=>{
 
 // ---- 오른쪽 위 알림: 마스크 승인 대기 · 추적 승인 대기가 새로 생기면 알려 줍니다 ----
 // 20초마다 내 검수 목록(작업자는 본인 것, 관리자는 전체)을 확인해, 처음 보는 대기 항목만 알림으로 띄웁니다.
-// 이미 본 항목은 이 브라우저 세션 동안 기억하므로 새로고침해도 다시 뜨지 않습니다. 검수가 끝난 항목의 알림은 자동으로 닫힙니다.
+// 이미 본 항목은 이 브라우저에 기억하므로 새로고침·새 탭·브라우저를 다시 열어도 다시 뜨지 않습니다. 검수가 끝난 항목의 알림은 자동으로 닫힙니다.
+// 내 검수에서 숨긴 항목은 알리지 않고, 연결이 잠깐 끊긴 PC의 항목은 기억을 지우지 않아 다시 연결돼도 예전 대기를 새로 알리지 않습니다.
 const HC_ALERT_MS=20000,HC_ALERT_MAX=5;
 let hcAlertSeen=null,hcAlertUser='',hcAlertBusy=false;
 function hcAlertKey(x){return x.episode+'|'+x.stage}
-function hcAlertStore(){try{sessionStorage.setItem('kaistAlertSeen:'+hcAlertUser,JSON.stringify([...hcAlertSeen]))}catch(e){}}
+// hcAlertSeen: 키(에피소드|단계) → 그 항목의 PC(worker_id). localStorage에 [[키,PC],…]로 저장합니다.
+function hcAlertStore(){try{localStorage.setItem('kaistAlertSeen:'+hcAlertUser,JSON.stringify([...hcAlertSeen].slice(-500)))}catch(e){}}
 function hcAlertClose(el){if(el&&el.parentNode)el.remove()}
 function hcAlertShow({key,title,episode,meta,kind,stage}){
  const box=$('hcAlerts');if(key&&box.querySelector('[data-key="'+CSS.escape(key)+'"]'))return;
@@ -343,28 +345,38 @@ async function hcAlertPoll(){
   if(hcAlertUser!==currentUser.name+'/'+currentUser.role){
    hcAlertUser=currentUser.name+'/'+currentUser.role;$('hcAlerts').querySelectorAll('.hcAlert:not(.fail)').forEach(hcAlertClose);
    // 저장된 기록이 없으면 null로 둬야 아래 '첫 확인' 요약이 뜹니다(빈 Set으로 두면 대기 건마다 알림이 하나씩 쌓임).
-   try{const saved=JSON.parse(sessionStorage.getItem('kaistAlertSeen:'+hcAlertUser)||'null');hcAlertSeen=Array.isArray(saved)?new Set(saved):null}catch(e){hcAlertSeen=null}
+   try{
+    const saved=JSON.parse(localStorage.getItem('kaistAlertSeen:'+hcAlertUser)||sessionStorage.getItem('kaistAlertSeen:'+hcAlertUser)||'null');
+    // 예전 형식(키 배열)은 PC를 모르는 키('')로 읽습니다.
+    hcAlertSeen=Array.isArray(saved)?new Map(saved.map(x=>Array.isArray(x)?x:[x,''])):null;
+   }catch(e){hcAlertSeen=null}
   }
-  const d=await hcRequest(HC_BASE+'/queue');if(!currentUser||currentUser.role==='admin')return;
-  // 검수 목록에서 숨긴 항목은 알리지 않습니다.
-  const pending=(d.reviews||[]).filter(x=>x.status!=='approved'&&(x.stage==='mask'||x.stage==='tracking')&&!(typeof isHidden==='function'&&isHidden('review',JSON.stringify([x.episode,x.stage]))));
+  const [d]=await Promise.all([hcRequest(HC_BASE+'/queue'),typeof loadHidden==='function'?loadHidden('review'):null]);if(!currentUser||currentUser.role==='admin')return;
+  const waiting=(d.reviews||[]).filter(x=>x.status!=='approved'&&(x.stage==='mask'||x.stage==='tracking'));
+  const all=new Set(waiting.map(hcAlertKey)),down=new Set(d.unavailable_workers||[]);
+  // 검수 목록에서 숨긴 항목은 알리지 않습니다(숨김을 풀어도 예전 대기를 새로 알리지 않도록 기억은 해 둡니다).
+  // 알림 설정에서 끈 종류(마스크·추적)도 알리지 않습니다.
+  const pending=waiting.filter(x=>!(typeof isHidden==='function'&&isHidden('review',JSON.stringify([x.episode,x.stage])))&&(typeof alertOn!=='function'||alertOn(x.stage)));
   const keys=new Set(pending.map(hcAlertKey));
   // 검수가 끝나 대기 목록에서 빠진 항목의 알림은 닫습니다.
   $('hcAlerts').querySelectorAll('.hcAlert[data-key]:not(.fail)').forEach(el=>{if(!keys.has(el.dataset.key))hcAlertClose(el)});
   if(hcAlertSeen===null){
    // 이 세션의 첫 확인: 이미 대기 중인 것은 한 번에 요약해서 알려 줍니다.
-   hcAlertSeen=new Set(keys);hcAlertStore();
+   hcAlertSeen=new Map(waiting.map(x=>[hcAlertKey(x),x.worker_id||'']));hcAlertStore();
    const m=pending.filter(x=>x.stage==='mask').length,t=pending.length-m;
    if(pending.length)hcAlertShow({kind:'summary',title:'검수 대기 '+pending.length+'건',meta:[m?'마스크 승인 대기 '+m+'건':'',t?'추적 승인 대기 '+t+'건':''].filter(Boolean).join(' · ')});
    return;
   }
   for(const x of pending){
-   const k=hcAlertKey(x);if(hcAlertSeen.has(k))continue;hcAlertSeen.add(k);
+   const k=hcAlertKey(x);if(hcAlertSeen.has(k))continue;hcAlertSeen.set(k,x.worker_id||'');
    hcAlertShow({key:k,kind:x.stage,stage:x.stage,episode:x.episode,title:x.stage==='mask'?'🟡 마스크 승인 대기':'🟣 추적 승인 대기',
     meta:(x.worker_label||'')+(x.frames?' · '+x.frames+'프레임':'')+' · '+new Date().toLocaleTimeString('ko-KR',{hour:'2-digit',minute:'2-digit'})});
+   if(typeof alertDesktop==='function')alertDesktop('KAIST '+(x.stage==='mask'?'마스크':'추적')+' 승인 대기',x.episode,()=>openReview(x.episode,x.stage));
   }
+  for(const x of waiting)hcAlertSeen.set(hcAlertKey(x),x.worker_id||'');
   // 승인돼 목록에서 빠진 항목은 기억에서 지워, 다시 대기가 되면(재실행 등) 또 알려 줍니다.
-  for(const k of [...hcAlertSeen])if(!keys.has(k))hcAlertSeen.delete(k);
+  // 단, 그 PC가 지금 연결되지 않아 목록에서 빠진 것이면(또는 PC를 모르는 예전 기록이면서 끊긴 PC가 있으면) 지우지 않습니다.
+  for(const [k,w] of [...hcAlertSeen])if(!all.has(k)&&!(w?down.has(w):down.size))hcAlertSeen.delete(k);
   hcAlertStore();
  }catch(e){/* 알림 확인 실패는 화면 동작에 영향을 주지 않습니다 */}
  finally{hcAlertBusy=false}
